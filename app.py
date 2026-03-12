@@ -103,7 +103,10 @@ def equal_axes(fig, x_data, y_data, pct=(1, 99), margin=0.05):
     lo, hi = np.percentile(combined, pct)
     pad = margin * (hi - lo) if hi > lo else 1.0
     r = [lo - pad, hi + pad]
-    fig.update_layout(**{"xaxis.range": r, "yaxis.range": r})
+    fig.update_layout(
+        xaxis=dict(range=r, constrain="domain"),
+        yaxis=dict(range=r, scaleanchor="x", scaleratio=1),
+    )
     return fig
 
 
@@ -334,13 +337,13 @@ with tabs[1]:
     with col1:
         fig_h = px.histogram(x=log_mass, nbins=60, labels={"x": "log10(M [Msun/h])"},
                              title="Halo mass distribution")
-        fig_h.update_layout(height=350, showlegend=False)
+        fig_h.update_layout(height=500, showlegend=False)
         add_log_buttons(fig_h)
         st.plotly_chart(fig_h, use_container_width=True)
     with col2:
         fig_v = px.histogram(x=v_mag, nbins=60, labels={"x": "|v| [km/s]"},
                              title="Halo velocity magnitude distribution")
-        fig_v.update_layout(height=350, showlegend=False)
+        fig_v.update_layout(height=500, showlegend=False)
         add_log_buttons(fig_v)
         st.plotly_chart(fig_v, use_container_width=True)
 
@@ -364,7 +367,7 @@ with tabs[2]:
         fig_conv.update_layout(
             xaxis_title="Optimization step",
             yaxis_title="-log posterior",
-            height=350,
+            height=500,
         )
         add_log_buttons(fig_conv)
         st.plotly_chart(fig_conv, use_container_width=True)
@@ -404,7 +407,7 @@ with tabs[2]:
         fig_k.update_layout(
             xaxis_title="r [Mpc/h]",
             yaxis_title="C(r)",
-            height=350,
+            height=500,
             title=f"Kernel: variance = {variance:.4f} +/- {variance*(np.exp(sig_lv)-1):.4f}, "
                   f"scale = {scale_mpc:.1f} +/- {scale_mpc*(np.exp(sig_ls)-1):.1f} Mpc/h",
         )
@@ -545,7 +548,7 @@ with tabs[2]:
         st.subheader("Density field distribution")
         fig_dh = px.histogram(x=delta, nbins=80, labels={"x": "delta"},
                                title="Distribution of reconstructed delta at halo positions")
-        fig_dh.update_layout(height=300, showlegend=False)
+        fig_dh.update_layout(height=500, showlegend=False)
         add_log_buttons(fig_dh)
         st.plotly_chart(fig_dh, use_container_width=True)
 
@@ -634,7 +637,7 @@ with tabs[3]:
                 marker_color=colors_eig[i], opacity=0.55,
             ))
         fig_eig.update_layout(
-            barmode="overlay", height=350,
+            barmode="overlay", height=500,
             xaxis_title="Eigenvalue", yaxis_title="Count",
         )
         clip_axes(fig_eig, x_data=eigenvalues.ravel())
@@ -646,7 +649,7 @@ with tabs[3]:
         with col1:
             fig_lap = px.histogram(x=laplacian, nbins=80, title="Laplacian (tr H)",
                                     labels={"x": "Laplacian"})
-            fig_lap.update_layout(height=300, showlegend=False)
+            fig_lap.update_layout(height=500, showlegend=False)
             clip_axes(fig_lap, x_data=laplacian)
             add_log_buttons(fig_lap)
             st.plotly_chart(fig_lap, use_container_width=True)
@@ -654,7 +657,7 @@ with tabs[3]:
             fig_s2 = px.histogram(x=np.log10(s_squared + 1), nbins=80,
                                    title="log10(1 + s^2) Tidal Shear",
                                    labels={"x": "log10(1 + s^2)"})
-            fig_s2.update_layout(height=300, showlegend=False)
+            fig_s2.update_layout(height=500, showlegend=False)
             add_log_buttons(fig_s2)
             st.plotly_chart(fig_s2, use_container_width=True)
 
@@ -735,7 +738,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                     fig_sc.update_layout(
                         xaxis_title="GP derivative",
                         yaxis_title="Quadratic fit",
-                        height=350,
+                        height=500,
                         title=f"{eig_names[i]} (r={r_val:.3f})",
                     )
                     equal_axes(fig_sc, eigenvalues_gp[:, i], eigenvalues_qf[:, i])
@@ -759,7 +762,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                     opacity=0.4,
                 ))
             fig_dist.update_layout(
-                barmode="overlay", height=400,
+                barmode="overlay", height=500,
                 xaxis_title="Eigenvalue", yaxis_title="Count",
             )
             all_eig = np.concatenate([eigenvalues_gp.ravel(), eigenvalues_qf.ravel()])
@@ -788,7 +791,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                 ))
                 fig_lap.update_layout(
                     xaxis_title="GP Laplacian", yaxis_title="QF Laplacian",
-                    height=350, title=f"Laplacian (r={r_lap:.3f})",
+                    height=500, title=f"Laplacian (r={r_lap:.3f})",
                 )
                 equal_axes(fig_lap, laplacian_gp, laplacian_qf)
                 add_log_buttons(fig_lap)
@@ -810,7 +813,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                 ))
                 fig_s2.update_layout(
                     xaxis_title="GP s^2", yaxis_title="QF s^2",
-                    height=350, title=f"Tidal shear s^2 (r={r_s2:.3f})",
+                    height=500, title=f"Tidal shear s^2 (r={r_s2:.3f})",
                 )
                 equal_axes(fig_s2, s2_gp, s2_qf)
                 add_log_buttons(fig_s2)
@@ -893,7 +896,7 @@ with tabs[5]:
                 marker=dict(size=2, opacity=0.3, color="steelblue"),
             )])
             fig_q1a.update_layout(xaxis_title="delta", yaxis_title=label_a_name,
-                                   height=350, title=f"{label_a_name} vs delta")
+                                   height=500, title=f"{label_a_name} vs delta")
             add_log_buttons(fig_q1a)
             st.plotly_chart(fig_q1a, use_container_width=True)
         with col2:
@@ -902,7 +905,7 @@ with tabs[5]:
                 marker=dict(size=2, opacity=0.3, color="darkorange"),
             )])
             fig_q1b.update_layout(xaxis_title="delta", yaxis_title=label_b_name,
-                                   height=350, title=f"{label_b_name} vs delta")
+                                   height=500, title=f"{label_b_name} vs delta")
             add_log_buttons(fig_q1b)
             st.plotly_chart(fig_q1b, use_container_width=True)
 
@@ -933,7 +936,7 @@ with tabs[5]:
             fig_r1.update_layout(
                 xaxis_title="s^2 residual (delta removed)",
                 yaxis_title=f"{label_a_name} residual",
-                height=350,
+                height=500,
                 title="Q2: Residuals after removing density",
             )
             add_log_buttons(fig_r1)
@@ -948,7 +951,7 @@ with tabs[5]:
             fig_r2.update_layout(
                 xaxis_title="s^2 residual (delta removed)",
                 yaxis_title=f"{label_b_name} residual",
-                height=350,
+                height=500,
                 title="Q2: Residuals after removing density",
             )
             add_log_buttons(fig_r2)
@@ -995,7 +998,7 @@ with tabs[5]:
             x=types, y=[row[f"Mean {label_b_name}"] for row in rows],
             marker_color=colors_q4[:len(types)], showlegend=False,
         ), row=1, col=2)
-        fig_q4.update_layout(height=350)
+        fig_q4.update_layout(height=500)
         st.plotly_chart(fig_q4, use_container_width=True)
 
 
@@ -1052,7 +1055,7 @@ functional forms, then run the reconstruction and check recovery.
             fig_kv.add_trace(go.Scatter(x=r_plot, y=cr_learned, name="Learned kernel",
                                          line=dict(color="royalblue", width=2)))
             fig_kv.update_layout(xaxis_title="r [box units]", yaxis_title="C(r)",
-                                  height=300)
+                                  height=500)
             add_log_buttons(fig_kv)
             st.plotly_chart(fig_kv, use_container_width=True)
 
@@ -1079,7 +1082,7 @@ functional forms, then run the reconstruction and check recovery.
         fig_fs.update_layout(
             xaxis_title="True delta",
             yaxis_title="Reconstructed delta",
-            height=450,
+            height=500,
             title=f"Correlation = {float(syn['r_field']):.3f}",
         )
         equal_axes(fig_fs, true_d, recon_d)
