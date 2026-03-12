@@ -94,6 +94,29 @@ st.sidebar.markdown(
     "(Vecchia approximation)."
 )
 
+# PDF documentation links
+_PDF_DIR = os.path.dirname(__file__)
+_miniproject_path = os.path.join(_PDF_DIR, "miniproject.pdf")
+_proposal_path = os.path.join(_PDF_DIR, "proposal_v2.pdf")
+
+st.sidebar.markdown("### Documentation")
+if os.path.isfile(_miniproject_path):
+    with open(_miniproject_path, "rb") as f:
+        st.sidebar.download_button(
+            "Mini-project description (PDF)",
+            f.read(),
+            file_name="miniproject.pdf",
+            mime="application/pdf",
+        )
+if os.path.isfile(_proposal_path):
+    with open(_proposal_path, "rb") as f:
+        st.sidebar.download_button(
+            "Collaboration proposal (PDF)",
+            f.read(),
+            file_name="proposal_v2.pdf",
+            mime="application/pdf",
+        )
+
 results_path = os.path.join(OUTPUT_DIR, "gp_reconstruction_results.npz")
 has_results = os.path.exists(results_path)
 
