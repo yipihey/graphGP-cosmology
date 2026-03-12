@@ -83,6 +83,43 @@ def slice_mask(positions, axis, center, thickness):
     return (coord > center - thickness / 2) & (coord < center + thickness / 2)
 
 
+def add_log_buttons(fig, x=True, y=True):
+    """Add interactive log/linear toggle buttons to a Plotly figure."""
+    buttons = []
+    if x and y:
+        buttons = [
+            dict(label="Lin / Lin", method="relayout",
+                 args=[{"xaxis.type": "linear", "yaxis.type": "linear"}]),
+            dict(label="Log X", method="relayout",
+                 args=[{"xaxis.type": "log", "yaxis.type": "linear"}]),
+            dict(label="Log Y", method="relayout",
+                 args=[{"xaxis.type": "linear", "yaxis.type": "log"}]),
+            dict(label="Log / Log", method="relayout",
+                 args=[{"xaxis.type": "log", "yaxis.type": "log"}]),
+        ]
+    elif x:
+        buttons = [
+            dict(label="Linear X", method="relayout",
+                 args=[{"xaxis.type": "linear"}]),
+            dict(label="Log X", method="relayout",
+                 args=[{"xaxis.type": "log"}]),
+        ]
+    elif y:
+        buttons = [
+            dict(label="Linear Y", method="relayout",
+                 args=[{"yaxis.type": "linear"}]),
+            dict(label="Log Y", method="relayout",
+                 args=[{"yaxis.type": "log"}]),
+        ]
+    if buttons:
+        fig.update_layout(updatemenus=[
+            dict(type="buttons", direction="left", buttons=buttons,
+                 x=1.0, xanchor="right", y=1.15, yanchor="top",
+                 bgcolor="rgba(255,255,255,0.7)", font=dict(size=10)),
+        ])
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -274,11 +311,13 @@ with tabs[1]:
         fig_h = px.histogram(x=log_mass, nbins=60, labels={"x": "log10(M [Msun/h])"},
                              title="Halo mass distribution")
         fig_h.update_layout(height=350, showlegend=False)
+        add_log_buttons(fig_h)
         st.plotly_chart(fig_h, use_container_width=True)
     with col2:
         fig_v = px.histogram(x=v_mag, nbins=60, labels={"x": "|v| [km/s]"},
                              title="Halo velocity magnitude distribution")
         fig_v.update_layout(height=350, showlegend=False)
+        add_log_buttons(fig_v)
         st.plotly_chart(fig_v, use_container_width=True)
 
 
@@ -303,6 +342,7 @@ with tabs[2]:
             yaxis_title="-log posterior",
             height=350,
         )
+        add_log_buttons(fig_conv)
         st.plotly_chart(fig_conv, use_container_width=True)
 
         # --- Kernel ---
@@ -344,6 +384,7 @@ with tabs[2]:
             title=f"Kernel: variance = {variance:.4f} +/- {variance*(np.exp(sig_lv)-1):.4f}, "
                   f"scale = {scale_mpc:.1f} +/- {scale_mpc*(np.exp(sig_ls)-1):.1f} Mpc/h",
         )
+        add_log_buttons(fig_k)
         st.plotly_chart(fig_k, use_container_width=True)
 
         # --- 3D density field ---
@@ -481,6 +522,7 @@ with tabs[2]:
         fig_dh = px.histogram(x=delta, nbins=80, labels={"x": "delta"},
                                title="Distribution of reconstructed delta at halo positions")
         fig_dh.update_layout(height=300, showlegend=False)
+        add_log_buttons(fig_dh)
         st.plotly_chart(fig_dh, use_container_width=True)
 
 
@@ -571,6 +613,7 @@ with tabs[3]:
             barmode="overlay", height=350,
             xaxis_title="Eigenvalue", yaxis_title="Count",
         )
+        add_log_buttons(fig_eig)
         st.plotly_chart(fig_eig, use_container_width=True)
 
         # Tidal shear & laplacian
@@ -579,12 +622,14 @@ with tabs[3]:
             fig_lap = px.histogram(x=laplacian, nbins=80, title="Laplacian (tr H)",
                                     labels={"x": "Laplacian"})
             fig_lap.update_layout(height=300, showlegend=False)
+            add_log_buttons(fig_lap)
             st.plotly_chart(fig_lap, use_container_width=True)
         with col2:
             fig_s2 = px.histogram(x=np.log10(s_squared + 1), nbins=80,
                                    title="log10(1 + s^2) Tidal Shear",
                                    labels={"x": "log10(1 + s^2)"})
             fig_s2.update_layout(height=300, showlegend=False)
+            add_log_buttons(fig_s2)
             st.plotly_chart(fig_s2, use_container_width=True)
 
 
@@ -664,6 +709,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                         height=350,
                         title=f"{eig_names[i]} (r={r_val:.3f})",
                     )
+                    add_log_buttons(fig_sc)
                     st.plotly_chart(fig_sc, use_container_width=True)
 
             # --- Eigenvalue distributions overlay ---
@@ -686,6 +732,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                 barmode="overlay", height=400,
                 xaxis_title="Eigenvalue", yaxis_title="Count",
             )
+            add_log_buttons(fig_dist)
             st.plotly_chart(fig_dist, use_container_width=True)
 
             # --- Laplacian and tidal shear comparison ---
@@ -709,6 +756,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                     xaxis_title="GP Laplacian", yaxis_title="QF Laplacian",
                     height=350, title=f"Laplacian (r={r_lap:.3f})",
                 )
+                add_log_buttons(fig_lap)
                 st.plotly_chart(fig_lap, use_container_width=True)
             with col2:
                 r_s2, _ = pearsonr(s2_gp, s2_qf)
@@ -727,6 +775,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                     xaxis_title="GP s^2", yaxis_title="QF s^2",
                     height=350, title=f"Tidal shear s^2 (r={r_s2:.3f})",
                 )
+                add_log_buttons(fig_s2)
                 st.plotly_chart(fig_s2, use_container_width=True)
 
             # --- Spatial comparison (2D slice) ---
@@ -807,6 +856,7 @@ with tabs[5]:
             )])
             fig_q1a.update_layout(xaxis_title="delta", yaxis_title=label_a_name,
                                    height=350, title=f"{label_a_name} vs delta")
+            add_log_buttons(fig_q1a)
             st.plotly_chart(fig_q1a, use_container_width=True)
         with col2:
             fig_q1b = go.Figure(data=[go.Scatter(
@@ -815,6 +865,7 @@ with tabs[5]:
             )])
             fig_q1b.update_layout(xaxis_title="delta", yaxis_title=label_b_name,
                                    height=350, title=f"{label_b_name} vs delta")
+            add_log_buttons(fig_q1b)
             st.plotly_chart(fig_q1b, use_container_width=True)
 
         # ------ Q2 ------
@@ -847,6 +898,7 @@ with tabs[5]:
                 height=350,
                 title="Q2: Residuals after removing density",
             )
+            add_log_buttons(fig_r1)
             st.plotly_chart(fig_r1, use_container_width=True)
         with col2:
             cb = P.polyfit(delta, label_b, 1)
@@ -861,6 +913,7 @@ with tabs[5]:
                 height=350,
                 title="Q2: Residuals after removing density",
             )
+            add_log_buttons(fig_r2)
             st.plotly_chart(fig_r2, use_container_width=True)
 
         # ------ Q3 ------
@@ -962,6 +1015,7 @@ functional forms, then run the reconstruction and check recovery.
                                          line=dict(color="royalblue", width=2)))
             fig_kv.update_layout(xaxis_title="r [box units]", yaxis_title="C(r)",
                                   height=300)
+            add_log_buttons(fig_kv)
             st.plotly_chart(fig_kv, use_container_width=True)
 
         # Field scatter
@@ -987,6 +1041,7 @@ functional forms, then run the reconstruction and check recovery.
             height=450,
             title=f"Correlation = {float(syn['r_field']):.3f}",
         )
+        add_log_buttons(fig_fs)
         st.plotly_chart(fig_fs, use_container_width=True)
 
         # Q2 check
