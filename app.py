@@ -83,6 +83,30 @@ def slice_mask(positions, axis, center, thickness):
     return (coord > center - thickness / 2) & (coord < center + thickness / 2)
 
 
+def clip_axes(fig, x_data=None, y_data=None, pct=(1, 99), margin=0.05):
+    """Set axis ranges to percentile bounds with margin, avoiding extreme tails."""
+    rng = {}
+    for data, axis in [(x_data, "xaxis"), (y_data, "yaxis")]:
+        if data is not None:
+            lo, hi = np.percentile(data, pct)
+            pad = margin * (hi - lo) if hi > lo else 1.0
+            rng[f"{axis}.range"] = [lo - pad, hi + pad]
+    if rng:
+        fig.update_layout(**rng)
+    return fig
+
+
+def equal_axes(fig, x_data, y_data, pct=(1, 99), margin=0.05):
+    """Force equal x/y ranges for comparison scatters (1:1 line at 45 deg)."""
+    combined = np.concatenate([np.asarray(x_data).ravel(),
+                               np.asarray(y_data).ravel()])
+    lo, hi = np.percentile(combined, pct)
+    pad = margin * (hi - lo) if hi > lo else 1.0
+    r = [lo - pad, hi + pad]
+    fig.update_layout(**{"xaxis.range": r, "yaxis.range": r})
+    return fig
+
+
 def add_log_buttons(fig, x=True, y=True):
     """Add interactive log/linear toggle buttons to a Plotly figure."""
     buttons = []
@@ -613,6 +637,7 @@ with tabs[3]:
             barmode="overlay", height=350,
             xaxis_title="Eigenvalue", yaxis_title="Count",
         )
+        clip_axes(fig_eig, x_data=eigenvalues.ravel())
         add_log_buttons(fig_eig)
         st.plotly_chart(fig_eig, use_container_width=True)
 
@@ -622,6 +647,7 @@ with tabs[3]:
             fig_lap = px.histogram(x=laplacian, nbins=80, title="Laplacian (tr H)",
                                     labels={"x": "Laplacian"})
             fig_lap.update_layout(height=300, showlegend=False)
+            clip_axes(fig_lap, x_data=laplacian)
             add_log_buttons(fig_lap)
             st.plotly_chart(fig_lap, use_container_width=True)
         with col2:
@@ -697,8 +723,11 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                         mode="markers",
                         marker=dict(size=2, opacity=0.3, color="steelblue"),
                     )])
-                    lims = [min(eigenvalues_gp[:, i].min(), eigenvalues_qf[:, i].min()),
-                            max(eigenvalues_gp[:, i].max(), eigenvalues_qf[:, i].max())]
+                    # 1:1 line spanning the clipped range
+                    combined = np.concatenate([eigenvalues_gp[:, i], eigenvalues_qf[:, i]])
+                    lo, hi = np.percentile(combined, [1, 99])
+                    pad = 0.05 * (hi - lo)
+                    lims = [lo - pad, hi + pad]
                     fig_sc.add_trace(go.Scatter(
                         x=lims, y=lims, mode="lines",
                         line=dict(color="red", dash="dash"), showlegend=False,
@@ -709,6 +738,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                         height=350,
                         title=f"{eig_names[i]} (r={r_val:.3f})",
                     )
+                    equal_axes(fig_sc, eigenvalues_gp[:, i], eigenvalues_qf[:, i])
                     add_log_buttons(fig_sc)
                     st.plotly_chart(fig_sc, use_container_width=True)
 
@@ -732,6 +762,8 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                 barmode="overlay", height=400,
                 xaxis_title="Eigenvalue", yaxis_title="Count",
             )
+            all_eig = np.concatenate([eigenvalues_gp.ravel(), eigenvalues_qf.ravel()])
+            clip_axes(fig_dist, x_data=all_eig)
             add_log_buttons(fig_dist)
             st.plotly_chart(fig_dist, use_container_width=True)
 
@@ -746,8 +778,10 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                     mode="markers",
                     marker=dict(size=2, opacity=0.3, color="steelblue"),
                 )])
-                lims_l = [min(laplacian_gp.min(), laplacian_qf.min()),
-                          max(laplacian_gp.max(), laplacian_qf.max())]
+                combined_l = np.concatenate([laplacian_gp, laplacian_qf])
+                lo_l, hi_l = np.percentile(combined_l, [1, 99])
+                pad_l = 0.05 * (hi_l - lo_l)
+                lims_l = [lo_l - pad_l, hi_l + pad_l]
                 fig_lap.add_trace(go.Scatter(
                     x=lims_l, y=lims_l, mode="lines",
                     line=dict(color="red", dash="dash"), showlegend=False,
@@ -756,6 +790,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                     xaxis_title="GP Laplacian", yaxis_title="QF Laplacian",
                     height=350, title=f"Laplacian (r={r_lap:.3f})",
                 )
+                equal_axes(fig_lap, laplacian_gp, laplacian_qf)
                 add_log_buttons(fig_lap)
                 st.plotly_chart(fig_lap, use_container_width=True)
             with col2:
@@ -765,8 +800,10 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                     mode="markers",
                     marker=dict(size=2, opacity=0.3, color="darkorange"),
                 )])
-                lims_s = [min(s2_gp.min(), s2_qf.min()),
-                          max(s2_gp.max(), s2_qf.max())]
+                combined_s = np.concatenate([s2_gp, s2_qf])
+                lo_s, hi_s = np.percentile(combined_s, [1, 99])
+                pad_s = 0.05 * (hi_s - lo_s)
+                lims_s = [lo_s - pad_s, hi_s + pad_s]
                 fig_s2.add_trace(go.Scatter(
                     x=lims_s, y=lims_s, mode="lines",
                     line=dict(color="red", dash="dash"), showlegend=False,
@@ -775,6 +812,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                     xaxis_title="GP s^2", yaxis_title="QF s^2",
                     height=350, title=f"Tidal shear s^2 (r={r_s2:.3f})",
                 )
+                equal_axes(fig_s2, s2_gp, s2_qf)
                 add_log_buttons(fig_s2)
                 st.plotly_chart(fig_s2, use_container_width=True)
 
@@ -1030,7 +1068,10 @@ functional forms, then run the reconstruction and check recovery.
             marker=dict(size=2.5, opacity=0.3, color="steelblue"),
             name="Halos",
         ))
-        lims = [min(true_d.min(), recon_d.min()), max(true_d.max(), recon_d.max())]
+        combined_d = np.concatenate([true_d, recon_d])
+        lo_d, hi_d = np.percentile(combined_d, [1, 99])
+        pad_d = 0.05 * (hi_d - lo_d)
+        lims = [lo_d - pad_d, hi_d + pad_d]
         fig_fs.add_trace(go.Scatter(
             x=lims, y=lims, mode="lines",
             line=dict(color="red", dash="dash"), name="Perfect recovery",
@@ -1041,6 +1082,7 @@ functional forms, then run the reconstruction and check recovery.
             height=450,
             title=f"Correlation = {float(syn['r_field']):.3f}",
         )
+        equal_axes(fig_fs, true_d, recon_d)
         add_log_buttons(fig_fs)
         st.plotly_chart(fig_fs, use_container_width=True)
 
