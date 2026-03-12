@@ -30,7 +30,8 @@ from graphGP_cosmo import (
     make_kernel, poisson_log_likelihood, optimize_field,
     optimize_kernel, compute_hessian_quadratic_fit,
     compute_gp_derivatives, partial_corr, compute_kernel_fisher,
-    N0, K_NEIGHBORS, OUTPUT_DIR,
+    build_combined_graph,
+    N0, K_NEIGHBORS, N_VOL_POINTS, OUTPUT_DIR,
 )
 
 # True kernel parameters (in [0,1] box units)
@@ -118,16 +119,22 @@ def assign_labels(true_delta, true_s2):
 
 
 def run_reconstruction(obs_points, n_obs):
-    """Run the pipeline on observed points."""
+    """Run the pipeline on observed points with volume integral."""
     print("\n" + "=" * 60)
     print("Running reconstruction on synthetic data")
     print("=" * 60)
 
     obs_jax = jnp.array(obs_points)
 
+    # Halo-only graph (for Hessian later)
     n0 = min(N0, n_obs // 2)
     k = min(K_NEIGHBORS, n0 - 1)
-    graph = gp.build_graph(obs_jax, n0=n0, k=k)
+    graph_halo = gp.build_graph(obs_jax, n0=n0, k=k)
+
+    # Combined graph with volume points (for corrected likelihood)
+    n_vol_syn = min(N_VOL_POINTS, n_obs)  # scale volume points to problem size
+    graph_combined, n_halo, n_vol, vol_points = \
+        build_combined_graph(obs_jax, n_vol=n_vol_syn, seed=42)
     n_bar = float(n_obs)
 
     # Initial kernel (deliberately off from truth)
@@ -136,30 +143,34 @@ def run_reconstruction(obs_points, n_obs):
 
     # Round 1: field
     xi, delta_map, losses1 = optimize_field(
-        graph, n_bar, init_log_var, init_log_scale,
-        n_steps=150, lr=1e-2)
+        graph_combined, n_bar, init_log_var, init_log_scale,
+        n_steps=150, lr=1e-2, n_halo=n_halo, n_vol=n_vol)
 
     # Round 1: kernel
     opt_lv, opt_ls = optimize_kernel(
-        delta_map, graph, init_log_var, init_log_scale,
+        delta_map, graph_combined, init_log_var, init_log_scale,
         n_steps=40, lr=1e-3)
 
     # Round 2: field with learned kernel
     xi, delta_map, losses2 = optimize_field(
-        graph, n_bar, opt_lv, opt_ls,
-        n_steps=150, lr=1e-2, xi_init=xi)
+        graph_combined, n_bar, opt_lv, opt_ls,
+        n_steps=150, lr=1e-2, xi_init=xi, n_halo=n_halo, n_vol=n_vol)
 
     # Round 2: kernel
     opt_lv, opt_ls = optimize_kernel(
-        delta_map, graph, opt_lv, opt_ls,
+        delta_map, graph_combined, opt_lv, opt_ls,
         n_steps=40, lr=1e-3)
 
     # Final field
     xi, delta_map, losses3 = optimize_field(
-        graph, n_bar, opt_lv, opt_ls,
-        n_steps=150, lr=1e-2, xi_init=xi)
+        graph_combined, n_bar, opt_lv, opt_ls,
+        n_steps=150, lr=1e-2, xi_init=xi, n_halo=n_halo, n_vol=n_vol)
 
     all_losses = losses1 + losses2 + losses3
+
+    # Extract halo-only delta
+    delta_halo = delta_map[:n_halo]
+    delta_vol = delta_map[n_halo:]
 
     learned_var = float(jnp.exp(opt_lv))
     learned_scale = float(jnp.exp(opt_ls))
@@ -168,13 +179,14 @@ def run_reconstruction(obs_points, n_obs):
           f"(true = {TRUE_VARIANCE:.4f})")
     print(f"  Learned kernel: scale = {learned_scale:.4f} "
           f"(true = {TRUE_SCALE:.4f})")
+    print(f"  Volume delta: mean = {float(delta_vol.mean()):.4f}")
 
     # Fisher uncertainties
     fisher, fisher_unc = compute_kernel_fisher(
-        delta_map, graph, opt_lv, opt_ls)
+        delta_map, graph_combined, opt_lv, opt_ls)
 
-    return (np.array(delta_map), learned_var, learned_scale,
-            all_losses, graph, opt_lv, opt_ls, fisher_unc)
+    return (np.array(delta_halo), learned_var, learned_scale,
+            all_losses, graph_halo, opt_lv, opt_ls, fisher_unc)
 
 
 def validate(true_delta, recon_delta, true_var, learned_var,

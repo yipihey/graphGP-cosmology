@@ -216,17 +216,20 @@ halo properties (mass, velocity) depend on the local tidal environment
 beyond their dependence on density alone.
 
 **Method:**
-1. Build a Vecchia-approximation neighbor graph on halo positions
+1. Build a Vecchia-approximation neighbor graph on halo + volume-filling positions
 2. Parameterize the density field via a Gaussian process in white-noise (xi) space
-3. Maximize the Poisson log-likelihood + GP log-prior via gradient descent
+3. Maximize the Poisson log-likelihood (with volume integral) + GP log-prior
 4. Alternate between field and kernel hyperparameter optimization
 5. Compute the Hessian via GP derivatives (autodiff through the kernel) to classify the cosmic web
 6. Test label-environment correlations (Q1-Q4)
 
 **Key equations:**
-- Poisson likelihood: `ln L = sum_i ln[n_bar * (1 + delta_i)] - N`
+- Poisson likelihood: `ln L = sum_i ln[n_bar(1+d_i)] - n_bar * (1/N_vol) * sum_j (1+d_j)`
 - GP prior (xi-space): `ln p(xi) = -0.5 * ||xi||^2`
 - Field: `delta = L * xi` where `L` is the Vecchia Cholesky factor
+
+The volume integral (second term) is estimated via Monte Carlo over uniform
+volume-filling points, correcting the bias from sampling only at halo positions.
 """)
     with col2:
         if has_results:
@@ -234,8 +237,12 @@ beyond their dependence on density alone.
             st.metric("Halos", f"{len(r['positions']):,}")
             st.metric("Kernel variance", f"{float(r['kernel_variance']):.4f}")
             st.metric("Kernel scale", f"{float(r['kernel_scale_mpc_h']):.1f} Mpc/h")
-            st.metric("Field range",
+            st.metric("Halo delta range",
                        f"[{r['delta'].min():.2f}, {r['delta'].max():.2f}]")
+            if "delta_vol" in r:
+                dv = r["delta_vol"]
+                st.metric("Volume pts", f"{len(dv):,}")
+                st.metric("Volume <delta>", f"{dv.mean():.3f}")
         else:
             st.info("Run the pipeline to see summary metrics.")
 
@@ -546,9 +553,35 @@ with tabs[2]:
 
         # Delta histogram
         st.subheader("Density field distribution")
-        fig_dh = px.histogram(x=delta, nbins=80, labels={"x": "delta"},
-                               title="Distribution of reconstructed delta at halo positions")
-        fig_dh.update_layout(height=500, showlegend=False)
+
+        has_vol = "delta_vol" in r
+        fig_dh = go.Figure()
+        fig_dh.add_trace(go.Histogram(
+            x=delta, nbinsx=80, name="Mass-weighted (at halos)",
+            opacity=0.7, marker_color="steelblue",
+            histnorm="probability density",
+        ))
+        if has_vol:
+            delta_vol = r["delta_vol"]
+            fig_dh.add_trace(go.Histogram(
+                x=delta_vol, nbinsx=80, name="Volume-weighted (uniform pts)",
+                opacity=0.6, marker_color="darkorange",
+                histnorm="probability density",
+            ))
+            fig_dh.update_layout(barmode="overlay")
+            mean_vol = float(delta_vol.mean())
+            frac_neg = float(np.mean(delta_vol < 0))
+            st.caption(
+                f"Volume points: N = {len(delta_vol)}, "
+                f"<delta_vol> = {mean_vol:.3f}, "
+                f"fraction delta < 0: {100*frac_neg:.1f}%"
+            )
+        fig_dh.update_layout(
+            xaxis_title="delta",
+            yaxis_title="Probability density",
+            height=500,
+            title="Density PDF: mass-weighted (halos) vs volume-weighted (uniform)",
+        )
         add_log_buttons(fig_dh)
         st.plotly_chart(fig_dh, use_container_width=True)
 

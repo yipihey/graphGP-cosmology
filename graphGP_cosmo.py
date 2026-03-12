@@ -50,6 +50,10 @@ L_BOX = 1000.0
 N0 = 100
 K_NEIGHBORS = 15
 
+# Volume-filling points for likelihood integral
+N_VOL_POINTS = 3000
+VOL_SEED = 99
+
 # Kernel initial guesses
 INIT_VARIANCE = 1.0
 INIT_SCALE = 30.0  # Mpc/h
@@ -127,6 +131,43 @@ def build_graph(points):
     return graph, points_norm
 
 
+def build_combined_graph(halo_points_norm, n_vol=N_VOL_POINTS, seed=VOL_SEED):
+    """
+    Build graph on halo positions + uniform volume-filling points.
+
+    The volume points provide unbiased Monte Carlo integration for the
+    Poisson likelihood normalization (the integral of lambda over the box).
+
+    Args:
+        halo_points_norm: (N_halo, 3) halo positions in [0,1] box units
+        n_vol: number of uniform volume-filling points
+        seed: random seed for volume point generation
+
+    Returns:
+        graph: GraphGP Graph on combined points (halos first, then volume)
+        n_halo: number of halo points
+        n_vol: number of volume points
+        vol_points: (n_vol, 3) volume point positions in [0,1]
+    """
+    n_halo = len(halo_points_norm)
+    print(f"\n  Building combined graph: {n_halo} halos + {n_vol} volume points")
+
+    rng = np.random.RandomState(seed)
+    vol_points = jnp.array(rng.uniform(0, 1, size=(n_vol, 3)).astype(np.float32))
+
+    combined = jnp.concatenate([halo_points_norm, vol_points], axis=0)
+    N_total = len(combined)
+
+    n0 = min(N0, N_total // 2)
+    k = min(K_NEIGHBORS, n0 - 1)
+
+    print(f"  N_total = {N_total}, n0 = {n0}, k = {k}")
+    graph = gp.build_graph(combined, n0=n0, k=k)
+    print(f"  Combined graph built.")
+
+    return graph, n_halo, n_vol, vol_points
+
+
 # =====================================================================
 # STEP 2: KERNEL
 # =====================================================================
@@ -153,27 +194,49 @@ def make_kernel(log_variance, log_scale):
 # STEP 3: MAP OPTIMIZATION (xi-space for field, delta-space for kernel)
 # =====================================================================
 
-def poisson_log_likelihood(delta, n_bar):
+def poisson_log_likelihood(delta, n_bar, n_halo, n_vol=0):
     """
-    Poisson point process log-likelihood.
+    Poisson point process log-likelihood with volume integral.
 
-    ln L = sum_i ln[n_bar * (1 + delta_i)] - N
+    Full form:
+      ln L = sum_{i in halos} ln[n_bar * (1 + delta_i)]
+           - n_bar * (V / N_vol) * sum_{j in vol} (1 + delta_j)
+
+    The first n_halo entries of delta are at halo positions (observed);
+    the remaining n_vol entries are at uniform volume-filling points
+    (for Monte Carlo integration of the intensity over the full volume).
+
+    With V = 1 (unit box), n_bar ~ N_halo.
     """
-    density = jnp.clip(1.0 + delta, 1e-10, None)
-    ll = jnp.sum(jnp.log(n_bar * density))
-    N = len(delta)
-    ll -= N
+    delta_halo = delta[:n_halo]
+    density_halo = jnp.clip(1.0 + delta_halo, 1e-10, None)
+    ll = jnp.sum(jnp.log(n_bar * density_halo))
+
+    if n_vol > 0:
+        delta_vol = delta[n_halo:]
+        # Monte Carlo estimate of integral[ n_bar*(1+delta(x)) dx ] over V=1
+        # Clip to non-negative density (physical constraint: rho >= 0)
+        density_vol = jnp.clip(1.0 + delta_vol, 1e-10, None)
+        integral = n_bar * (1.0 / n_vol) * jnp.sum(density_vol)
+        ll -= integral
+    else:
+        # Fallback: approximate integral as N_halo (assumes <delta>=0)
+        ll -= n_halo
+
     return ll
 
 
 def optimize_field(graph, n_bar, log_variance, log_scale,
-                   n_steps=200, lr=1e-2, xi_init=None):
+                   n_steps=200, lr=1e-2, xi_init=None,
+                   n_halo=None, n_vol=0):
     """
     MAP field estimation in xi-space (white-noise parameterization).
 
     delta = gp.generate(graph, cov, xi)
     Prior: p(xi) = N(0, I), so log-prior = -0.5 * ||xi||^2
-    No logdet or generate_inv needed during field optimization.
+
+    When n_vol > 0, the Poisson likelihood includes a Monte Carlo volume
+    integral over uniform volume-filling points (indices n_halo..N-1).
 
     Returns:
         xi_map: (N,) MAP white-noise parameters
@@ -187,6 +250,10 @@ def optimize_field(graph, n_bar, log_variance, log_scale,
     N = len(graph.points)
     cov = make_kernel(log_variance, log_scale)
 
+    # Default: all points are halos (backward compatible)
+    _n_halo = n_halo if n_halo is not None else N
+    _n_vol = n_vol
+
     if xi_init is None:
         key = jax.random.PRNGKey(42)
         xi = 0.01 * jax.random.normal(key, shape=(N,))
@@ -199,7 +266,7 @@ def optimize_field(graph, n_bar, log_variance, log_scale,
     @jit
     def loss_fn(xi):
         delta = gp.generate(graph, cov, xi)
-        ll = poisson_log_likelihood(delta, n_bar)
+        ll = poisson_log_likelihood(delta, n_bar, _n_halo, _n_vol)
         log_prior = -0.5 * jnp.dot(xi, xi)
         return -(ll + log_prior)
 
@@ -215,9 +282,14 @@ def optimize_field(graph, n_bar, log_variance, log_scale,
 
         if step % 50 == 0 or step == n_steps - 1:
             delta = gp.generate(graph, cov, xi)
-            print(f"  Step {step:4d}: loss = {loss_val:.2f}, "
-                  f"delta range = [{float(delta.min()):.3f}, "
-                  f"{float(delta.max()):.3f}]")
+            d_halo = delta[:_n_halo]
+            msg = (f"  Step {step:4d}: loss = {loss_val:.2f}, "
+                   f"delta_halo = [{float(d_halo.min()):.3f}, "
+                   f"{float(d_halo.max()):.3f}]")
+            if _n_vol > 0:
+                d_vol = delta[_n_halo:]
+                msg += f", <delta_vol> = {float(d_vol.mean()):.3f}"
+            print(msg)
 
     delta_map = gp.generate(graph, cov, xi)
     return xi, delta_map, losses
@@ -844,9 +916,14 @@ def main(sim_idx=0):
     print(f"  Label b ({label_b_name}): "
           f"range [{label_b.min():.1f}, {label_b.max():.1f}]")
 
-    # ── Step 1: Build graph ──────────────────────────────────────
-    graph, points_norm = build_graph(positions)
+    # ── Step 1: Build graphs ─────────────────────────────────────
+    # Halo-only graph (for Hessian computation later)
+    graph_halo, points_norm = build_graph(positions)
     n_bar = float(N)
+
+    # Combined graph with volume-filling points (for corrected likelihood)
+    graph_combined, n_halo, n_vol, vol_points = \
+        build_combined_graph(points_norm, n_vol=N_VOL_POINTS)
 
     # ── Step 2: Initial kernel ───────────────────────────────────
     log_var = jnp.log(jnp.array(INIT_VARIANCE, dtype=jnp.float32))
@@ -856,7 +933,7 @@ def main(sim_idx=0):
           f"scale = {INIT_SCALE:.1f} Mpc/h "
           f"({INIT_SCALE/L_BOX:.4f} box units)")
 
-    # ── Step 3: Alternating optimization ─────────────────────────
+    # ── Step 3: Alternating optimization (combined graph) ────────
     all_losses = []
     xi_current = None
 
@@ -865,33 +942,39 @@ def main(sim_idx=0):
         print(f"  ALTERNATING ROUND {rnd+1}/{N_ALTERNATING_ROUNDS}")
         print(f"{'*'*60}")
 
-        # Field optimization (xi-space)
+        # Field optimization (xi-space) with volume integral
         xi_current, delta_map, losses = optimize_field(
-            graph, n_bar, log_var, log_scale,
+            graph_combined, n_bar, log_var, log_scale,
             n_steps=N_OPTIM_STEPS, lr=LEARNING_RATE,
-            xi_init=xi_current)
+            xi_init=xi_current, n_halo=n_halo, n_vol=n_vol)
         all_losses.extend(losses)
 
-        # Kernel optimization (delta-space)
+        # Kernel optimization (delta-space) on combined graph
         log_var, log_scale = optimize_kernel(
-            delta_map, graph, log_var, log_scale,
+            delta_map, graph_combined, log_var, log_scale,
             n_steps=N_KERNEL_STEPS, lr=1e-3)
 
     # Final field optimization with learned kernel
     xi_current, delta_map, losses = optimize_field(
-        graph, n_bar, log_var, log_scale,
+        graph_combined, n_bar, log_var, log_scale,
         n_steps=N_OPTIM_STEPS, lr=LEARNING_RATE,
-        xi_init=xi_current)
+        xi_init=xi_current, n_halo=n_halo, n_vol=n_vol)
     all_losses.extend(losses)
+
+    # Extract halo and volume delta
+    delta_halo = np.array(delta_map[:n_halo])
+    delta_vol = np.array(delta_map[n_halo:])
+    vol_points_np = np.array(vol_points)
 
     print(f"\n  Final kernel: variance = {float(jnp.exp(log_var)):.4f}, "
           f"scale = {float(jnp.exp(log_scale)) * L_BOX:.1f} Mpc/h")
-    print(f"  Field range: [{float(delta_map.min()):.3f}, "
-          f"{float(delta_map.max()):.3f}]")
+    print(f"  Halo delta range: [{delta_halo.min():.3f}, {delta_halo.max():.3f}]")
+    print(f"  Volume delta: mean = {delta_vol.mean():.3f}, "
+          f"range = [{delta_vol.min():.3f}, {delta_vol.max():.3f}]")
 
     # ── Fisher matrix for kernel uncertainties ───────────────────
     fisher, fisher_unc = compute_kernel_fisher(
-        delta_map, graph, log_var, log_scale)
+        delta_map, graph_combined, log_var, log_scale)
 
     var_val = float(jnp.exp(log_var))
     scale_val = float(jnp.exp(log_scale)) * L_BOX
@@ -900,13 +983,14 @@ def main(sim_idx=0):
     print(f"  Kernel: variance = {var_val:.4f} +/- {var_val*(np.exp(sig_lv)-1):.4f}")
     print(f"  Kernel: scale = {scale_val:.1f} +/- {scale_val*(np.exp(sig_ls)-1):.1f} Mpc/h")
 
-    # Convert to numpy
-    delta_np = np.array(delta_map)
+    # Convert to numpy (halo-only)
+    delta_np = delta_halo
     points_np = np.array(points_norm)
 
-    # ── Step 4: Hessian and cosmic web ───────────────────────────
+    # ── Step 4: Hessian and cosmic web (halo-only graph) ─────────
     gradient, hessian, eigenvalues, labels_geo, laplacian, s_squared = \
-        compute_gp_derivatives(graph, make_kernel(log_var, log_scale), delta_map,
+        compute_gp_derivatives(graph_halo, make_kernel(log_var, log_scale),
+                               jnp.array(delta_halo),
                                log_variance=log_var, log_scale=log_scale)
 
     # Also compute quadratic-fit Hessian for comparison
@@ -921,7 +1005,7 @@ def main(sim_idx=0):
 
     # ── Step 5b: Q4 label-dependent clustering ───────────────────
     q4_results = label_dependent_clustering(
-        positions, label_a, label_a_name, graph)
+        positions, label_a, label_a_name, graph_halo)
 
     # ── Plots ────────────────────────────────────────────────────
     make_plots(
@@ -952,6 +1036,10 @@ def main(sim_idx=0):
         laplacian_qf=laplacian_qf,
         s_squared_qf=s_squared_qf,
         labels_geo_qf=labels_geo_qf,
+        # Volume-filling evaluation
+        delta_vol=delta_vol,
+        vol_points=vol_points_np,
+        n_vol_points=n_vol,
         # Kernel info
         kernel_variance=var_val,
         kernel_scale_mpc_h=scale_val,
