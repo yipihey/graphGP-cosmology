@@ -680,7 +680,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
                 fig_dist.add_trace(go.Histogram(
                     x=eigenvalues_qf[:, i], nbinsx=80,
                     name=f"QF {eig_names[i]}", marker_color=colors_qf[i],
-                    opacity=0.4, line=dict(dash="dot"),
+                    opacity=0.4,
                 ))
             fig_dist.update_layout(
                 barmode="overlay", height=400,
