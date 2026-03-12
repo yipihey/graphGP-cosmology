@@ -311,7 +311,7 @@ def compute_kernel_fisher(delta, graph, opt_log_var, opt_log_scale):
 # STEP 4: COMPUTE HESSIAN AND CLASSIFY LOCAL GEOMETRY
 # =====================================================================
 
-def compute_hessian_local_quadratic(delta, points):
+def compute_hessian_quadratic_fit(delta, points):
     """
     Estimate gradient and Hessian at each point via local quadratic fits
     using k-nearest-neighbor weighted least squares.
@@ -381,6 +381,160 @@ def compute_hessian_local_quadratic(delta, points):
     eigenvalues = eigenvalues[:, ::-1]  # descending: l1 >= l2 >= l3
 
     # Classify by number of positive eigenvalues of -H
+    n_positive_neg_H = np.sum(-eigenvalues > 0, axis=1)
+    labels_geo = np.array(["void"] * N, dtype=object)
+    labels_geo[n_positive_neg_H == 1] = "sheet"
+    labels_geo[n_positive_neg_H == 2] = "filament"
+    labels_geo[n_positive_neg_H == 3] = "peak"
+
+    unique, counts = np.unique(labels_geo, return_counts=True)
+    print(f"\n  Cosmic web classification:")
+    for u, c in zip(unique, counts):
+        print(f"    {u:10s}: {c:5d} ({100*c/N:.1f}%)")
+
+    laplacian = np.trace(hessian, axis1=1, axis2=2)
+
+    trace_part = (laplacian / 3.0)[:, None, None] * np.eye(3)[None, :, :]
+    s_ij = hessian - trace_part
+    s_squared = np.sum(s_ij ** 2, axis=(1, 2))
+
+    print(f"\n  Laplacian range: [{laplacian.min():.4f}, {laplacian.max():.4f}]")
+    print(f"  Tidal shear s^2 range: [{s_squared.min():.4f}, {s_squared.max():.4f}]")
+
+    return gradient, hessian, eigenvalues, labels_geo, laplacian, s_squared
+
+
+def compute_gp_derivatives(graph, cov, delta, log_variance=None, log_scale=None):
+    """
+    Compute gradient and Hessian of the GP posterior mean at each point
+    using Vecchia-local conditionals and JAX autodiff.
+
+    For refined points (i >= n0): differentiate the Vecchia conditional mean
+      mu(x) = k(x, X_nbrs) @ K_nbrs^{-1} @ delta_nbrs
+    For dense points (i < n0): differentiate
+      mu(x) = k(x, X_dense) @ K_dense^{-1} @ delta_dense
+
+    Uses the analytical RBF kernel C(r) = var * exp(-0.5*(r/l)^2) for
+    differentiation (not jnp.interp, which is piecewise-linear and has
+    zero second derivatives).  The cov tuple is still used to build K_nn
+    and K_dd via jnp.interp (where only values, not derivatives, matter).
+
+    Args:
+        graph: GraphGP Graph object
+        cov: (r_bins, c_vals) kernel tuple (used for covariance matrices)
+        delta: (N,) field values in original point order
+        log_variance: log of kernel variance (if None, estimated from cov)
+        log_scale: log of kernel scale (if None, estimated from cov)
+
+    Returns:
+        gradient, hessian, eigenvalues, labels_geo, laplacian, s_squared
+    """
+    print("\n" + "=" * 60)
+    print("STEP 4: Computing Hessian (GP derivatives via autodiff)")
+    print("=" * 60)
+
+    r_bins, c_vals = cov
+    n0 = graph.offsets[0]
+    N = len(graph.points)
+
+    # Extract kernel parameters
+    if log_variance is None or log_scale is None:
+        # Estimate from the tabulated kernel
+        variance = c_vals[0]  # C(0) ≈ variance (+ small jitter)
+        # Find scale from C(r) = variance/e ⟹ r = scale
+        half_idx = jnp.searchsorted(-c_vals, -variance / jnp.e)
+        scale = r_bins[half_idx]
+    else:
+        variance = jnp.exp(log_variance)
+        scale = jnp.exp(log_scale)
+
+    print(f"  Kernel: variance = {float(variance):.4f}, "
+          f"scale = {float(scale):.4f} box units")
+
+    # Reorder delta into graph order
+    delta_graph = delta[graph.indices]
+
+    def rbf_kernel(r_sq):
+        """Smooth RBF kernel as a function of squared distance."""
+        return variance * jnp.exp(-0.5 * r_sq / (scale ** 2))
+
+    def safe_dist_sq(x, axis=-1):
+        """Squared distance (no norm singularity)."""
+        return jnp.sum(x ** 2, axis=axis)
+
+    # --- Refined points (i >= n0): Vecchia-local conditional ---
+    n_refined = N - n0
+    k = graph.neighbors.shape[1]
+    print(f"  Refined points: {n_refined}, neighbors k = {k}")
+    print(f"  Dense points: {n0}")
+
+    # Gather neighbor data for all refined points
+    neighbor_points = graph.points[graph.neighbors]        # (n_refined, k, 3)
+    neighbor_values = delta_graph[graph.neighbors]         # (n_refined, k)
+    refined_points = graph.points[n0:]                     # (n_refined, 3)
+
+    def refined_conditional_mean(x_query, nbr_pts, nbr_vals):
+        """Conditional mean at x_query given neighbor points and values."""
+        # Cross-covariance: use smooth RBF for differentiability
+        diffs = x_query[None, :] - nbr_pts                # (k, 3)
+        k_star = rbf_kernel(safe_dist_sq(diffs, axis=1))   # (k,)
+
+        # Neighbor-neighbor covariance: use interp (only values needed, not derivatives)
+        diffs_nn = nbr_pts[:, None, :] - nbr_pts[None, :, :]
+        dists_nn = jnp.sqrt(safe_dist_sq(diffs_nn, axis=2) + 1e-30)
+        K_nn = jnp.interp(dists_nn, r_bins, c_vals)       # (k, k)
+
+        alpha = jnp.linalg.solve(K_nn, nbr_vals)
+        return jnp.dot(k_star, alpha)
+
+    def refined_grad(x_query, nbr_pts, nbr_vals):
+        return jax.grad(refined_conditional_mean)(x_query, nbr_pts, nbr_vals)
+
+    def refined_hess(x_query, nbr_pts, nbr_vals):
+        return jax.hessian(refined_conditional_mean)(x_query, nbr_pts, nbr_vals)
+
+    print("  Computing refined-point gradients and Hessians...")
+    grad_refined = jax.vmap(refined_grad)(refined_points, neighbor_points, neighbor_values)
+    hess_refined = jax.vmap(refined_hess)(refined_points, neighbor_points, neighbor_values)
+
+    # --- Dense points (i < n0): condition on all n0 dense points ---
+    # Using rbf_kernel(r_sq) avoids the norm singularity entirely — the
+    # squared-distance formulation is smooth everywhere including at r=0.
+    dense_points = graph.points[:n0]                       # (n0, 3)
+    dense_values = delta_graph[:n0]                        # (n0,)
+
+    # Precompute alpha_dense = K_dd^{-1} @ delta_dense
+    diffs_dd = dense_points[:, None, :] - dense_points[None, :, :]
+    dists_dd = jnp.sqrt(safe_dist_sq(diffs_dd, axis=2) + 1e-30)
+    K_dd = jnp.interp(dists_dd, r_bins, c_vals)
+    alpha_dense = jnp.linalg.solve(K_dd, dense_values)
+
+    def dense_mean_at(x_query):
+        """Conditional mean at x_query using precomputed alpha_dense."""
+        diffs = x_query[None, :] - dense_points            # (n0, 3)
+        k_star = rbf_kernel(safe_dist_sq(diffs, axis=1))   # (n0,)
+        return jnp.dot(k_star, alpha_dense)
+
+    print("  Computing dense-point gradients and Hessians...")
+    grad_dense = jax.vmap(jax.grad(dense_mean_at))(dense_points)
+    hess_dense = jax.vmap(jax.hessian(dense_mean_at))(dense_points)
+
+    # --- Combine in graph order, then reorder to original order ---
+    grad_graph = jnp.concatenate([grad_dense, grad_refined], axis=0)   # (N, 3)
+    hess_graph = jnp.concatenate([hess_dense, hess_refined], axis=0)   # (N, 3, 3)
+
+    # Reorder from graph order to original order
+    inv_perm = jnp.argsort(graph.indices)
+    gradient = np.array(grad_graph[inv_perm])
+    hessian = np.array(hess_graph[inv_perm])
+
+    # Symmetrize (remove floating-point asymmetry ~1e-7 relative)
+    hessian = 0.5 * (hessian + np.transpose(hessian, (0, 2, 1)))
+
+    # --- Classify ---
+    eigenvalues = np.linalg.eigvalsh(hessian)
+    eigenvalues = eigenvalues[:, ::-1]  # descending: l1 >= l2 >= l3
+
     n_positive_neg_H = np.sum(-eigenvalues > 0, axis=1)
     labels_geo = np.array(["void"] * N, dtype=object)
     labels_geo[n_positive_neg_H == 1] = "sheet"
@@ -752,7 +906,12 @@ def main(sim_idx=0):
 
     # ── Step 4: Hessian and cosmic web ───────────────────────────
     gradient, hessian, eigenvalues, labels_geo, laplacian, s_squared = \
-        compute_hessian_local_quadratic(delta_np, points_np)
+        compute_gp_derivatives(graph, make_kernel(log_var, log_scale), delta_map,
+                               log_variance=log_var, log_scale=log_scale)
+
+    # Also compute quadratic-fit Hessian for comparison
+    gradient_qf, hessian_qf, eigenvalues_qf, labels_geo_qf, laplacian_qf, s_squared_qf = \
+        compute_hessian_quadratic_fit(delta_np, points_np)
 
     # ── Step 5: Label-environment correlations ───────────────────
     corr_results = environment_label_analysis(
@@ -786,6 +945,14 @@ def main(sim_idx=0):
         label_a=label_a,
         label_b=label_b,
         labels_geo=labels_geo,
+        # Quadratic-fit Hessian for comparison
+        gradient_qf=gradient_qf,
+        hessian_qf=hessian_qf,
+        eigenvalues_qf=eigenvalues_qf,
+        laplacian_qf=laplacian_qf,
+        s_squared_qf=s_squared_qf,
+        labels_geo_qf=labels_geo_qf,
+        # Kernel info
         kernel_variance=var_val,
         kernel_scale_mpc_h=scale_val,
         fisher_matrix=np.array(fisher),

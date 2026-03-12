@@ -28,8 +28,8 @@ import matplotlib.pyplot as plt
 # Import pipeline functions
 from graphGP_cosmo import (
     make_kernel, poisson_log_likelihood, optimize_field,
-    optimize_kernel, compute_hessian_local_quadratic,
-    partial_corr, compute_kernel_fisher,
+    optimize_kernel, compute_hessian_quadratic_fit,
+    compute_gp_derivatives, partial_corr, compute_kernel_fisher,
     N0, K_NEIGHBORS, OUTPUT_DIR,
 )
 
@@ -95,7 +95,7 @@ def generate_synthetic_data():
     # Compute true Hessian eigenvalues via local quadratic fit on ALL points
     print("  Computing true Hessian on observed points...")
     _, _, true_eig, true_labels, true_lap, true_s2 = \
-        compute_hessian_local_quadratic(delta_all[keep], obs_points)
+        compute_hessian_quadratic_fit(delta_all[keep], obs_points)
 
     return (obs_points, true_delta_obs, delta_all, all_points,
             true_eig, true_labels, true_lap, true_s2, keep)
@@ -291,9 +291,31 @@ def main():
      graph, opt_lv, opt_ls, fisher_unc) = \
         run_reconstruction(obs_points, N_obs)
 
-    # Compute Hessian on reconstructed field
-    _, _, recon_eig, recon_labels, recon_lap, recon_s2 = \
-        compute_hessian_local_quadratic(recon_delta, obs_points)
+    # Compute Hessian on reconstructed field — both methods
+    recon_delta_jax = jnp.array(recon_delta)
+    cov = make_kernel(opt_lv, opt_ls)
+
+    _, _, recon_eig_gp, recon_labels_gp, recon_lap_gp, recon_s2_gp = \
+        compute_gp_derivatives(graph, cov, recon_delta_jax,
+                               log_variance=opt_lv, log_scale=opt_ls)
+    _, _, recon_eig_qf, recon_labels_qf, recon_lap_qf, recon_s2_qf = \
+        compute_hessian_quadratic_fit(recon_delta, obs_points)
+
+    # Compare the two Hessian methods against truth
+    from scipy.stats import pearsonr
+    for i in range(3):
+        r_gp, _ = pearsonr(true_eig[:, i], recon_eig_gp[:, i])
+        r_qf, _ = pearsonr(true_eig[:, i], recon_eig_qf[:, i])
+        print(f"  Eigenvalue {i+1} corr with truth:  GP = {r_gp:.4f},  QuadFit = {r_qf:.4f}")
+
+    agree_gp = np.mean(true_labels == recon_labels_gp)
+    agree_qf = np.mean(true_labels == recon_labels_qf)
+    print(f"  Classification agreement:  GP = {100*agree_gp:.1f}%,  QuadFit = {100*agree_qf:.1f}%")
+
+    # Use GP derivatives as the primary result for validation
+    recon_eig = recon_eig_gp
+    recon_labels = recon_labels_gp
+    recon_s2 = recon_s2_gp
 
     # Validate
     val_results = validate(

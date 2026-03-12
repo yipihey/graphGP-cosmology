@@ -128,6 +128,7 @@ tab_names = [
     "Data Explorer",
     "Density Field",
     "Cosmic Web",
+    "Hessian Comparison",
     "Environment Correlations",
     "Synthetic Validation",
 ]
@@ -155,7 +156,7 @@ beyond their dependence on density alone.
 2. Parameterize the density field via a Gaussian process in white-noise (xi) space
 3. Maximize the Poisson log-likelihood + GP log-prior via gradient descent
 4. Alternate between field and kernel hyperparameter optimization
-5. Compute the Hessian via local quadratic fits to classify the cosmic web
+5. Compute the Hessian via GP derivatives (autodiff through the kernel) to classify the cosmic web
 6. Test label-environment correlations (Q1-Q4)
 
 **Key equations:**
@@ -587,8 +588,177 @@ with tabs[3]:
             st.plotly_chart(fig_s2, use_container_width=True)
 
 
-# ===== TAB 4: ENVIRONMENT CORRELATIONS ====================================
+# ===== TAB 4: HESSIAN COMPARISON ==========================================
 with tabs[4]:
+    st.header("Hessian Method Comparison")
+    st.markdown("""
+Compare the **GP-derivative Hessian** (analytically correct — differentiates the kernel)
+with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP kernel).
+""")
+
+    if not has_results:
+        st.warning("No results found. Run `python graphGP_cosmo.py` first.")
+    else:
+        r = load_results(results_path)
+
+        has_qf = "eigenvalues_qf" in r
+        if not has_qf:
+            st.warning("Quadratic-fit results not found in saved data. "
+                       "Re-run `python graphGP_cosmo.py` to generate comparison data.")
+        else:
+            eigenvalues_gp = r["eigenvalues"]
+            eigenvalues_qf = r["eigenvalues_qf"]
+            labels_gp = r["labels_geo"]
+            labels_qf = r["labels_geo_qf"]
+            laplacian_gp = r["laplacian"]
+            laplacian_qf = r["laplacian_qf"]
+            s2_gp = r["s_squared"]
+            s2_qf = r["s_squared_qf"]
+            pos_n = r["positions"] / L_BOX
+            N = len(eigenvalues_gp)
+
+            # --- Classification comparison ---
+            st.subheader("Cosmic Web Classification")
+            geo_types = ["peak", "filament", "sheet", "void"]
+            color_map_cw = {"peak": "#e74c3c", "filament": "#f39c12",
+                            "sheet": "#85c1e9", "void": "#1a5276"}
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**GP Derivatives**")
+                for g in geo_types:
+                    c = int(np.sum(labels_gp == g))
+                    st.write(f"  {g.capitalize()}: {c} ({100*c/N:.1f}%)")
+            with col2:
+                st.markdown("**Quadratic Fit**")
+                for g in geo_types:
+                    c = int(np.sum(labels_qf == g))
+                    st.write(f"  {g.capitalize()}: {c} ({100*c/N:.1f}%)")
+
+            agreement = np.mean(labels_gp == labels_qf)
+            st.metric("Classification Agreement", f"{100*agreement:.1f}%")
+
+            # --- Eigenvalue scatter ---
+            st.subheader("Eigenvalue Comparison (GP vs Quadratic Fit)")
+            eig_names = ["lambda_1 (largest)", "lambda_2", "lambda_3 (smallest)"]
+            cols_eig = st.columns(3)
+            for i, col in enumerate(cols_eig):
+                with col:
+                    from scipy.stats import pearsonr
+                    r_val, _ = pearsonr(eigenvalues_gp[:, i], eigenvalues_qf[:, i])
+                    idx_s = thin_for_3d(N, 2000)
+                    fig_sc = go.Figure(data=[go.Scatter(
+                        x=eigenvalues_gp[idx_s, i], y=eigenvalues_qf[idx_s, i],
+                        mode="markers",
+                        marker=dict(size=2, opacity=0.3, color="steelblue"),
+                    )])
+                    lims = [min(eigenvalues_gp[:, i].min(), eigenvalues_qf[:, i].min()),
+                            max(eigenvalues_gp[:, i].max(), eigenvalues_qf[:, i].max())]
+                    fig_sc.add_trace(go.Scatter(
+                        x=lims, y=lims, mode="lines",
+                        line=dict(color="red", dash="dash"), showlegend=False,
+                    ))
+                    fig_sc.update_layout(
+                        xaxis_title="GP derivative",
+                        yaxis_title="Quadratic fit",
+                        height=350,
+                        title=f"{eig_names[i]} (r={r_val:.3f})",
+                    )
+                    st.plotly_chart(fig_sc, use_container_width=True)
+
+            # --- Eigenvalue distributions overlay ---
+            st.subheader("Eigenvalue Distributions")
+            colors_gp = ["rgba(231,76,60,0.5)", "rgba(39,174,96,0.5)", "rgba(41,128,185,0.5)"]
+            colors_qf = ["rgba(231,76,60,0.25)", "rgba(39,174,96,0.25)", "rgba(41,128,185,0.25)"]
+            fig_dist = go.Figure()
+            for i in range(3):
+                fig_dist.add_trace(go.Histogram(
+                    x=eigenvalues_gp[:, i], nbinsx=80,
+                    name=f"GP {eig_names[i]}", marker_color=colors_gp[i],
+                    opacity=0.6,
+                ))
+                fig_dist.add_trace(go.Histogram(
+                    x=eigenvalues_qf[:, i], nbinsx=80,
+                    name=f"QF {eig_names[i]}", marker_color=colors_qf[i],
+                    opacity=0.4, line=dict(dash="dot"),
+                ))
+            fig_dist.update_layout(
+                barmode="overlay", height=400,
+                xaxis_title="Eigenvalue", yaxis_title="Count",
+            )
+            st.plotly_chart(fig_dist, use_container_width=True)
+
+            # --- Laplacian and tidal shear comparison ---
+            st.subheader("Laplacian & Tidal Shear")
+            col1, col2 = st.columns(2)
+            with col1:
+                r_lap, _ = pearsonr(laplacian_gp, laplacian_qf)
+                idx_s = thin_for_3d(N, 2000)
+                fig_lap = go.Figure(data=[go.Scatter(
+                    x=laplacian_gp[idx_s], y=laplacian_qf[idx_s],
+                    mode="markers",
+                    marker=dict(size=2, opacity=0.3, color="steelblue"),
+                )])
+                lims_l = [min(laplacian_gp.min(), laplacian_qf.min()),
+                          max(laplacian_gp.max(), laplacian_qf.max())]
+                fig_lap.add_trace(go.Scatter(
+                    x=lims_l, y=lims_l, mode="lines",
+                    line=dict(color="red", dash="dash"), showlegend=False,
+                ))
+                fig_lap.update_layout(
+                    xaxis_title="GP Laplacian", yaxis_title="QF Laplacian",
+                    height=350, title=f"Laplacian (r={r_lap:.3f})",
+                )
+                st.plotly_chart(fig_lap, use_container_width=True)
+            with col2:
+                r_s2, _ = pearsonr(s2_gp, s2_qf)
+                fig_s2 = go.Figure(data=[go.Scatter(
+                    x=s2_gp[idx_s], y=s2_qf[idx_s],
+                    mode="markers",
+                    marker=dict(size=2, opacity=0.3, color="darkorange"),
+                )])
+                lims_s = [min(s2_gp.min(), s2_qf.min()),
+                          max(s2_gp.max(), s2_qf.max())]
+                fig_s2.add_trace(go.Scatter(
+                    x=lims_s, y=lims_s, mode="lines",
+                    line=dict(color="red", dash="dash"), showlegend=False,
+                ))
+                fig_s2.update_layout(
+                    xaxis_title="GP s^2", yaxis_title="QF s^2",
+                    height=350, title=f"Tidal shear s^2 (r={r_s2:.3f})",
+                )
+                st.plotly_chart(fig_s2, use_container_width=True)
+
+            # --- Spatial comparison (2D slice) ---
+            st.subheader("Spatial Classification Comparison (z-slice)")
+            center_hc = st.slider("Slice center", 0.0, 1.0, 0.5, 0.01, key="hc_slice_c")
+            thick_hc = st.slider("Thickness", 0.02, 0.3, 0.1, 0.01, key="hc_slice_t")
+            mask_hc = slice_mask(pos_n, 2, center_hc, thick_hc)
+
+            col1, col2 = st.columns(2)
+            for col, labels, title in [(col1, labels_gp, "GP Derivatives"),
+                                        (col2, labels_qf, "Quadratic Fit")]:
+                with col:
+                    fig_cw = go.Figure()
+                    for g in geo_types:
+                        m = mask_hc & (labels == g)
+                        if m.sum() > 0:
+                            fig_cw.add_trace(go.Scatter(
+                                x=pos_n[m, 0], y=pos_n[m, 1],
+                                mode="markers",
+                                marker=dict(size=5, color=color_map_cw[g]),
+                                name=g.capitalize(),
+                            ))
+                    fig_cw.update_layout(
+                        xaxis_title="x [box]", yaxis_title="y [box]",
+                        xaxis=dict(scaleanchor="y"),
+                        height=500, title=title,
+                    )
+                    st.plotly_chart(fig_cw, use_container_width=True)
+
+
+# ===== TAB 5: ENVIRONMENT CORRELATIONS ====================================
+with tabs[5]:
     st.header("Label-Environment Correlations (Q1-Q4)")
 
     if not has_results:
@@ -738,8 +908,8 @@ with tabs[4]:
         st.plotly_chart(fig_q4, use_container_width=True)
 
 
-# ===== TAB 5: SYNTHETIC VALIDATION ========================================
-with tabs[5]:
+# ===== TAB 6: SYNTHETIC VALIDATION ========================================
+with tabs[6]:
     st.header("Synthetic Ground-Truth Validation")
 
     syn = load_synthetic()
