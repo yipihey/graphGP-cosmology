@@ -147,6 +147,70 @@ def add_log_buttons(fig, x=True, y=True):
     return fig
 
 
+def compute_theory_curves(variance, scale, fisher_matrix, r, approach):
+    """Compute analytic theory curves from GP kernel K(r) with Fisher error bands.
+
+    Parameters theta = (log_var, log_scale).  Gradient of K w.r.t. theta:
+      g = [K(r),  K(r) * (r/scale)^2]
+    sigma_K(r) = sqrt(g^T F^{-1} g).
+
+    For 'density':  xi = K,  sigma_xi = sigma_K.
+    For 'log_delta':  xi = exp(K) - 1,  sigma_xi = exp(K)*sigma_K  (delta method).
+    """
+    K = variance * np.exp(-0.5 * (r / scale) ** 2)
+    g_var = K
+    g_scale = K * (r / scale) ** 2
+    F_inv = np.linalg.inv(np.array(fisher_matrix, dtype=np.float64))
+    sigma_K = np.sqrt(
+        F_inv[0, 0] * g_var**2
+        + 2 * F_inv[0, 1] * g_var * g_scale
+        + F_inv[1, 1] * g_scale**2
+    )
+    out = {"r": r, "K": K, "sigma_K": sigma_K}
+    if approach == "density":
+        out["xi"] = K
+        out["sigma_xi"] = sigma_K
+    else:  # log_delta
+        out["xi"] = np.exp(K) - 1
+        out["sigma_xi"] = np.exp(K) * sigma_K
+        xi = out["xi"]
+        out["zeta"] = 3 * xi**2 + xi**3
+        out["Q"] = 1 + xi / 3
+        out["sigma_Q"] = out["sigma_xi"] / 3
+        out["sigma_zeta"] = np.abs(6 * xi + 3 * xi**2) * out["sigma_xi"]
+    return out
+
+
+def compute_lognormal_pdf(variance, delta_grid):
+    """Log-normal density PDF p(delta) where sigma^2 = K(0) = variance."""
+    sigma2 = variance
+    valid = delta_grid > -1
+    pdf = np.zeros_like(delta_grid)
+    d = delta_grid[valid]
+    pdf[valid] = (1.0 / ((1 + d) * np.sqrt(2 * np.pi * sigma2))
+                  * np.exp(-(np.log(1 + d) + sigma2 / 2)**2 / (2 * sigma2)))
+    return pdf
+
+
+def add_theory_band(fig, r, y_center, y_upper, y_lower,
+                    line_color, fill_color, name):
+    """Add dashed theory curve with shaded 1-sigma band to a Plotly figure."""
+    fig.add_trace(go.Scatter(
+        x=r, y=y_upper, mode="lines", line=dict(width=0),
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=r, y=y_lower, mode="lines", line=dict(width=0),
+        fill="tonexty", fillcolor=fill_color,
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=r, y=y_center, mode="lines",
+        line=dict(color=line_color, width=2, dash="dash"),
+        name=name,
+    ))
+
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -162,6 +226,7 @@ st.sidebar.markdown(
 _PDF_DIR = os.path.dirname(__file__)
 _miniproject_path = os.path.join(_PDF_DIR, "miniproject.pdf")
 _proposal_path = os.path.join(_PDF_DIR, "proposal_v2.pdf")
+_paper_path = os.path.join(_PDF_DIR, "gp_lognormal_paper_draft_2.pdf")
 
 st.sidebar.markdown("### Documentation")
 if os.path.isfile(_miniproject_path):
@@ -178,6 +243,14 @@ if os.path.isfile(_proposal_path):
             "Collaboration proposal (PDF)",
             f.read(),
             file_name="proposal_v2.pdf",
+            mime="application/pdf",
+        )
+if os.path.isfile(_paper_path):
+    with open(_paper_path, "rb") as f:
+        st.sidebar.download_button(
+            "GP log-normal paper draft (PDF)",
+            f.read(),
+            file_name="gp_lognormal_paper_draft_2.pdf",
             mime="application/pdf",
         )
 
@@ -1093,6 +1166,31 @@ with tabs[6]:
         else:
             rd = None
 
+        # ----- Compute analytic theory curves from learned kernels -----
+        r_theory = np.linspace(0.5, 160, 500)
+
+        rl_var = float(rl["kernel_variance"])
+        rl_scale = float(rl["kernel_scale_mpc_h"])
+        rl_fisher = np.array(rl["fisher_matrix"])
+        theory_l = compute_theory_curves(rl_var, rl_scale, rl_fisher,
+                                         r_theory, "log_delta")
+
+        if rd is not None:
+            rd_var = float(rd["kernel_variance"])
+            rd_scale = float(rd["kernel_scale_mpc_h"])
+            rd_fisher = np.array(rd["fisher_matrix"])
+            theory_d = compute_theory_curves(rd_var, rd_scale, rd_fisher,
+                                             r_theory, "density")
+        else:
+            theory_d = None
+
+        st.info(
+            "**Theory overlay:** Dashed lines = analytic predictions from the "
+            "learned GP kernel K(r). Shaded bands = Fisher-propagated 1σ "
+            "uncertainties. Under the log-normal model, *all* clustering "
+            "statistics follow from K(r) — no separate estimation needed."
+        )
+
         # ----- Overview metrics -----
         st.subheader("Summary Comparison")
 
@@ -1226,6 +1324,13 @@ with tabs[6]:
                     opacity=0.6, marker_color="darkorange",
                     histnorm="probability density",
                 ))
+                # Log-normal theory PDF from log-delta kernel
+                _dg = np.linspace(-0.99, float(np.percentile(delta_l, 99.5)), 500)
+                fig_dhist.add_trace(go.Scatter(
+                    x=_dg, y=compute_lognormal_pdf(rl_var, _dg), mode="lines",
+                    line=dict(color="darkorange", width=2.5, dash="dash"),
+                    name="Log-normal theory",
+                ))
                 fig_dhist.update_layout(
                     barmode="overlay", height=500,
                     xaxis_title="delta", yaxis_title="PDF",
@@ -1267,6 +1372,16 @@ with tabs[6]:
                 x=f_halo, nbinsx=80, name="f = log(1+delta)",
                 marker_color="darkorange", histnorm="probability density",
             ))
+            # Gaussian theory: f ~ N(-sigma^2/2, sigma^2) where sigma^2 = K(0)
+            _fg = np.linspace(float(f_halo.min()) - 0.5,
+                              float(f_halo.max()) + 0.5, 500)
+            _pdf_g = (1.0 / np.sqrt(2 * np.pi * rl_var)
+                      * np.exp(-(_fg + rl_var / 2)**2 / (2 * rl_var)))
+            fig_fhist.add_trace(go.Scatter(
+                x=_fg, y=_pdf_g, mode="lines",
+                line=dict(color="darkorange", width=2.5, dash="dash"),
+                name="Gaussian N(-σ²/2, σ²)",
+            ))
             fig_fhist.update_layout(
                 xaxis_title="f = log(1 + delta)", yaxis_title="PDF",
                 height=400, title="Log-Density Field Distribution",
@@ -1280,6 +1395,21 @@ with tabs[6]:
                      "relative to a uniform Poisson process.")
 
         fig_2pt = go.Figure()
+
+        # Theory bands (first, so data renders on top)
+        if theory_d is not None:
+            add_theory_band(fig_2pt, r_theory,
+                            theory_d["xi"],
+                            theory_d["xi"] + theory_d["sigma_xi"],
+                            theory_d["xi"] - theory_d["sigma_xi"],
+                            "steelblue", "rgba(68,114,196,0.15)",
+                            "Theory ξ (density)")
+        add_theory_band(fig_2pt, r_theory,
+                        theory_l["xi"],
+                        theory_l["xi"] + theory_l["sigma_xi"],
+                        theory_l["xi"] - theory_l["sigma_xi"],
+                        "darkorange", "rgba(230,126,34,0.15)",
+                        "Theory ξ (log-delta)")
 
         if rd is not None and "r_2pt" in rd:
             fig_2pt.add_trace(go.Scatter(
@@ -1311,6 +1441,24 @@ with tabs[6]:
         col1, col2 = st.columns(2)
         with col1:
             fig_2pt_log = go.Figure()
+            # Theory bands (positive values only for log-log)
+            if theory_d is not None:
+                _m = theory_d["xi"] > 0
+                _lo_d = np.maximum(theory_d["xi"] - theory_d["sigma_xi"], 1e-10)
+                add_theory_band(fig_2pt_log, r_theory[_m],
+                                theory_d["xi"][_m],
+                                (theory_d["xi"] + theory_d["sigma_xi"])[_m],
+                                _lo_d[_m],
+                                "steelblue", "rgba(68,114,196,0.15)",
+                                "Theory (density)")
+            _m_l = theory_l["xi"] > 0
+            _lo_l = np.maximum(theory_l["xi"] - theory_l["sigma_xi"], 1e-10)
+            add_theory_band(fig_2pt_log, r_theory[_m_l],
+                            theory_l["xi"][_m_l],
+                            (theory_l["xi"] + theory_l["sigma_xi"])[_m_l],
+                            _lo_l[_m_l],
+                            "darkorange", "rgba(230,126,34,0.15)",
+                            "Theory (log-delta)")
             if rd is not None and "r_2pt" in rd:
                 mask_pos = rd["xi_2pt"] > 0
                 fig_2pt_log.add_trace(go.Scatter(
@@ -1343,6 +1491,20 @@ with tabs[6]:
         with col2:
             # r^2 * xi(r) to highlight BAO scale
             fig_r2xi = go.Figure()
+            # Theory bands
+            if theory_d is not None:
+                add_theory_band(fig_r2xi, r_theory,
+                                r_theory**2 * theory_d["xi"],
+                                r_theory**2 * (theory_d["xi"] + theory_d["sigma_xi"]),
+                                r_theory**2 * (theory_d["xi"] - theory_d["sigma_xi"]),
+                                "steelblue", "rgba(68,114,196,0.15)",
+                                "Theory (density)")
+            add_theory_band(fig_r2xi, r_theory,
+                            r_theory**2 * theory_l["xi"],
+                            r_theory**2 * (theory_l["xi"] + theory_l["sigma_xi"]),
+                            r_theory**2 * (theory_l["xi"] - theory_l["sigma_xi"]),
+                            "darkorange", "rgba(230,126,34,0.15)",
+                            "Theory (log-delta)")
             if rd is not None and "r_2pt" in rd:
                 r2xi_d = rd["r_2pt"] ** 2 * rd["xi_2pt"]
                 r2xi_d_err = rd["r_2pt"] ** 2 * rd["xi_2pt_err"]
@@ -1416,6 +1578,20 @@ with tabs[6]:
                     "Skewness": f"{float(rl['cic_skewness']):.4f}",
                     "S3 = <d^3>/<d^2>^2": f"{float(rl['cic_S3']):.3f}",
                 })
+            # Theory predictions from kernel (unsmoothed, K(0))
+            if theory_d is not None:
+                rows_cic.append({
+                    "Approach": "Theory (density, K(0))",
+                    "Variance": f"{rd_var:.2f}",
+                    "Skewness": "—",
+                    "S3 = <d^3>/<d^2>^2": "—",
+                })
+            rows_cic.append({
+                "Approach": "Theory (log-normal, K(0))",
+                "Variance": f"{np.exp(rl_var) - 1:.2f}",
+                "Skewness": "—",
+                "S3 = <d^3>/<d^2>^2": f"{np.exp(rl_var) + 2:.3f}",
+            })
             if rows_cic:
                 st.markdown("**Counts-in-Cells Moments**")
                 st.table(rows_cic)
@@ -1452,6 +1628,13 @@ ansatz"). Deviations indicate non-linear evolution and non-Gaussianity.
         col1, col2 = st.columns(2)
         with col1:
             fig_3pt = go.Figure()
+            # Theory Q = 1 + xi/3 (log-normal prediction)
+            add_theory_band(fig_3pt, r_theory,
+                            theory_l["Q"],
+                            theory_l["Q"] + theory_l["sigma_Q"],
+                            theory_l["Q"] - theory_l["sigma_Q"],
+                            "darkorange", "rgba(230,126,34,0.15)",
+                            "Theory Q = 1 + ξ/3")
             if rd is not None and "r_3pt" in rd:
                 fig_3pt.add_trace(go.Scatter(
                     x=rd["r_3pt"], y=rd["Q_3pt"], mode="markers+lines",
@@ -1481,6 +1664,13 @@ ansatz"). Deviations indicate non-linear evolution and non-Gaussianity.
 
         with col2:
             fig_zeta = go.Figure()
+            # Theory zeta = 3*xi^2 + xi^3 (log-normal prediction)
+            add_theory_band(fig_zeta, r_theory,
+                            theory_l["zeta"],
+                            theory_l["zeta"] + theory_l["sigma_zeta"],
+                            theory_l["zeta"] - theory_l["sigma_zeta"],
+                            "darkorange", "rgba(230,126,34,0.15)",
+                            "Theory ζ = 3ξ² + ξ³")
             if rd is not None and "r_3pt" in rd:
                 fig_zeta.add_trace(go.Scatter(
                     x=rd["r_3pt"], y=rd["zeta_3pt"], mode="markers+lines",
@@ -1505,6 +1695,20 @@ ansatz"). Deviations indicate non-linear evolution and non-Gaussianity.
 
         # xi(r) at 3pt scales (used as denominator in Q)
         fig_xi3 = go.Figure()
+        # Theory bands
+        if theory_d is not None:
+            add_theory_band(fig_xi3, r_theory,
+                            theory_d["xi"],
+                            theory_d["xi"] + theory_d["sigma_xi"],
+                            theory_d["xi"] - theory_d["sigma_xi"],
+                            "steelblue", "rgba(68,114,196,0.15)",
+                            "Theory (density)")
+        add_theory_band(fig_xi3, r_theory,
+                        theory_l["xi"],
+                        theory_l["xi"] + theory_l["sigma_xi"],
+                        theory_l["xi"] - theory_l["sigma_xi"],
+                        "darkorange", "rgba(230,126,34,0.15)",
+                        "Theory (log-delta)")
         if rd is not None and "r_3pt" in rd and "xi_3pt" in rd:
             fig_xi3.add_trace(go.Scatter(
                 x=rd["r_3pt"], y=rd["xi_3pt"], mode="markers+lines",
