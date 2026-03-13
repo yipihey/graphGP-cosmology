@@ -172,8 +172,7 @@ def run_reconstruction(obs_points, n_obs):
     all_losses = losses1 + losses2 + losses3
 
     # Extract halo-only delta
-    delta_halo = delta_map[:n_halo]
-    delta_vol = delta_map[n_halo:]
+    delta_halo = np.array(delta_map[:n_halo])
 
     learned_var = float(jnp.exp(opt_lv))
     learned_scale = float(jnp.exp(opt_ls))
@@ -182,13 +181,12 @@ def run_reconstruction(obs_points, n_obs):
           f"(true = {TRUE_VARIANCE:.4f})")
     print(f"  Learned kernel: scale = {learned_scale:.4f} "
           f"(true = {TRUE_SCALE:.4f})")
-    print(f"  Volume delta: mean = {float(delta_vol.mean()):.4f}")
 
     # Fisher uncertainties
     fisher, fisher_unc = compute_kernel_fisher(
         delta_map, graph_combined, opt_lv, opt_ls)
 
-    return (np.array(delta_halo), learned_var, learned_scale,
+    return (delta_halo, learned_var, learned_scale,
             all_losses, graph_halo, opt_lv, opt_ls, fisher_unc)
 
 

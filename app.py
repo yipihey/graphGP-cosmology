@@ -230,12 +230,12 @@ beyond their dependence on density alone.
 6. Test label-environment correlations (Q1-Q4)
 
 **Key equations:**
-- Poisson likelihood: `ln L = sum_i ln[n_bar(1+d_i)] - n_bar * (1/N_vol) * sum_j (1+d_j)`
+- Poisson likelihood: `ln L = sum_i ln[n_bar(1+d_i)] - n_bar/N_vol * sum_j max(0, 1+d_j)`
 - GP prior (xi-space): `ln p(xi) = -0.5 * ||xi||^2`
 - Field: `delta = L * xi` where `L` is the Vecchia Cholesky factor
 
-The volume integral (second term) is estimated via Monte Carlo over uniform
-volume-filling points, correcting the bias from sampling only at halo positions.
+The volume integral is estimated via Monte Carlo over uniform points.
+The volume-weighted PDF is predicted at random points via GP conditional mean.
 """)
     with col2:
         if has_results:

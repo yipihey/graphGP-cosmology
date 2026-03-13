@@ -198,15 +198,11 @@ def poisson_log_likelihood(delta, n_bar, n_halo, n_vol=0):
     """
     Poisson point process log-likelihood with volume integral.
 
-    Full form:
-      ln L = sum_{i in halos} ln[n_bar * (1 + delta_i)]
-           - n_bar * (V / N_vol) * sum_{j in vol} (1 + delta_j)
+    ln L = sum_{i in halos} ln[n_bar * (1 + delta_i)]
+         - n_bar * (V / N_vol) * sum_{j in vol} max(0, 1 + delta_j)
 
-    The first n_halo entries of delta are at halo positions (observed);
-    the remaining n_vol entries are at uniform volume-filling points
-    (for Monte Carlo integration of the intensity over the full volume).
-
-    With V = 1 (unit box), n_bar ~ N_halo.
+    The volume integral is estimated via Monte Carlo over uniform points.
+    Density is clipped to >= 0 in the integral (physical constraint).
     """
     delta_halo = delta[:n_halo]
     density_halo = jnp.clip(1.0 + delta_halo, 1e-10, None)
@@ -214,13 +210,10 @@ def poisson_log_likelihood(delta, n_bar, n_halo, n_vol=0):
 
     if n_vol > 0:
         delta_vol = delta[n_halo:]
-        # Monte Carlo estimate of integral[ n_bar*(1+delta(x)) dx ] over V=1
-        # Clip to non-negative density (physical constraint: rho >= 0)
         density_vol = jnp.clip(1.0 + delta_vol, 1e-10, None)
         integral = n_bar * (1.0 / n_vol) * jnp.sum(density_vol)
         ll -= integral
     else:
-        # Fallback: approximate integral as N_halo (assumes <delta>=0)
         ll -= n_halo
 
     return ll
@@ -630,6 +623,55 @@ def compute_gp_derivatives(graph, cov, delta, log_variance=None, log_scale=None)
     return gradient, hessian, eigenvalues, labels_geo, laplacian, s_squared
 
 
+def predict_at_points(delta_known, points_known, new_points, cov, k=15):
+    """
+    Predict GP field at new locations via k-NN conditional mean.
+
+    For each new point, finds k nearest neighbors among known points
+    and computes the Vecchia conditional mean:
+      mu(x) = k(x, X_nbrs) @ K_nbrs^{-1} @ delta_nbrs
+
+    Args:
+        delta_known: (N,) field values at known positions
+        points_known: (N, 3) known positions (JAX or numpy)
+        new_points: (M, 3) positions to predict at
+        cov: (r_bins, c_vals) kernel tuple
+        k: number of neighbors
+
+    Returns:
+        predictions: (M,) predicted field values
+    """
+    from scipy.spatial import cKDTree
+
+    pts = np.array(points_known)
+    vals = np.array(delta_known)
+    new_pts = np.array(new_points)
+    r_bins = np.array(cov[0])
+    c_vals = np.array(cov[1])
+
+    tree = cKDTree(pts, boxsize=1.0)
+    M = len(new_pts)
+    predictions = np.zeros(M)
+
+    for i in range(M):
+        dists, idxs = tree.query(new_pts[i], k=k)
+
+        # Cross-covariance: k(x_new, neighbors)
+        k_star = np.interp(dists, r_bins, c_vals)
+
+        # Neighbor-neighbor covariance
+        nbr_pts = pts[idxs]
+        diffs = nbr_pts[:, None, :] - nbr_pts[None, :, :]
+        diffs = diffs - np.round(diffs)  # periodic wrap
+        dists_nn = np.sqrt(np.sum(diffs ** 2, axis=2))
+        K_nn = np.interp(dists_nn, r_bins, c_vals)
+
+        alpha = np.linalg.solve(K_nn, vals[idxs])
+        predictions[i] = np.dot(k_star, alpha)
+
+    return predictions
+
+
 # =====================================================================
 # STEP 5: LABEL-ENVIRONMENT CORRELATIONS
 # =====================================================================
@@ -949,7 +991,7 @@ def main(sim_idx=0):
             xi_init=xi_current, n_halo=n_halo, n_vol=n_vol)
         all_losses.extend(losses)
 
-        # Kernel optimization (delta-space) on combined graph
+        # Kernel optimization on combined graph
         log_var, log_scale = optimize_kernel(
             delta_map, graph_combined, log_var, log_scale,
             n_steps=N_KERNEL_STEPS, lr=1e-3)
@@ -961,14 +1003,21 @@ def main(sim_idx=0):
         xi_init=xi_current, n_halo=n_halo, n_vol=n_vol)
     all_losses.extend(losses)
 
-    # Extract halo and volume delta
+    # Extract halo delta from the optimization
     delta_halo = np.array(delta_map[:n_halo])
-    delta_vol = np.array(delta_map[n_halo:])
     vol_points_np = np.array(vol_points)
 
     print(f"\n  Final kernel: variance = {float(jnp.exp(log_var)):.4f}, "
           f"scale = {float(jnp.exp(log_scale)) * L_BOX:.1f} Mpc/h")
     print(f"  Halo delta range: [{delta_halo.min():.3f}, {delta_halo.max():.3f}]")
+
+    # Predict delta at volume points via GP conditional mean from halos.
+    # This gives physically smooth interpolation (not optimization artifacts).
+    print("  Predicting field at volume points via GP conditional mean...")
+    cov_learned = make_kernel(log_var, log_scale)
+    delta_vol = predict_at_points(
+        delta_halo, points_norm, vol_points, cov_learned, k=K_NEIGHBORS)
+    delta_vol = np.array(delta_vol)
     print(f"  Volume delta: mean = {delta_vol.mean():.3f}, "
           f"range = [{delta_vol.min():.3f}, {delta_vol.max():.3f}]")
 
@@ -993,7 +1042,7 @@ def main(sim_idx=0):
                                jnp.array(delta_halo),
                                log_variance=log_var, log_scale=log_scale)
 
-    # Also compute quadratic-fit Hessian for comparison
+    # Quadratic-fit Hessian for comparison
     gradient_qf, hessian_qf, eigenvalues_qf, labels_geo_qf, laplacian_qf, s_squared_qf = \
         compute_hessian_quadratic_fit(delta_np, points_np)
 
