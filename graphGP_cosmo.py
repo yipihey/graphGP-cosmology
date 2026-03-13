@@ -1007,6 +1007,25 @@ def main(sim_idx=0):
     q4_results = label_dependent_clustering(
         positions, label_a, label_a_name, graph_halo)
 
+    # ── Clustering statistics ────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Computing clustering statistics...")
+    print("=" * 60)
+
+    print("  Two-point correlation function...")
+    r_2pt, xi_2pt, xi_2pt_err = compute_two_point_function(
+        positions, n_bins=20, r_max=150.0, box_size=L_BOX)
+
+    print("  Counts-in-cells...")
+    counts_10, density_mean_10, cic_bins_10, cic_pdf_10, cic_var_10, cic_skew_10, cic_S3_10 = \
+        compute_counts_in_cells(positions, delta_halo, n_cells=10, box_size=L_BOX)
+    print(f"    n_cells=10: variance={cic_var_10:.2f}, "
+          f"skewness={cic_skew_10:.4f}, S3={cic_S3_10:.3f}")
+
+    print("  Three-point function (equilateral)...")
+    r_3pt, Q_3pt, Q_3pt_err, zeta_3pt, xi_3pt = compute_three_point_function(
+        positions, n_bins=12, r_max=80.0, box_size=L_BOX)
+
     # ── Plots ────────────────────────────────────────────────────
     make_plots(
         points_np, delta_np, eigenvalues, labels_geo,
@@ -1046,6 +1065,21 @@ def main(sim_idx=0):
         fisher_matrix=np.array(fisher),
         fisher_uncertainties=np.array(fisher_unc),
         losses=np.array(all_losses),
+        # Clustering statistics
+        r_2pt=r_2pt,
+        xi_2pt=xi_2pt,
+        xi_2pt_err=xi_2pt_err,
+        cic_bins=cic_bins_10,
+        cic_pdf=cic_pdf_10,
+        cic_variance=cic_var_10,
+        cic_skewness=cic_skew_10,
+        cic_S3=cic_S3_10,
+        cic_counts=counts_10,
+        r_3pt=r_3pt,
+        Q_3pt=Q_3pt,
+        Q_3pt_err=Q_3pt_err,
+        zeta_3pt=zeta_3pt,
+        xi_3pt=xi_3pt,
     )
     print(f"\n  Results saved to: {outfile}")
 
@@ -1054,7 +1088,567 @@ def main(sim_idx=0):
     print("=" * 62)
 
 
+# =====================================================================
+# LOG-DELTA APPROACH
+# =====================================================================
+# Instead of reconstructing delta directly (where rho = n_bar*(1+delta)),
+# we reconstruct f(x) = log(1 + delta(x)), the log-density contrast.
+# This guarantees positive densities (delta = exp(f) - 1 >= -1) and
+# is better suited for high-contrast regions of the cosmic web.
+#
+# Key differences from the linear (delta) approach:
+#   - GP models f(x) = log(1 + delta) instead of delta
+#   - Poisson log-likelihood: sum_i f_i - n_bar * (1/N_vol) * sum_j exp(f_j)
+#   - Density recovered as delta = exp(f) - 1
+# =====================================================================
+
+def log_delta_poisson_log_likelihood(f, n_bar, n_halo, n_vol=0):
+    """
+    Poisson log-likelihood in log-density space.
+
+    f = log(1 + delta), so (1 + delta) = exp(f).
+
+    ln L = sum_{i in halos} [ln(n_bar) + f_i]
+         - n_bar * (V / N_vol) * sum_{j in vol} exp(f_j)
+
+    Args:
+        f: (N,) log-density field values at all points
+        n_bar: mean number density
+        n_halo: number of halo points (first n_halo entries)
+        n_vol: number of volume-filling points (remaining entries)
+    """
+    f_halo = f[:n_halo]
+    ll = jnp.sum(jnp.log(n_bar) + f_halo)
+
+    if n_vol > 0:
+        f_vol = f[n_halo:]
+        # Monte Carlo integral of n_bar * exp(f) over unit volume
+        integral = n_bar * (1.0 / n_vol) * jnp.sum(jnp.exp(f_vol))
+        ll -= integral
+    else:
+        ll -= n_halo
+
+    return ll
+
+
+def optimize_field_log_delta(graph, n_bar, log_variance, log_scale,
+                              n_steps=200, lr=1e-2, xi_init=None,
+                              n_halo=None, n_vol=0):
+    """
+    MAP field estimation in log-density space.
+
+    f = gp.generate(graph, cov, xi) models log(1+delta).
+
+    Returns:
+        xi_map: (N,) MAP white-noise parameters
+        f_map: (N,) MAP log-density field
+        delta_map: (N,) MAP density contrast (exp(f) - 1)
+        losses: list of -log_posterior values
+    """
+    print("\n" + "=" * 60)
+    print("LOG-DELTA: Optimizing log-density field (fixed kernel, xi-space)")
+    print("=" * 60)
+
+    N = len(graph.points)
+    cov = make_kernel(log_variance, log_scale)
+
+    _n_halo = n_halo if n_halo is not None else N
+    _n_vol = n_vol
+
+    if xi_init is None:
+        key = jax.random.PRNGKey(42)
+        xi = 0.01 * jax.random.normal(key, shape=(N,))
+    else:
+        xi = xi_init
+
+    optimizer = optax.adam(lr)
+    opt_state = optimizer.init(xi)
+
+    @jit
+    def loss_fn(xi):
+        f = gp.generate(graph, cov, xi)
+        ll = log_delta_poisson_log_likelihood(f, n_bar, _n_halo, _n_vol)
+        log_prior = -0.5 * jnp.dot(xi, xi)
+        return -(ll + log_prior)
+
+    grad_fn = jit(grad(loss_fn))
+
+    losses = []
+    for step in range(n_steps):
+        loss_val = loss_fn(xi)
+        grads = grad_fn(xi)
+        updates, opt_state = optimizer.update(grads, opt_state, xi)
+        xi = optax.apply_updates(xi, updates)
+        losses.append(float(loss_val))
+
+        if step % 50 == 0 or step == n_steps - 1:
+            f = gp.generate(graph, cov, xi)
+            f_halo = f[:_n_halo]
+            delta_halo = jnp.exp(f_halo) - 1.0
+            msg = (f"  Step {step:4d}: loss = {loss_val:.2f}, "
+                   f"f_halo = [{float(f_halo.min()):.3f}, "
+                   f"{float(f_halo.max()):.3f}], "
+                   f"delta = [{float(delta_halo.min()):.3f}, "
+                   f"{float(delta_halo.max()):.3f}]")
+            if _n_vol > 0:
+                f_vol = f[_n_halo:]
+                msg += f", <f_vol> = {float(f_vol.mean()):.3f}"
+            print(msg)
+
+    f_map = gp.generate(graph, cov, xi)
+    delta_map = jnp.exp(f_map) - 1.0
+    return xi, f_map, delta_map, losses
+
+
+# =====================================================================
+# CLUSTERING STATISTICS
+# =====================================================================
+
+def compute_two_point_function(positions, n_bins=25, r_max=150.0,
+                                box_size=None):
+    """
+    Estimate the two-point correlation function xi(r) using the
+    Landy-Szalay estimator: xi(r) = (DD - 2DR + RR) / RR.
+
+    Args:
+        positions: (N, 3) positions in Mpc/h
+        n_bins: number of radial bins
+        r_max: maximum separation in Mpc/h
+        box_size: periodic box size (if None, no periodic wrapping)
+
+    Returns:
+        r_centers: (n_bins,) bin centers
+        xi: (n_bins,) two-point correlation function
+        xi_err: (n_bins,) Poisson error estimate
+    """
+    from scipy.spatial import cKDTree
+
+    N = len(positions)
+    r_edges = np.linspace(0, r_max, n_bins + 1)
+    r_centers = 0.5 * (r_edges[:-1] + r_edges[1:])
+
+    # Build tree with periodic boundary conditions
+    if box_size is not None:
+        tree = cKDTree(positions, boxsize=box_size)
+    else:
+        tree = cKDTree(positions)
+
+    # DD counts
+    DD = np.zeros(n_bins)
+    for i in range(N):
+        dists = tree.query_ball_point(positions[i], r_max)
+        dists_vals = np.array([np.linalg.norm(
+            _periodic_diff(positions[j] - positions[i], box_size)
+            if box_size else positions[j] - positions[i])
+            for j in dists if j != i])
+        if len(dists_vals) > 0:
+            hist, _ = np.histogram(dists_vals, bins=r_edges)
+            DD += hist
+    DD /= 2.0  # each pair counted twice
+
+    # RR counts (analytic for uniform random in a periodic box)
+    if box_size is not None:
+        V = box_size ** 3
+    else:
+        V = (positions.max(axis=0) - positions.min(axis=0)).prod()
+
+    n_bar_vol = N / V
+    shell_volumes = (4.0 / 3.0) * np.pi * (r_edges[1:] ** 3 - r_edges[:-1] ** 3)
+    RR = 0.5 * N * (N - 1) * shell_volumes / V
+
+    # Landy-Szalay (simplified: DR ~ RR for periodic box)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        xi = np.where(RR > 0, DD / RR - 1.0, 0.0)
+
+    # Poisson error: sigma_xi ~ (1 + xi) / sqrt(DD)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        xi_err = np.where(DD > 0, (1.0 + np.abs(xi)) / np.sqrt(DD), 0.0)
+
+    return r_centers, xi, xi_err
+
+
+def _periodic_diff(dx, box_size):
+    """Apply periodic wrapping to displacement vector."""
+    if box_size is None:
+        return dx
+    return dx - box_size * np.round(dx / box_size)
+
+
+def compute_counts_in_cells(positions, delta, n_cells=10, box_size=None):
+    """
+    Counts-in-cells statistics: bin halos into a 3D grid and compute
+    the PDF of cell counts, plus moments.
+
+    Args:
+        positions: (N, 3) positions in Mpc/h
+        delta: (N,) density field values (used for density-weighted counts)
+        n_cells: number of cells per dimension
+        box_size: box size in Mpc/h
+
+    Returns:
+        counts: (n_cells^3,) raw counts per cell
+        density_mean: (n_cells^3,) mean density per cell
+        count_pdf_bins: bin edges for the count PDF
+        count_pdf: count PDF values
+        variance: variance of counts
+        skewness: skewness of counts
+        S3: reduced skewness S_3 = <delta^3> / <delta^2>^2
+    """
+    if box_size is None:
+        box_size = positions.max() - positions.min()
+
+    pos_min = positions.min(axis=0)
+
+    # Assign to cells
+    cell_idx = np.floor((positions - pos_min) / box_size * n_cells).astype(int)
+    cell_idx = np.clip(cell_idx, 0, n_cells - 1)
+
+    # Count halos per cell
+    flat_idx = cell_idx[:, 0] * n_cells ** 2 + cell_idx[:, 1] * n_cells + cell_idx[:, 2]
+    n_total_cells = n_cells ** 3
+    counts = np.bincount(flat_idx, minlength=n_total_cells).astype(float)
+
+    # Mean density per cell
+    density_sum = np.bincount(flat_idx, weights=delta, minlength=n_total_cells)
+    cell_counts_nonzero = np.where(counts > 0, counts, 1)
+    density_mean = density_sum / cell_counts_nonzero
+
+    # Count PDF
+    max_count = int(counts.max()) + 1
+    count_pdf_bins = np.arange(-0.5, max_count + 1.5, 1.0)
+    count_pdf, _ = np.histogram(counts, bins=count_pdf_bins, density=True)
+    count_pdf_centers = 0.5 * (count_pdf_bins[:-1] + count_pdf_bins[1:])
+
+    # Moments
+    mean_count = counts.mean()
+    variance = counts.var()
+    delta_c = (counts - mean_count) / mean_count if mean_count > 0 else counts * 0
+    skewness = np.mean(delta_c ** 3)
+    var_delta = np.mean(delta_c ** 2)
+    S3 = skewness / var_delta ** 2 if var_delta > 0 else 0.0
+
+    return counts, density_mean, count_pdf_centers, count_pdf, variance, skewness, S3
+
+
+def compute_three_point_function(positions, n_bins=10, r_max=80.0,
+                                  box_size=None, n_triplets_max=500000,
+                                  seed=42):
+    """
+    Estimate the reduced three-point function Q(r1, r2, theta) for
+    equilateral configurations (r1 = r2 = r).
+
+    Q = zeta(r, r, r) / [xi(r)^2 * 3]
+
+    where zeta is the connected three-point function.
+
+    Uses Monte Carlo sampling of triplets for efficiency.
+
+    Args:
+        positions: (N, 3) positions in Mpc/h
+        n_bins: number of radial bins
+        r_max: maximum triangle side length
+        box_size: periodic box size
+        n_triplets_max: max number of triplet samples
+        seed: random seed
+
+    Returns:
+        r_centers: (n_bins,) bin centers
+        Q_r: (n_bins,) reduced three-point function
+        Q_err: (n_bins,) bootstrap error
+        zeta: (n_bins,) connected three-point function
+        xi_r: (n_bins,) two-point function at same scales
+    """
+    from scipy.spatial import cKDTree
+
+    N = len(positions)
+    rng = np.random.RandomState(seed)
+
+    r_edges = np.linspace(0, r_max, n_bins + 1)
+    r_centers = 0.5 * (r_edges[:-1] + r_edges[1:])
+    dr = r_edges[1] - r_edges[0]
+
+    if box_size is not None:
+        tree = cKDTree(positions, boxsize=box_size)
+    else:
+        tree = cKDTree(positions)
+
+    # First compute xi(r) at these scales
+    _, xi_r, _ = compute_two_point_function(positions, n_bins=n_bins,
+                                             r_max=r_max, box_size=box_size)
+
+    # Count equilateral triplets: DDD(r)
+    DDD = np.zeros(n_bins)
+    RRR = np.zeros(n_bins)
+
+    if box_size is not None:
+        V = box_size ** 3
+    else:
+        V = (positions.max(axis=0) - positions.min(axis=0)).prod()
+
+    n_bar_vol = N / V
+
+    # Sample anchor points
+    n_anchors = min(N, 2000)
+    anchor_idx = rng.choice(N, n_anchors, replace=False)
+
+    for a_idx in anchor_idx:
+        # Find neighbors within r_max
+        nbrs = tree.query_ball_point(positions[a_idx], r_max + dr)
+        if len(nbrs) < 2:
+            continue
+
+        nbr_pos = positions[nbrs]
+        diffs_a = nbr_pos - positions[a_idx]
+        if box_size is not None:
+            diffs_a = diffs_a - box_size * np.round(diffs_a / box_size)
+        dists_a = np.linalg.norm(diffs_a, axis=1)
+
+        for b in range(n_bins):
+            r_lo, r_hi = r_edges[b], r_edges[b + 1]
+            mask_b = (dists_a >= r_lo) & (dists_a < r_hi)
+            b_indices = np.where(mask_b)[0]
+
+            if len(b_indices) < 2:
+                continue
+
+            # For each pair in this shell, check if they are also separated by r
+            for ii in range(min(len(b_indices), 50)):
+                idx_i = b_indices[ii]
+                for jj in range(ii + 1, min(len(b_indices), 50)):
+                    idx_j = b_indices[jj]
+                    diff_ij = nbr_pos[idx_j] - nbr_pos[idx_i]
+                    if box_size is not None:
+                        diff_ij = diff_ij - box_size * np.round(diff_ij / box_size)
+                    dist_ij = np.linalg.norm(diff_ij)
+                    if r_lo <= dist_ij < r_hi:
+                        DDD[b] += 1
+
+    # Normalize
+    scale = N / n_anchors
+    DDD *= scale
+
+    # RRR for uniform random (analytic for equilateral in periodic box)
+    shell_vol = (4.0 / 3.0) * np.pi * (r_edges[1:] ** 3 - r_edges[:-1] ** 3)
+    for b in range(n_bins):
+        RRR[b] = (N * (N - 1) * (N - 2) / 6.0) * (shell_vol[b] / V) ** 2
+
+    # Connected three-point function
+    with np.errstate(divide='ignore', invalid='ignore'):
+        zeta = np.where(RRR > 0, DDD / RRR - 1.0, 0.0)
+
+    # Reduced Q = zeta / (3 * xi^2)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        denom = 3.0 * xi_r ** 2
+        Q_r = np.where(denom > 1e-10, zeta / denom, 0.0)
+
+    # Error estimate (Poisson-based)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        Q_err = np.where(DDD > 0, np.abs(Q_r) / np.sqrt(DDD + 1), 0.0)
+
+    return r_centers, Q_r, Q_err, zeta, xi_r
+
+
+# =====================================================================
+# LOG-DELTA MAIN PIPELINE
+# =====================================================================
+
+def main_log_delta(sim_idx=0):
+    """Run the full GP log-density reconstruction pipeline."""
+
+    print("=" * 62)
+    print("  GP Log-Density Reconstruction from Quijote Halo Catalogs")
+    print("  Using GraphGP (Vecchia approximation)")
+    print("  Field: f(x) = log(1 + delta(x))")
+    print("=" * 62)
+
+    # ── Step 0: Load data ────────────────────────────────────────
+    positions, velocities, masses = load_data(DATA_DIR, sim_idx=sim_idx)
+    N = len(positions)
+
+    label_a = np.log10(masses + 1e-10)
+    label_b = np.linalg.norm(velocities, axis=1)
+    label_a_name = "log10(M)"
+    label_b_name = "|v| [km/s]"
+
+    # ── Step 1: Build graphs ─────────────────────────────────────
+    graph_halo, points_norm = build_graph(positions)
+    n_bar = float(N)
+
+    graph_combined, n_halo, n_vol, vol_points = \
+        build_combined_graph(points_norm, n_vol=N_VOL_POINTS)
+
+    # ── Step 2: Initial kernel ───────────────────────────────────
+    log_var = jnp.log(jnp.array(INIT_VARIANCE, dtype=jnp.float32))
+    log_scale = jnp.log(jnp.array(INIT_SCALE / L_BOX, dtype=jnp.float32))
+
+    # ── Step 3: Alternating optimization (log-delta) ─────────────
+    all_losses = []
+    xi_current = None
+
+    for rnd in range(N_ALTERNATING_ROUNDS):
+        print(f"\n{'*'*60}")
+        print(f"  LOG-DELTA ROUND {rnd+1}/{N_ALTERNATING_ROUNDS}")
+        print(f"{'*'*60}")
+
+        xi_current, f_map, delta_map, losses = optimize_field_log_delta(
+            graph_combined, n_bar, log_var, log_scale,
+            n_steps=N_OPTIM_STEPS, lr=LEARNING_RATE,
+            xi_init=xi_current, n_halo=n_halo, n_vol=n_vol)
+        all_losses.extend(losses)
+
+        # Kernel optimization uses f (the GP field) not delta
+        log_var, log_scale = optimize_kernel(
+            f_map, graph_combined, log_var, log_scale,
+            n_steps=N_KERNEL_STEPS, lr=1e-3)
+
+    # Final field optimization
+    xi_current, f_map, delta_map, losses = optimize_field_log_delta(
+        graph_combined, n_bar, log_var, log_scale,
+        n_steps=N_OPTIM_STEPS, lr=LEARNING_RATE,
+        xi_init=xi_current, n_halo=n_halo, n_vol=n_vol)
+    all_losses.extend(losses)
+
+    # Extract halo and volume values
+    f_halo = np.array(f_map[:n_halo])
+    delta_halo = np.array(delta_map[:n_halo])
+    f_vol = np.array(f_map[n_halo:])
+    delta_vol = np.array(delta_map[n_halo:])
+    vol_points_np = np.array(vol_points)
+
+    print(f"\n  Final kernel: variance = {float(jnp.exp(log_var)):.4f}, "
+          f"scale = {float(jnp.exp(log_scale)) * L_BOX:.1f} Mpc/h")
+    print(f"  f_halo range: [{f_halo.min():.3f}, {f_halo.max():.3f}]")
+    print(f"  delta_halo range: [{delta_halo.min():.3f}, {delta_halo.max():.3f}]")
+    print(f"  All densities positive: {np.all(delta_halo > -1)}")
+
+    # ── Fisher matrix ────────────────────────────────────────────
+    fisher, fisher_unc = compute_kernel_fisher(
+        f_map, graph_combined, log_var, log_scale)
+
+    var_val = float(jnp.exp(log_var))
+    scale_val = float(jnp.exp(log_scale)) * L_BOX
+    sig_lv = float(fisher_unc[0])
+    sig_ls = float(fisher_unc[1])
+
+    # ── Hessian and cosmic web ───────────────────────────────────
+    # Compute Hessian of the log-density field f, then convert to
+    # Hessian of delta = exp(f) - 1 via chain rule:
+    #   d^2(delta)/dx_i dx_j = exp(f) * [d^2f/dx_i dx_j + df/dx_i * df/dx_j]
+    gradient_f, hessian_f, eigenvalues_f, labels_geo_f, laplacian_f, s_squared_f = \
+        compute_gp_derivatives(graph_halo, make_kernel(log_var, log_scale),
+                               jnp.array(f_halo),
+                               log_variance=log_var, log_scale=log_scale)
+
+    # Convert to delta-space Hessian
+    exp_f = np.exp(f_halo)
+    hessian_delta = np.zeros_like(hessian_f)
+    for i in range(len(f_halo)):
+        outer_grad = np.outer(gradient_f[i], gradient_f[i])
+        hessian_delta[i] = exp_f[i] * (hessian_f[i] + outer_grad)
+
+    eigenvalues_delta = np.linalg.eigvalsh(hessian_delta)
+    eigenvalues_delta = eigenvalues_delta[:, ::-1]
+
+    n_positive_neg_H = np.sum(-eigenvalues_delta > 0, axis=1)
+    labels_geo = np.array(["void"] * len(f_halo), dtype=object)
+    labels_geo[n_positive_neg_H == 1] = "sheet"
+    labels_geo[n_positive_neg_H == 2] = "filament"
+    labels_geo[n_positive_neg_H == 3] = "peak"
+
+    laplacian_delta = np.trace(hessian_delta, axis1=1, axis2=2)
+    trace_part = (laplacian_delta / 3.0)[:, None, None] * np.eye(3)[None, :, :]
+    s_ij = hessian_delta - trace_part
+    s_squared_delta = np.sum(s_ij ** 2, axis=(1, 2))
+
+    # ── Clustering statistics ────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Computing clustering statistics...")
+    print("=" * 60)
+
+    # Two-point function
+    print("  Two-point correlation function...")
+    r_2pt, xi_2pt, xi_2pt_err = compute_two_point_function(
+        positions, n_bins=20, r_max=150.0, box_size=L_BOX)
+
+    # Counts in cells
+    print("  Counts-in-cells...")
+    for nc_label, nc in [("8", 8), ("16", 16)]:
+        counts, density_mean, cic_bins, cic_pdf, cic_var, cic_skew, cic_S3 = \
+            compute_counts_in_cells(positions, delta_halo, n_cells=nc,
+                                     box_size=L_BOX)
+        print(f"    n_cells={nc}: variance={cic_var:.2f}, "
+              f"skewness={cic_skew:.4f}, S3={cic_S3:.3f}")
+
+    # Use n_cells=10 for saved results
+    counts_10, density_mean_10, cic_bins_10, cic_pdf_10, cic_var_10, cic_skew_10, cic_S3_10 = \
+        compute_counts_in_cells(positions, delta_halo, n_cells=10, box_size=L_BOX)
+
+    # Three-point function
+    print("  Three-point function (equilateral)...")
+    r_3pt, Q_3pt, Q_3pt_err, zeta_3pt, xi_3pt = compute_three_point_function(
+        positions, n_bins=12, r_max=80.0, box_size=L_BOX)
+
+    # ── Label-environment correlations ───────────────────────────
+    corr_results = environment_label_analysis(
+        delta_halo, laplacian_delta, s_squared_delta, eigenvalues_delta, labels_geo,
+        label_a, label_b,
+        label_a_name=label_a_name, label_b_name=label_b_name)
+
+    # ── Save results ─────────────────────────────────────────────
+    outfile = os.path.join(OUTPUT_DIR, "gp_log_delta_results.npz")
+    np.savez(
+        outfile,
+        positions=positions,
+        f_halo=f_halo,
+        delta=delta_halo,
+        f_vol=f_vol,
+        delta_vol=delta_vol,
+        vol_points=vol_points_np,
+        gradient_f=gradient_f,
+        hessian_f=hessian_f,
+        eigenvalues_f=eigenvalues_f,
+        gradient_delta=gradient_f * exp_f[:, None],  # chain rule
+        hessian_delta=hessian_delta,
+        eigenvalues=eigenvalues_delta,
+        laplacian=laplacian_delta,
+        s_squared=s_squared_delta,
+        labels_geo=labels_geo,
+        label_a=label_a,
+        label_b=label_b,
+        # Kernel
+        kernel_variance=var_val,
+        kernel_scale_mpc_h=scale_val,
+        fisher_matrix=np.array(fisher),
+        fisher_uncertainties=np.array(fisher_unc),
+        losses=np.array(all_losses),
+        # Clustering statistics
+        r_2pt=r_2pt,
+        xi_2pt=xi_2pt,
+        xi_2pt_err=xi_2pt_err,
+        cic_bins=cic_bins_10,
+        cic_pdf=cic_pdf_10,
+        cic_variance=cic_var_10,
+        cic_skewness=cic_skew_10,
+        cic_S3=cic_S3_10,
+        cic_counts=counts_10,
+        r_3pt=r_3pt,
+        Q_3pt=Q_3pt,
+        Q_3pt_err=Q_3pt_err,
+        zeta_3pt=zeta_3pt,
+        xi_3pt=xi_3pt,
+    )
+    print(f"\n  Log-delta results saved to: {outfile}")
+
+    print("\n" + "=" * 62)
+    print("  Log-delta pipeline complete!")
+    print("=" * 62)
+
+
 if __name__ == "__main__":
     import sys
     sim_idx = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-    main(sim_idx=sim_idx)
+    mode = sys.argv[2] if len(sys.argv) > 2 else "density"
+    if mode == "log_delta":
+        main_log_delta(sim_idx=sim_idx)
+    else:
+        main(sim_idx=sim_idx)
