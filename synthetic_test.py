@@ -31,6 +31,9 @@ from graphGP_cosmo import (
     optimize_kernel, compute_hessian_quadratic_fit,
     compute_gp_derivatives, partial_corr, compute_kernel_fisher,
     build_combined_graph,
+    log_delta_poisson_log_likelihood, optimize_field_log_delta,
+    compute_two_point_function, compute_counts_in_cells,
+    compute_three_point_function,
     N0, K_NEIGHBORS, N_VOL_POINTS, OUTPUT_DIR,
 )
 
