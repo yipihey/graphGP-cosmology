@@ -42,8 +42,8 @@ HAS_RAW_DATA = os.path.isfile(os.path.join(DATA_DIR, "train_halos.npy"))
 # ---------------------------------------------------------------------------
 
 @st.cache_data
-def load_results(path):
-    """Load a pre-computed .npz results file."""
+def load_results(path, mtime=0):
+    """Load a pre-computed .npz results file.  mtime busts cache on file change."""
     d = np.load(path, allow_pickle=True)
     return {k: d[k] for k in d.keys()}
 
@@ -183,6 +183,7 @@ if os.path.isfile(_proposal_path):
 
 results_path = os.path.join(OUTPUT_DIR, "gp_reconstruction_results.npz")
 has_results = os.path.exists(results_path)
+results_mtime = os.path.getmtime(results_path) if has_results else 0
 
 if not has_results:
     st.sidebar.warning("No pre-computed results found. Run `python graphGP_cosmo.py` first.")
@@ -233,7 +234,7 @@ volume-filling points, correcting the bias from sampling only at halo positions.
 """)
     with col2:
         if has_results:
-            r = load_results(results_path)
+            r = load_results(results_path, results_mtime)
             st.metric("Halos", f"{len(r['positions']):,}")
             st.metric("Kernel variance", f"{float(r['kernel_variance']):.4f}")
             st.metric("Kernel scale", f"{float(r['kernel_scale_mpc_h']):.1f} Mpc/h")
@@ -262,7 +263,7 @@ with tabs[1]:
         _src_label = f"Sim {sim_idx}"
     elif has_results:
         st.info("Raw simulation files not found. Showing halos from pre-computed results (sim 0).")
-        _r = load_results(results_path)
+        _r = load_results(results_path, results_mtime)
         pos = _r["positions"]  # Mpc/h
         log_mass = np.array(_r["label_a"])
         v_mag = np.array(_r["label_b"])
@@ -362,7 +363,7 @@ with tabs[2]:
     if not has_results:
         st.warning("No results found. Run `python graphGP_cosmo.py` first.")
     else:
-        r = load_results(results_path)
+        r = load_results(results_path, results_mtime)
         pos_n = r["positions"] / L_BOX  # normalized [0,1]
         delta = r["delta"]
         losses = r["losses"]
@@ -593,7 +594,7 @@ with tabs[3]:
     if not has_results:
         st.warning("No results found.")
     else:
-        r = load_results(results_path)
+        r = load_results(results_path, results_mtime)
         pos_n = r["positions"] / L_BOX
         eigenvalues = r["eigenvalues"]
         labels_geo = r["labels_geo"]
@@ -706,7 +707,7 @@ with the **quadratic-fit Hessian** (ad-hoc local least-squares, ignores the GP k
     if not has_results:
         st.warning("No results found. Run `python graphGP_cosmo.py` first.")
     else:
-        r = load_results(results_path)
+        r = load_results(results_path, results_mtime)
 
         has_qf = "eigenvalues_qf" in r
         if not has_qf:
@@ -887,7 +888,7 @@ with tabs[5]:
     if not has_results:
         st.warning("No results found.")
     else:
-        r = load_results(results_path)
+        r = load_results(results_path, results_mtime)
         delta = r["delta"]
         label_a = r["label_a"]
         label_b = r["label_b"]
