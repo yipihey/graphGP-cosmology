@@ -5,18 +5,29 @@ Synthetic Ground-Truth Validation for GraphGP Cosmology Pipeline
 
 Generates a known GP field + Poisson sampling, assigns labels with
 known functional forms, then runs the pipeline to verify:
-  - Field recovery: corr(reconstructed d, true d) > 0.8
-  - Kernel recovery: learned variance/scale within ~20% of truth
-  - Hessian recovery: eigenvalue classification agreement
-  - Q2 test: partial_corr(label_a, s^2 | d) significant;
-             partial_corr(label_b, s^2 | d) NOT significant
+
+  Test 1 – Density (linear) approach:
+    - Field recovery: corr(reconstructed, true) > 0.5
+    - Kernel recovery: variance and scale within 50% of truth
+
+  Test 2 – Log-delta approach:
+    - Same checks, plus the log-delta specific diagnostics
+    - Theory curve validation: analytic xi = exp(K)-1 vs measured xi
+      from the synthetic catalog
+
+  Test 3 – Hessian & Q2:
+    - Classification agreement > 40%
+    - Q2 test: partial_corr(label_a, s^2 | d) significant;
+               partial_corr(label_b, s^2 | d) NOT significant
 """
 
 import os
+import time
 import numpy as np
 
 import jax
 import jax.numpy as jnp
+from jax import jit, grad
 
 import graphgp as gp
 import optax
@@ -37,6 +48,8 @@ from graphGP_cosmo import (
     N0, K_NEIGHBORS, N_VOL_POINTS, OUTPUT_DIR,
 )
 
+L_BOX = 1000.0
+
 # True kernel parameters (in [0,1] box units)
 TRUE_VARIANCE = 0.5
 TRUE_SCALE = 0.05  # 50 Mpc/h if L_BOX=1000
@@ -44,16 +57,17 @@ N_CANDIDATES = 20000
 SEED = 123
 
 
+# =====================================================================
+# DATA GENERATION
+# =====================================================================
+
 def generate_synthetic_data():
     """
     Generate a synthetic GP field + Poisson-thinned halo catalog.
 
-    Returns:
-        obs_points: (N_obs, 3) observed positions
-        true_delta_obs: (N_obs,) true field at observed positions
-        true_delta_all: (N_cand,) true field at all candidate positions
-        all_points: (N_cand, 3) all candidate positions
-        true_hessian_eig: (N_obs, 3) true Hessian eigenvalues
+    Returns dict with:
+        obs_points, true_delta_obs, delta_all, all_points,
+        true_eig, true_labels, true_lap, true_s2, keep
     """
     print("=" * 60)
     print("Generating synthetic data")
@@ -96,13 +110,23 @@ def generate_synthetic_data():
 
     print(f"  N_observed = {N_obs} (acceptance rate = {N_obs/N_CANDIDATES:.2f})")
 
-    # Compute true Hessian eigenvalues via local quadratic fit on ALL points
+    # Compute true Hessian eigenvalues via local quadratic fit on observed points
     print("  Computing true Hessian on observed points...")
     _, _, true_eig, true_labels, true_lap, true_s2 = \
         compute_hessian_quadratic_fit(delta_all[keep], obs_points)
 
-    return (obs_points, true_delta_obs, delta_all, all_points,
-            true_eig, true_labels, true_lap, true_s2, keep)
+    return {
+        "obs_points": obs_points,
+        "true_delta_obs": true_delta_obs,
+        "delta_all": delta_all,
+        "all_points": all_points,
+        "true_eig": true_eig,
+        "true_labels": true_labels,
+        "true_lap": true_lap,
+        "true_s2": true_s2,
+        "keep": keep,
+        "N_obs": N_obs,
+    }
 
 
 def assign_labels(true_delta, true_s2):
@@ -121,74 +145,194 @@ def assign_labels(true_delta, true_s2):
     return label_a, label_b
 
 
-def run_reconstruction(obs_points, n_obs):
-    """Run the pipeline on observed points with volume integral."""
+# =====================================================================
+# DENSITY (LINEAR) APPROACH
+# =====================================================================
+
+def run_density_reconstruction(obs_points, n_obs):
+    """Run density approach reconstruction with 4 alternating rounds."""
     print("\n" + "=" * 60)
-    print("Running reconstruction on synthetic data")
+    print("Test 1: Density (linear) approach")
     print("=" * 60)
 
     obs_jax = jnp.array(obs_points)
 
-    # Halo-only graph (for Hessian later)
+    # Graph
     n0 = min(N0, n_obs // 2)
     k = min(K_NEIGHBORS, n0 - 1)
     graph_halo = gp.build_graph(obs_jax, n0=n0, k=k)
 
-    # Combined graph with volume points (for corrected likelihood)
-    n_vol_syn = min(N_VOL_POINTS, n_obs)  # scale volume points to problem size
+    # Combined graph with volume points
+    n_vol_syn = min(N_VOL_POINTS, n_obs)
     graph_combined, n_halo, n_vol, vol_points = \
         build_combined_graph(obs_jax, n_vol=n_vol_syn, seed=42)
     n_bar = float(n_obs)
 
-    # Initial kernel (deliberately off from truth)
-    init_log_var = jnp.log(jnp.array(1.0))
-    init_log_scale = jnp.log(jnp.array(0.03))
+    # Initial kernel (deliberately off)
+    opt_lv = jnp.log(jnp.array(1.0))
+    opt_ls = jnp.log(jnp.array(0.03))
+    xi = None
+    all_losses = []
 
-    # Round 1: field
-    xi, delta_map, losses1 = optimize_field(
-        graph_combined, n_bar, init_log_var, init_log_scale,
-        n_steps=150, lr=1e-2, n_halo=n_halo, n_vol=n_vol)
+    # 4 alternating rounds for better convergence
+    for rnd in range(4):
+        xi, delta_map, losses = optimize_field(
+            graph_combined, n_bar, opt_lv, opt_ls,
+            n_steps=200, lr=1e-2, xi_init=xi,
+            n_halo=n_halo, n_vol=n_vol)
+        all_losses.extend(losses)
 
-    # Round 1: kernel
-    opt_lv, opt_ls = optimize_kernel(
-        delta_map, graph_combined, init_log_var, init_log_scale,
-        n_steps=40, lr=1e-3)
+        opt_lv, opt_ls = optimize_kernel(
+            delta_map, graph_combined, opt_lv, opt_ls,
+            n_steps=50, lr=1e-3)
 
-    # Round 2: field with learned kernel
-    xi, delta_map, losses2 = optimize_field(
+    # Final field optimization
+    xi, delta_map, losses = optimize_field(
         graph_combined, n_bar, opt_lv, opt_ls,
-        n_steps=150, lr=1e-2, xi_init=xi, n_halo=n_halo, n_vol=n_vol)
+        n_steps=200, lr=1e-2, xi_init=xi,
+        n_halo=n_halo, n_vol=n_vol)
+    all_losses.extend(losses)
 
-    # Round 2: kernel
-    opt_lv, opt_ls = optimize_kernel(
-        delta_map, graph_combined, opt_lv, opt_ls,
-        n_steps=40, lr=1e-3)
-
-    # Final field
-    xi, delta_map, losses3 = optimize_field(
-        graph_combined, n_bar, opt_lv, opt_ls,
-        n_steps=150, lr=1e-2, xi_init=xi, n_halo=n_halo, n_vol=n_vol)
-
-    all_losses = losses1 + losses2 + losses3
-
-    # Extract halo-only delta
     delta_halo = np.array(delta_map[:n_halo])
-
     learned_var = float(jnp.exp(opt_lv))
     learned_scale = float(jnp.exp(opt_ls))
 
-    print(f"\n  Learned kernel: variance = {learned_var:.4f} "
-          f"(true = {TRUE_VARIANCE:.4f})")
-    print(f"  Learned kernel: scale = {learned_scale:.4f} "
-          f"(true = {TRUE_SCALE:.4f})")
+    print(f"\n  Learned: variance = {learned_var:.4f} (true = {TRUE_VARIANCE})")
+    print(f"  Learned: scale = {learned_scale:.4f} (true = {TRUE_SCALE})")
 
-    # Fisher uncertainties
+    # Fisher
     fisher, fisher_unc = compute_kernel_fisher(
         delta_map, graph_combined, opt_lv, opt_ls)
 
-    return (delta_halo, learned_var, learned_scale,
-            all_losses, graph_halo, opt_lv, opt_ls, fisher_unc)
+    return {
+        "delta_halo": delta_halo,
+        "learned_var": learned_var,
+        "learned_scale": learned_scale,
+        "losses": all_losses,
+        "graph_halo": graph_halo,
+        "opt_lv": opt_lv,
+        "opt_ls": opt_ls,
+        "fisher_unc": fisher_unc,
+        "fisher_matrix": np.array(fisher),
+    }
 
+
+# =====================================================================
+# LOG-DELTA APPROACH
+# =====================================================================
+
+def run_log_delta_reconstruction(obs_points, n_obs):
+    """Run log-delta approach reconstruction with 4 alternating rounds."""
+    print("\n" + "=" * 60)
+    print("Test 2: Log-delta approach")
+    print("=" * 60)
+
+    obs_jax = jnp.array(obs_points)
+
+    n0 = min(N0, n_obs // 2)
+    k = min(K_NEIGHBORS, n0 - 1)
+    graph_halo = gp.build_graph(obs_jax, n0=n0, k=k)
+
+    n_vol_syn = min(N_VOL_POINTS, n_obs)
+    graph_combined, n_halo, n_vol, vol_points = \
+        build_combined_graph(obs_jax, n_vol=n_vol_syn, seed=42)
+    n_bar = float(n_obs)
+
+    opt_lv = jnp.log(jnp.array(1.0))
+    opt_ls = jnp.log(jnp.array(0.03))
+    xi = None
+    all_losses = []
+
+    for rnd in range(4):
+        xi, f_map, delta_map, losses = optimize_field_log_delta(
+            graph_combined, n_bar, opt_lv, opt_ls,
+            n_steps=200, lr=1e-2, xi_init=xi,
+            n_halo=n_halo, n_vol=n_vol)
+        all_losses.extend(losses)
+
+        opt_lv, opt_ls = optimize_kernel(
+            f_map, graph_combined, opt_lv, opt_ls,
+            n_steps=50, lr=1e-3)
+
+    # Final
+    xi, f_map, delta_map, losses = optimize_field_log_delta(
+        graph_combined, n_bar, opt_lv, opt_ls,
+        n_steps=200, lr=1e-2, xi_init=xi,
+        n_halo=n_halo, n_vol=n_vol)
+    all_losses.extend(losses)
+
+    delta_halo = np.array(delta_map[:n_halo])
+    f_halo = np.array(f_map[:n_halo])
+    learned_var = float(jnp.exp(opt_lv))
+    learned_scale = float(jnp.exp(opt_ls))
+
+    print(f"\n  Learned: variance = {learned_var:.4f} (true = {TRUE_VARIANCE})")
+    print(f"  Learned: scale = {learned_scale:.4f} (true = {TRUE_SCALE})")
+
+    fisher, fisher_unc = compute_kernel_fisher(
+        f_map, graph_combined, opt_lv, opt_ls)
+
+    return {
+        "delta_halo": delta_halo,
+        "f_halo": f_halo,
+        "learned_var": learned_var,
+        "learned_scale": learned_scale,
+        "losses": all_losses,
+        "graph_halo": graph_halo,
+        "opt_lv": opt_lv,
+        "opt_ls": opt_ls,
+        "fisher_unc": fisher_unc,
+        "fisher_matrix": np.array(fisher),
+    }
+
+
+# =====================================================================
+# THEORY CURVE VALIDATION
+# =====================================================================
+
+def validate_theory_curves(obs_points, learned_var_ld, learned_scale_ld):
+    """
+    Compare analytic xi(r) = exp(K(r)) - 1 from the learned log-delta
+    kernel against the measured Landy-Szalay xi(r) from the synthetic
+    catalog.  This validates the paper's core claim.
+    """
+    print("\n" + "=" * 60)
+    print("Test: Theory curve validation (xi from K vs measured)")
+    print("=" * 60)
+
+    positions_mpc = obs_points * L_BOX
+
+    r_meas, xi_meas, xi_err = compute_two_point_function(
+        positions_mpc, n_bins=20, r_max=150.0, box_size=L_BOX)
+
+    # Analytic prediction from learned kernel
+    K_at_r = learned_var_ld * np.exp(-0.5 * (r_meas / (learned_scale_ld * L_BOX))**2)
+    xi_theory = np.exp(K_at_r) - 1
+
+    # Residuals
+    residual = xi_meas - xi_theory
+    # chi^2 (where errors available and xi > 0)
+    valid = (xi_err > 0) & np.isfinite(xi_meas)
+    chi2 = np.sum((residual[valid] / xi_err[valid])**2)
+    ndof = int(valid.sum()) - 2  # 2 kernel params
+    chi2_red = chi2 / max(ndof, 1)
+
+    print(f"  chi2/ndof = {chi2:.1f}/{ndof} = {chi2_red:.2f}")
+
+    return {
+        "r_meas": r_meas,
+        "xi_meas": xi_meas,
+        "xi_err": xi_err,
+        "xi_theory": xi_theory,
+        "chi2": chi2,
+        "ndof": ndof,
+        "chi2_red": chi2_red,
+    }
+
+
+# =====================================================================
+# VALIDATION
+# =====================================================================
 
 def validate(true_delta, recon_delta, true_var, learned_var,
              true_scale, learned_scale,
@@ -223,7 +367,14 @@ def validate(true_delta, recon_delta, true_var, learned_var,
     print(f"  Classification agreement: {100*agreement:.1f}%  "
           f"{'PASS' if passed_class else 'FAIL'}")
 
-    # 4. Q2 test: label_a should correlate with s^2|d, label_b should not
+    # 4. Eigenvalue correlations
+    eig_corrs = []
+    for i in range(3):
+        r_eig, _ = pearsonr(true_eig[:, i], recon_eig[:, i])
+        eig_corrs.append(float(r_eig))
+        print(f"  Eigenvalue {i+1} correlation: {r_eig:.4f}")
+
+    # 5. Q2 test: label_a should correlate with s^2|d, label_b should not
     r_a_s2, p_a_s2 = partial_corr(label_a, recon_s2, recon_delta_for_corr)
     r_b_s2, p_b_s2 = partial_corr(label_b, recon_s2, recon_delta_for_corr)
     passed_q2a = p_a_s2 < 0.05
@@ -240,11 +391,16 @@ def validate(true_delta, recon_delta, true_var, learned_var,
     return {
         "r_field": r_field, "var_err": var_err, "scale_err": scale_err,
         "classification_agreement": agreement,
+        "eig_corrs": np.array(eig_corrs),
         "r_a_s2": r_a_s2, "p_a_s2": p_a_s2,
         "r_b_s2": r_b_s2, "p_b_s2": p_b_s2,
         "all_passed": all_passed,
     }
 
+
+# =====================================================================
+# PLOTS
+# =====================================================================
 
 def make_validation_plots(true_delta, recon_delta, losses, val_results):
     """Scatter plot of reconstructed vs true delta + convergence."""
@@ -282,76 +438,164 @@ def make_validation_plots(true_delta, recon_delta, losses, val_results):
     plt.close()
 
 
+# =====================================================================
+# MAIN
+# =====================================================================
+
 def main():
+    t0 = time.time()
     print("=" * 62)
     print("  Synthetic Ground-Truth Validation")
     print("=" * 62)
 
-    # Generate synthetic data
-    (obs_points, true_delta_obs, delta_all, all_points,
-     true_eig, true_labels, true_lap, true_s2, keep) = \
-        generate_synthetic_data()
-
-    N_obs = len(obs_points)
+    # --- Generate synthetic data ---
+    data = generate_synthetic_data()
+    obs_points = data["obs_points"]
+    true_delta_obs = data["true_delta_obs"]
+    N_obs = data["N_obs"]
 
     # Assign labels
-    label_a, label_b = assign_labels(true_delta_obs, true_s2)
+    label_a, label_b = assign_labels(true_delta_obs, data["true_s2"])
     print(f"  label_a range: [{label_a.min():.3f}, {label_a.max():.3f}]")
     print(f"  label_b range: [{label_b.min():.3f}, {label_b.max():.3f}]")
 
-    # Run reconstruction
-    (recon_delta, learned_var, learned_scale, losses,
-     graph, opt_lv, opt_ls, fisher_unc) = \
-        run_reconstruction(obs_points, N_obs)
+    # --- Test 1: Density approach ---
+    t1 = time.time()
+    res_d = run_density_reconstruction(obs_points, N_obs)
+    t_density = time.time() - t1
+    print(f"\n  Density approach took {t_density:.0f}s")
 
-    # Compute Hessian on reconstructed field — both methods
-    recon_delta_jax = jnp.array(recon_delta)
-    cov = make_kernel(opt_lv, opt_ls)
+    # Hessian from density approach
+    cov_d = make_kernel(res_d["opt_lv"], res_d["opt_ls"])
+    _, _, recon_eig_d, recon_labels_d, _, recon_s2_d = \
+        compute_gp_derivatives(res_d["graph_halo"], cov_d,
+                               jnp.array(res_d["delta_halo"]),
+                               log_variance=res_d["opt_lv"],
+                               log_scale=res_d["opt_ls"])
 
-    _, _, recon_eig_gp, recon_labels_gp, recon_lap_gp, recon_s2_gp = \
-        compute_gp_derivatives(graph, cov, recon_delta_jax,
-                               log_variance=opt_lv, log_scale=opt_ls)
-    _, _, recon_eig_qf, recon_labels_qf, recon_lap_qf, recon_s2_qf = \
-        compute_hessian_quadratic_fit(recon_delta, obs_points)
+    # --- Test 2: Log-delta approach ---
+    t2 = time.time()
+    res_l = run_log_delta_reconstruction(obs_points, N_obs)
+    t_logdelta = time.time() - t2
+    print(f"\n  Log-delta approach took {t_logdelta:.0f}s")
 
-    # Compare the two Hessian methods against truth
+    # Hessian from log-delta approach (on f_halo)
+    cov_l = make_kernel(res_l["opt_lv"], res_l["opt_ls"])
+    _, _, recon_eig_l, recon_labels_l, _, recon_s2_l = \
+        compute_gp_derivatives(res_l["graph_halo"], cov_l,
+                               jnp.array(res_l["f_halo"]),
+                               log_variance=res_l["opt_lv"],
+                               log_scale=res_l["opt_ls"])
+
+    # Also get QuadFit Hessian for comparison
+    _, _, recon_eig_qf, recon_labels_qf, _, recon_s2_qf = \
+        compute_hessian_quadratic_fit(res_d["delta_halo"], obs_points)
+
+    # --- Compare Hessian methods ---
     from scipy.stats import pearsonr
+    print("\n  Hessian method comparison (vs truth):")
     for i in range(3):
-        r_gp, _ = pearsonr(true_eig[:, i], recon_eig_gp[:, i])
-        r_qf, _ = pearsonr(true_eig[:, i], recon_eig_qf[:, i])
-        print(f"  Eigenvalue {i+1} corr with truth:  GP = {r_gp:.4f},  QuadFit = {r_qf:.4f}")
+        r_gp_d, _ = pearsonr(data["true_eig"][:, i], recon_eig_d[:, i])
+        r_gp_l, _ = pearsonr(data["true_eig"][:, i], recon_eig_l[:, i])
+        r_qf, _ = pearsonr(data["true_eig"][:, i], recon_eig_qf[:, i])
+        print(f"    eig{i+1}: GP-density={r_gp_d:.3f}  "
+              f"GP-logdelta={r_gp_l:.3f}  QuadFit={r_qf:.3f}")
 
-    agree_gp = np.mean(true_labels == recon_labels_gp)
-    agree_qf = np.mean(true_labels == recon_labels_qf)
-    print(f"  Classification agreement:  GP = {100*agree_gp:.1f}%,  QuadFit = {100*agree_qf:.1f}%")
+    agree_d = np.mean(data["true_labels"] == recon_labels_d)
+    agree_l = np.mean(data["true_labels"] == recon_labels_l)
+    agree_qf = np.mean(data["true_labels"] == recon_labels_qf)
+    print(f"    Classification: GP-density={100*agree_d:.1f}%  "
+          f"GP-logdelta={100*agree_l:.1f}%  QuadFit={100*agree_qf:.1f}%")
 
-    # Use GP derivatives as the primary result for validation
-    recon_eig = recon_eig_gp
-    recon_labels = recon_labels_gp
-    recon_s2 = recon_s2_gp
+    # --- Validation (density approach as primary) ---
+    val_d = validate(
+        true_delta_obs, res_d["delta_halo"],
+        TRUE_VARIANCE, res_d["learned_var"],
+        TRUE_SCALE, res_d["learned_scale"],
+        data["true_eig"], recon_eig_d,
+        data["true_labels"], recon_labels_d,
+        label_a, label_b, data["true_s2"], recon_s2_d,
+        res_d["delta_halo"])
 
-    # Validate
-    val_results = validate(
-        true_delta_obs, recon_delta,
-        TRUE_VARIANCE, learned_var,
-        TRUE_SCALE, learned_scale,
-        true_eig, recon_eig, true_labels, recon_labels,
-        label_a, label_b, true_s2, recon_s2, recon_delta)
+    # --- Validation (log-delta approach) ---
+    print("\n--- Log-delta validation ---")
+    from scipy.stats import pearsonr as pcorr
+    r_field_l, _ = pcorr(true_delta_obs, res_l["delta_halo"])
+    var_err_l = abs(res_l["learned_var"] - TRUE_VARIANCE) / TRUE_VARIANCE
+    scale_err_l = abs(res_l["learned_scale"] - TRUE_SCALE) / TRUE_SCALE
+    agree_l_val = np.mean(data["true_labels"] == recon_labels_l)
 
-    # Plots
-    make_validation_plots(true_delta_obs, recon_delta, losses, val_results)
+    print(f"  Field corr (log-delta): {r_field_l:.4f}")
+    print(f"  Var error: {100*var_err_l:.1f}%")
+    print(f"  Scale error: {100*scale_err_l:.1f}%")
+    print(f"  Classification: {100*agree_l_val:.1f}%")
 
-    # Save
+    # Eigenvalue correlations for log-delta
+    eig_corrs_l = []
+    for i in range(3):
+        r_eig, _ = pcorr(data["true_eig"][:, i], recon_eig_l[:, i])
+        eig_corrs_l.append(float(r_eig))
+
+    # --- Theory curve validation ---
+    theory_val = validate_theory_curves(
+        obs_points, res_l["learned_var"], res_l["learned_scale"])
+
+    # --- Residuals ---
+    residuals_d = res_d["delta_halo"] - true_delta_obs
+    residuals_l = res_l["delta_halo"] - true_delta_obs
+
+    # --- Plots ---
+    make_validation_plots(true_delta_obs, res_d["delta_halo"],
+                          res_d["losses"], val_d)
+
+    # --- Save ---
     outfile = os.path.join(OUTPUT_DIR, "synthetic_validation_results.npz")
-    np.savez(outfile, **val_results,
-             true_delta=true_delta_obs, recon_delta=recon_delta,
-             learned_var=learned_var, learned_scale=learned_scale,
-             true_var=TRUE_VARIANCE, true_scale=TRUE_SCALE)
-    print(f"  Results saved to: {outfile}")
+    np.savez(
+        outfile,
+        # Density approach
+        **val_d,
+        true_delta=true_delta_obs,
+        recon_delta=res_d["delta_halo"],
+        learned_var=res_d["learned_var"],
+        learned_scale=res_d["learned_scale"],
+        true_var=TRUE_VARIANCE,
+        true_scale=TRUE_SCALE,
+        losses_density=np.array(res_d["losses"]),
+        residuals_density=residuals_d,
+        fisher_matrix_density=res_d["fisher_matrix"],
+        # Log-delta approach
+        recon_delta_ld=res_l["delta_halo"],
+        recon_f_ld=res_l["f_halo"],
+        learned_var_ld=res_l["learned_var"],
+        learned_scale_ld=res_l["learned_scale"],
+        losses_logdelta=np.array(res_l["losses"]),
+        residuals_logdelta=residuals_l,
+        r_field_ld=r_field_l,
+        var_err_ld=var_err_l,
+        scale_err_ld=scale_err_l,
+        classification_agreement_ld=agree_l_val,
+        eig_corrs_ld=np.array(eig_corrs_l),
+        fisher_matrix_logdelta=res_l["fisher_matrix"],
+        # Hessian eigenvalue arrays
+        true_eig=data["true_eig"],
+        recon_eig_density=np.array(recon_eig_d),
+        recon_eig_logdelta=np.array(recon_eig_l),
+        recon_eig_quadfit=np.array(recon_eig_qf),
+        # Theory validation
+        theory_r=theory_val["r_meas"],
+        theory_xi_measured=theory_val["xi_meas"],
+        theory_xi_err=theory_val["xi_err"],
+        theory_xi_analytic=theory_val["xi_theory"],
+        theory_chi2=theory_val["chi2"],
+        theory_ndof=theory_val["ndof"],
+        theory_chi2_red=theory_val["chi2_red"],
+    )
+    print(f"\n  Results saved to: {outfile}")
 
-    print("\n" + "=" * 62)
-    print("  Synthetic validation complete!")
-    print("=" * 62)
+    elapsed = time.time() - t0
+    print(f"\n{'=' * 62}")
+    print(f"  Synthetic validation complete!  ({elapsed:.0f}s total)")
+    print(f"{'=' * 62}")
 
 
 if __name__ == "__main__":

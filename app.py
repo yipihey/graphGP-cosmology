@@ -1843,12 +1843,44 @@ with tabs[7]:
         st.warning("No synthetic results found. Run `python synthetic_test.py` first.")
     else:
         st.markdown("""
-**Setup:** Generate a known GP field with true kernel parameters,
-Poisson-thin to simulate observed halos, assign labels with known
-functional forms, then run the reconstruction and check recovery.
+**Setup:** Draw a GP field with known kernel parameters (variance = 0.5,
+scale = 50 Mpc/h), Poisson-thin to create an observed halo catalog, then
+run the full reconstruction pipeline and check what is recovered.
+
+This is an end-to-end test: the pipeline only sees the thinned point
+pattern, not the true field.  Three independent checks are run:
+
+1. **Field & kernel recovery** — can the MAP estimator recover the
+   density contrast and the covariance function?
+2. **Theory-curve validation** — does the analytic prediction
+   xi(r) = exp(K(r)) - 1 match the Landy-Szalay estimator applied
+   to the *synthetic* catalog?  (Validates the paper's core claim.)
+3. **Q2 signal detection** — can the pipeline detect a planted
+   tidal-shear signal via partial correlations?
+
+Both the **density (linear)** and **log-delta** approaches are tested
+side-by-side.
 """)
 
-        # Metrics
+        # --- flags for new vs old data ---
+        _has_ld = "recon_delta_ld" in syn
+        _has_theory = "theory_r" in syn
+        _has_eig = "true_eig" in syn
+        _has_losses = "losses_density" in syn
+        _has_residuals = "residuals_density" in syn
+
+        true_var_s = float(syn["true_var"])
+        true_scale_s = float(syn["true_scale"])
+        learned_var_s = float(syn["learned_var"])
+        learned_scale_s = float(syn["learned_scale"])
+        true_d = syn["true_delta"]
+        recon_d = syn["recon_delta"]
+
+        # =================================================================
+        # SECTION 1: Density approach summary
+        # =================================================================
+        st.subheader("Test 1 — Density (Linear) Approach")
+
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Field corr", f"{float(syn['r_field']):.3f}",
                      delta="PASS" if float(syn['r_field']) > 0.5 else "FAIL")
@@ -1861,68 +1893,308 @@ functional forms, then run the reconstruction and check recovery.
         col4.metric("Classification", f"{100*float(syn['classification_agreement']):.1f}%",
                      delta="PASS" if float(syn['classification_agreement']) > 0.4 else "FAIL")
 
-        # Kernel comparison
-        st.subheader("Kernel Recovery")
+        # Kernel table + plot
         col1, col2 = st.columns(2)
         with col1:
-            true_var = float(syn["true_var"])
-            true_scale = float(syn["true_scale"])
-            learned_var = float(syn["learned_var"])
-            learned_scale = float(syn["learned_scale"])
-
-            st.markdown(f"""
-| Parameter | True | Learned | Error |
-|-----------|------|---------|-------|
-| Variance  | {true_var:.4f} | {learned_var:.4f} | {100*float(syn['var_err']):.1f}% |
-| Scale     | {true_scale:.4f} | {learned_scale:.4f} | {100*float(syn['scale_err']):.1f}% |
-""")
+            st.markdown("**Kernel recovery**")
+            _kernel_rows = [{
+                "": "Density",
+                "True var": f"{true_var_s:.4f}",
+                "Learned var": f"{learned_var_s:.4f}",
+                "Var err": f"{100*float(syn['var_err']):.1f}%",
+                "True scale": f"{true_scale_s:.4f}",
+                "Learned scale": f"{learned_scale_s:.4f}",
+                "Scale err": f"{100*float(syn['scale_err']):.1f}%",
+            }]
+            if _has_ld:
+                _lv_ld = float(syn["learned_var_ld"])
+                _ls_ld = float(syn["learned_scale_ld"])
+                _kernel_rows.append({
+                    "": "Log-delta",
+                    "True var": f"{true_var_s:.4f}",
+                    "Learned var": f"{_lv_ld:.4f}",
+                    "Var err": f"{100*float(syn['var_err_ld']):.1f}%",
+                    "True scale": f"{true_scale_s:.4f}",
+                    "Learned scale": f"{_ls_ld:.4f}",
+                    "Scale err": f"{100*float(syn['scale_err_ld']):.1f}%",
+                })
+            st.table(_kernel_rows)
 
         with col2:
-            r_plot = np.linspace(0, 0.3, 300)
-            cr_true = true_var * np.exp(-0.5 * (r_plot / true_scale) ** 2)
-            cr_learned = learned_var * np.exp(-0.5 * (r_plot / learned_scale) ** 2)
+            _rp = np.linspace(0, 0.3, 300)
+            _cr_true = true_var_s * np.exp(-0.5 * (_rp / true_scale_s) ** 2)
+            _cr_d = learned_var_s * np.exp(-0.5 * (_rp / learned_scale_s) ** 2)
             fig_kv = go.Figure()
-            fig_kv.add_trace(go.Scatter(x=r_plot, y=cr_true, name="True kernel",
-                                         line=dict(color="green", width=2, dash="dash")))
-            fig_kv.add_trace(go.Scatter(x=r_plot, y=cr_learned, name="Learned kernel",
-                                         line=dict(color="royalblue", width=2)))
+            fig_kv.add_trace(go.Scatter(x=_rp, y=_cr_true, name="True",
+                                         line=dict(color="green", width=2.5, dash="dash")))
+            fig_kv.add_trace(go.Scatter(x=_rp, y=_cr_d, name="Density",
+                                         line=dict(color="steelblue", width=2)))
+            if _has_ld:
+                _cr_l = _lv_ld * np.exp(-0.5 * (_rp / _ls_ld) ** 2)
+                fig_kv.add_trace(go.Scatter(x=_rp, y=_cr_l, name="Log-delta",
+                                             line=dict(color="darkorange", width=2)))
             fig_kv.update_layout(xaxis_title="r [box units]", yaxis_title="C(r)",
-                                  height=500)
+                                  height=400, title="Kernel Recovery")
             add_log_buttons(fig_kv)
             st.plotly_chart(fig_kv, use_container_width=True)
 
-        # Field scatter
-        st.subheader("Field Recovery")
-        true_d = syn["true_delta"]
-        recon_d = syn["recon_delta"]
+        # Field recovery scatter + residuals
+        st.markdown("**Field recovery**")
+        _n_cols = 3 if _has_residuals else 2
+        _cols = st.columns(_n_cols)
+        with _cols[0]:
+            fig_fs = go.Figure()
+            idx_sv = thin_for_3d(len(true_d), 2000)
+            fig_fs.add_trace(go.Scatter(
+                x=true_d[idx_sv], y=recon_d[idx_sv], mode="markers",
+                marker=dict(size=2.5, opacity=0.3, color="steelblue"),
+                name="Density approach",
+            ))
+            if _has_ld:
+                recon_d_ld = syn["recon_delta_ld"]
+                fig_fs.add_trace(go.Scatter(
+                    x=true_d[idx_sv], y=recon_d_ld[idx_sv], mode="markers",
+                    marker=dict(size=2.5, opacity=0.3, color="darkorange"),
+                    name="Log-delta approach",
+                ))
+            _all = np.concatenate([true_d, recon_d])
+            _lo, _hi = np.percentile(_all, [1, 99])
+            _pad = 0.05 * (_hi - _lo)
+            _lims = [_lo - _pad, _hi + _pad]
+            fig_fs.add_trace(go.Scatter(x=_lims, y=_lims, mode="lines",
+                                         line=dict(color="red", dash="dash"),
+                                         name="1:1"))
+            _title_fs = f"Density r = {float(syn['r_field']):.3f}"
+            if _has_ld:
+                _title_fs += f",  Log-delta r = {float(syn['r_field_ld']):.3f}"
+            fig_fs.update_layout(
+                xaxis_title="True delta", yaxis_title="Reconstructed delta",
+                height=450, title=_title_fs,
+            )
+            equal_axes(fig_fs, true_d, recon_d)
+            st.plotly_chart(fig_fs, use_container_width=True)
 
-        fig_fs = go.Figure()
-        idx_sv = thin_for_3d(len(true_d), 2000)
-        fig_fs.add_trace(go.Scatter(
-            x=true_d[idx_sv], y=recon_d[idx_sv], mode="markers",
-            marker=dict(size=2.5, opacity=0.3, color="steelblue"),
-            name="Halos",
-        ))
-        combined_d = np.concatenate([true_d, recon_d])
-        lo_d, hi_d = np.percentile(combined_d, [1, 99])
-        pad_d = 0.05 * (hi_d - lo_d)
-        lims = [lo_d - pad_d, hi_d + pad_d]
-        fig_fs.add_trace(go.Scatter(
-            x=lims, y=lims, mode="lines",
-            line=dict(color="red", dash="dash"), name="Perfect recovery",
-        ))
-        fig_fs.update_layout(
-            xaxis_title="True delta",
-            yaxis_title="Reconstructed delta",
-            height=500,
-            title=f"Correlation = {float(syn['r_field']):.3f}",
-        )
-        equal_axes(fig_fs, true_d, recon_d)
-        add_log_buttons(fig_fs)
-        st.plotly_chart(fig_fs, use_container_width=True)
+        if _has_residuals:
+            with _cols[1]:
+                fig_res = go.Figure()
+                fig_res.add_trace(go.Histogram(
+                    x=syn["residuals_density"], nbinsx=60,
+                    name="Density", marker_color="steelblue", opacity=0.6,
+                    histnorm="probability density",
+                ))
+                if _has_ld:
+                    fig_res.add_trace(go.Histogram(
+                        x=syn["residuals_logdelta"], nbinsx=60,
+                        name="Log-delta", marker_color="darkorange", opacity=0.6,
+                        histnorm="probability density",
+                    ))
+                _std_d = float(np.std(syn["residuals_density"]))
+                _title_res = f"Residuals (density std = {_std_d:.3f}"
+                if _has_ld:
+                    _std_l = float(np.std(syn["residuals_logdelta"]))
+                    _title_res += f", log-delta std = {_std_l:.3f}"
+                _title_res += ")"
+                fig_res.update_layout(
+                    barmode="overlay", height=450,
+                    xaxis_title="recon - true", yaxis_title="PDF",
+                    title=_title_res,
+                )
+                st.plotly_chart(fig_res, use_container_width=True)
 
-        # Q2 check
+            with _cols[2]:
+                # Convergence
+                if _has_losses:
+                    fig_conv_s = go.Figure()
+                    fig_conv_s.add_trace(go.Scatter(
+                        y=syn["losses_density"], mode="lines",
+                        name="Density", line=dict(color="steelblue", width=1.5),
+                    ))
+                    if _has_ld:
+                        fig_conv_s.add_trace(go.Scatter(
+                            y=syn["losses_logdelta"], mode="lines",
+                            name="Log-delta", line=dict(color="darkorange", width=1.5),
+                        ))
+                    fig_conv_s.update_layout(
+                        xaxis_title="Step", yaxis_title="-log posterior",
+                        height=450, title="Convergence",
+                    )
+                    add_log_buttons(fig_conv_s)
+                    st.plotly_chart(fig_conv_s, use_container_width=True)
+        else:
+            with _cols[1]:
+                st.info("Re-run `python synthetic_test.py` for convergence & residual diagnostics.")
+
+        # =================================================================
+        # SECTION 2: Log-delta comparison metrics
+        # =================================================================
+        if _has_ld:
+            st.subheader("Test 2 — Log-Delta Approach")
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Field corr", f"{float(syn['r_field_ld']):.3f}",
+                         delta="PASS" if float(syn['r_field_ld']) > 0.5 else "FAIL")
+            col2.metric("Var error", f"{100*float(syn['var_err_ld']):.1f}%",
+                         delta="PASS" if float(syn['var_err_ld']) < 0.5 else "FAIL",
+                         delta_color="inverse")
+            col3.metric("Scale error", f"{100*float(syn['scale_err_ld']):.1f}%",
+                         delta="PASS" if float(syn['scale_err_ld']) < 0.5 else "FAIL",
+                         delta_color="inverse")
+            col4.metric("Classification", f"{100*float(syn['classification_agreement_ld']):.1f}%",
+                         delta="PASS" if float(syn['classification_agreement_ld']) > 0.4 else "FAIL")
+
+            st.markdown("""
+The log-delta approach models `f = log(1 + delta)` as the GP field,
+guaranteeing positive densities.  The kernel parameters are in f-space,
+so the effective two-point function of delta is xi(r) = exp(K(r)) - 1.
+Comparing with the density approach shows whether the log-transform
+helps or hurts recovery for this synthetic field.
+""")
+
+        # =================================================================
+        # SECTION 3: Theory curve validation
+        # =================================================================
+        if _has_theory:
+            st.subheader("Theory Curve Validation: Analytic xi vs Measured xi")
+
+            st.markdown("""
+The paper's core prediction: if the GP models `f = log(1 + delta)` with
+kernel K(r), then the two-point function of the density field is
+**exactly** xi(r) = exp(K(r)) - 1.  Here we test this by comparing the
+analytic formula (using the *learned* kernel) against the Landy-Szalay
+estimator applied to the synthetic catalog.
+""")
+
+            _tr = syn["theory_r"]
+            _xi_m = syn["theory_xi_measured"]
+            _xi_e = syn["theory_xi_err"]
+            _xi_a = syn["theory_xi_analytic"]
+            _chi2r = float(syn["theory_chi2_red"])
+
+            col1, col2 = st.columns(2)
+            with col1:
+                fig_th = go.Figure()
+                fig_th.add_trace(go.Scatter(
+                    x=_tr, y=_xi_a, mode="lines",
+                    line=dict(color="darkorange", width=2.5, dash="dash"),
+                    name="Theory: exp(K(r)) - 1",
+                ))
+                fig_th.add_trace(go.Scatter(
+                    x=_tr, y=_xi_m, mode="markers",
+                    error_y=dict(type="data", array=_xi_e, visible=True),
+                    marker=dict(size=6, color="steelblue"),
+                    name="Landy-Szalay",
+                ))
+                fig_th.update_layout(
+                    xaxis_title="r [Mpc/h]", yaxis_title="xi(r)",
+                    height=450,
+                    title=f"Theory vs Measured xi(r)  [chi2/dof = {_chi2r:.2f}]",
+                )
+                add_log_buttons(fig_th)
+                st.plotly_chart(fig_th, use_container_width=True)
+
+            with col2:
+                # Fractional residuals
+                _valid = np.abs(_xi_a) > 1e-6
+                _frac = np.zeros_like(_xi_m)
+                _frac[_valid] = (_xi_m[_valid] - _xi_a[_valid]) / _xi_a[_valid]
+                fig_frac = go.Figure()
+                fig_frac.add_trace(go.Scatter(
+                    x=_tr, y=_frac, mode="markers+lines",
+                    marker=dict(size=5, color="mediumseagreen"),
+                    line=dict(width=1),
+                    name="(measured - theory) / theory",
+                ))
+                fig_frac.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_frac.update_layout(
+                    xaxis_title="r [Mpc/h]",
+                    yaxis_title="Fractional residual",
+                    height=450,
+                    title="Fractional Residuals",
+                )
+                st.plotly_chart(fig_frac, use_container_width=True)
+
+            _ndof = int(syn["theory_ndof"])
+            _chi2 = float(syn["theory_chi2"])
+            if _chi2r < 2.0:
+                st.success(f"chi2 = {_chi2:.1f} / {_ndof} dof  "
+                           f"(reduced = {_chi2r:.2f}) — theory matches data.")
+            elif _chi2r < 5.0:
+                st.warning(f"chi2 = {_chi2:.1f} / {_ndof} dof  "
+                           f"(reduced = {_chi2r:.2f}) — marginal agreement.")
+            else:
+                st.error(f"chi2 = {_chi2:.1f} / {_ndof} dof  "
+                         f"(reduced = {_chi2r:.2f}) — poor agreement.")
+
+        # =================================================================
+        # SECTION 4: Hessian eigenvalue recovery
+        # =================================================================
+        if _has_eig:
+            st.subheader("Hessian Eigenvalue Recovery")
+
+            st.markdown("""
+The cosmic-web classification depends on the Hessian eigenvalues of the
+density field.  Here we compare the eigenvalues recovered by two
+methods (GP derivatives, local quadratic fit) against the truth.
+""")
+
+            _te = syn["true_eig"]
+            _eig_labels = ["lambda_1 (most positive)", "lambda_2", "lambda_3 (most negative)"]
+
+            _methods = []
+            if "recon_eig_density" in syn:
+                _methods.append(("GP-density", syn["recon_eig_density"], "steelblue"))
+            if "recon_eig_logdelta" in syn:
+                _methods.append(("GP-logdelta", syn["recon_eig_logdelta"], "darkorange"))
+            if "recon_eig_quadfit" in syn:
+                _methods.append(("QuadFit", syn["recon_eig_quadfit"], "mediumseagreen"))
+
+            if _methods:
+                from scipy.stats import pearsonr as _pcorr
+
+                cols_eig = st.columns(3)
+                for i in range(3):
+                    with cols_eig[i]:
+                        fig_eig = go.Figure()
+                        _idx_e = thin_for_3d(len(_te), 1500)
+                        for mname, marr, mcol in _methods:
+                            _r_e, _ = _pcorr(_te[_idx_e, i], marr[_idx_e, i])
+                            fig_eig.add_trace(go.Scatter(
+                                x=_te[_idx_e, i], y=marr[_idx_e, i],
+                                mode="markers",
+                                marker=dict(size=2, opacity=0.3, color=mcol),
+                                name=f"{mname} (r={_r_e:.3f})",
+                            ))
+                        _all_e = _te[:, i]
+                        _lo_e, _hi_e = np.percentile(_all_e, [2, 98])
+                        _pad_e = 0.1 * (_hi_e - _lo_e)
+                        _lims_e = [_lo_e - _pad_e, _hi_e + _pad_e]
+                        fig_eig.add_trace(go.Scatter(
+                            x=_lims_e, y=_lims_e, mode="lines",
+                            line=dict(color="red", dash="dash"),
+                            showlegend=False,
+                        ))
+                        fig_eig.update_layout(
+                            xaxis_title="True", yaxis_title="Recovered",
+                            height=380, title=_eig_labels[i],
+                            margin=dict(l=40, r=10, t=40, b=40),
+                        )
+                        st.plotly_chart(fig_eig, use_container_width=True)
+
+                # Correlation summary table
+                _eig_rows = []
+                for mname, marr, _ in _methods:
+                    row = {"Method": mname}
+                    for i in range(3):
+                        _r_e, _ = _pcorr(_te[:, i], marr[:, i])
+                        row[f"eig{i+1} corr"] = f"{_r_e:.3f}"
+                    _eig_rows.append(row)
+                st.table(_eig_rows)
+
+        # =================================================================
+        # SECTION 5: Q2 Signal Detection
+        # =================================================================
         st.subheader("Q2 Signal Detection")
+
         col1, col2 = st.columns(2)
         col1.metric("label_a ~ s^2|delta (expect significant)",
                      f"r = {float(syn['r_a_s2']):+.4f}",
@@ -1932,10 +2204,20 @@ functional forms, then run the reconstruction and check recovery.
                      delta=f"p = {float(syn['p_b_s2']):.2e}")
 
         st.markdown("""
-**Interpretation:** `label_a` was constructed with explicit tidal shear
-dependence (`0.5*delta + 0.3*s^2 + noise`), so its partial correlation
-with s^2 at fixed delta should be significant. `label_b` depends only on
-density (`0.4*delta + noise`), so its partial correlation should be weak.
+**Setup:** Two synthetic labels are planted with known functional forms:
+- `label_a = 0.5 * delta + 0.3 * s^2 + noise` — depends on density
+  AND tidal shear (s^2 = sum of squared Hessian eigenvalues)
+- `label_b = 0.4 * delta + noise` — depends on density ONLY
+
+**Expected outcome:** The partial correlation of label_a with s^2 at
+fixed delta should be significant (p < 0.05), confirming the pipeline
+can detect tidal-shear dependence.  label_b should show no significant
+partial correlation with s^2.
+
+**Caveat:** This test depends on the quality of the reconstructed
+Hessian.  If the field recovery is poor (low correlation), the
+reconstructed s^2 will differ from the true s^2 used to generate the
+labels, potentially weakening or inverting the signal.
 """)
 
 
