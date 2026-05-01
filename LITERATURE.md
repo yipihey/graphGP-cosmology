@@ -315,6 +315,132 @@ So this is genuinely an open direction; the demo verifying the identity
 is the seed for a real implementation.
 
 
+## Faster than triangle counts: anisotropy-preserving 2nd-order estimators
+
+The 3pt construction above costs ``O(N * k_pair^2)`` per particle (the
+inner loop runs over pairs of pair-neighbors). If the goal is to add
+**shape / anisotropy information** without paying full triangle cost,
+several existing estimators in cosmology and spatial statistics achieve
+this at ``O(N * k_pair)`` -- the same as the 2pt LISA. They are still
+2nd-order in counts (i.e. "two-point", not "three-point"), but they
+carry tensorial / directional structure that a scalar pair count
+cannot.
+
+### Per-particle pair multipoles (cosmology: Hamilton 1992)
+
+The standard quadrupole / hexadecapole moments of the 2pt correlation
+function ``xi(r, mu) = sum_L xi_L(r) * P_L(mu)`` decompose the pair
+distribution into Legendre multipoles. The natural per-particle LISA at
+multipole ``L`` is
+
+```
+b_i^(j, L) = sum_{k != i, r_ik in B_j} P_L(mu_ik),
+```
+
+with ``mu_ik`` the cosine of the angle between ``x_k - x_i`` and a
+chosen axis (line of sight, principal axis of local neighborhood, or
+any preferred direction). The standard scalar count is the ``L=0``
+moment. ``L=2`` carries the dominant anisotropy signal:
+
+```
+mean_i b_i^(j, 2) / mean_i b_i^(j, 0)   =   xi_2(r_j),
+```
+
+the quadrupole of the LS estimator. Verified numerically in
+``demos/demo_pair_quadrupole.py``: an isotropic clustered toy gives
+``xi_2(r) ~ 0`` (noise floor 0.02), while a z-squashed pancake catalog
+gives ``xi_2 ~ -0.25`` peaked at the pancake scale. The cost is the
+same as the scalar count -- one extra ``np.add.at`` accumulating
+``P_L(mu)`` instead of ``1.0``.
+
+Compared to triangle counts:
+
+| primitive             | order | what it captures           | cost            |
+| --------------------- | ----- | -------------------------- | --------------- |
+| ``b_i^(j, 0)``        | 2pt   | scalar density at scale r  | O(N k_pair)     |
+| ``b_i^(j, 2)``        | 2pt   | + alignment / quadrupole   | O(N k_pair)     |
+| ``b_i^(j, 4)``        | 2pt   | + hexadecapole anisotropy  | O(N k_pair)     |
+| ``T_i^(alpha)``       | 3pt   | + triangle shape structure | O(N k_pair^2)   |
+
+For the price of a couple more ``np.add.at`` calls on the same pair
+list one gains the full angular-multipole expansion at every scale.
+Each multipole gives an additional LISA primitive that can be
+aggregated into the per-particle weight:
+
+```
+delta_i = a_0 delta_i^(0) + a_2 delta_i^(2) + a_4 delta_i^(4) + ...
+```
+
+Particles whose local neighborhood is preferentially aligned (e.g., in
+filaments) get ``delta_i^(2)`` flagged separately from their scalar
+overdensity ``delta_i^(0)``.
+
+### Counts-in-cells skewness (Peebles 1980, Bouchet+ 1992, Bernardeau)
+
+For non-Gaussianity per se -- the 3rd-order moment of the smoothed
+density field ``S_3 = <delta_R^3> / <delta_R^2>^2`` -- counts-in-cells
+on a regular grid is ``O(N)`` for binning plus moment evaluation, so
+it costs *less* than even the 2pt LISA for a fixed smoothing scale.
+With anisotropic cells (cylindrical along the LOS, ellipsoidal
+oriented to a chosen tensor) the moments carry directional information
+without pair enumeration.
+
+| primitive                   | what it captures            | cost           |
+| --------------------------- | --------------------------- | -------------- |
+| spherical CIC ``S_3``       | scalar 3rd-order amplitude  | O(N)           |
+| cylindrical / oriented CIC  | + LOS / axial anisotropy    | O(N) per shape |
+| skew spectra (Munshi+ 2022) | shape-dependent bispectrum  | O(N log N)     |
+
+The 3rd-order CIC variants miss the pair-resolved scale information
+that the LISA primitives give, but they carry the dominant
+non-Gaussian and anisotropic signals at constant cost.
+
+### Per-particle local inertia tensor (Hahn et al. 2007 cosmic-web)
+
+For each particle ``i``, the symmetric tensor
+
+```
+I_i = sum_{k in shell} (x_k - x_i) (x_k - x_i)^T  /  |x_k - x_i|^2
+```
+
+is the moment-of-inertia of pair-separation directions. Its
+**eigenvalues** describe local shape (sphere / pancake / filament /
+void) and its **eigenvectors** the orientation. This is exactly what
+``graphGP_cosmo.py`` already computes from the GP-reconstructed density
+field via the Hessian (Hahn et al. 2007; Forero-Romero et al. 2009);
+the per-particle pair-tensor form is the discrete-sample analog and
+is what ``b_i^(j, L=2)`` captures bin by bin.
+
+### Bottom line for "skewness with anisotropy"
+
+If the goal is **fast 2nd-order estimators that carry shape /
+anisotropy information**, the cleanest answer is per-particle pair
+multipoles ``b_i^(j, L)`` for ``L = 0, 2, (4)``. Same cost as the
+existing pair-count baseline; identity ``mean_i b_i^(j, L) / b_i^(j, 0)``
+recovers the standard ``xi_L(r)`` multipole; verified numerically.
+
+If the goal is **fast 3rd-order non-Gaussianity** (genuine skewness),
+counts-in-cells with anisotropic cell shapes (Bouchet+ 1992) is the
+cheapest path, costing ``O(N)`` per cell shape. For the per-particle
+analog, our 3pt LISA remains O(N k_pair^2); skew-spectrum methods like
+Munshi et al. (2022, *Mon. Not. R. Astron. Soc.* **513**, 4309) hit
+``O(N log N)`` via FFT but lose the per-particle decomposition.
+
+### Additional references
+
+- T. Hamilton, *Measuring omega and the real correlation function from
+  the redshift correlation function*, ApJ **385**, L5 (1992):
+  introduces the multipole decomposition of xi(r, mu).
+- O. Hahn, C. M. Carollo, C. Porciani, A. Dekel, *The properties of
+  cosmic web environments*, MNRAS **375**, 489 (2007).
+- D. Munshi, R. Lee, et al., *Skew-spectra for galaxy
+  clustering*, arXiv:2107.10765, 2107.13533.
+- F. Bouchet, R. Schaeffer, M. Davis, *Skewness, variance and 3-point
+  function*, ApJ **383**, 19 (1991): CIC moments + skewness.
+- J. Forero-Romero et al., *Cosmic web classification*, MNRAS **396**,
+  1815 (2009).
+
+
 ## References (URLs)
 
 - Getis & Franklin (1987): https://esajournals.onlinelibrary.wiley.com/doi/10.2307/1938452
