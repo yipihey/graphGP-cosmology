@@ -78,6 +78,7 @@ def compute_binned_weights(
     r_kernel: float | None = None,
     box_size: float | None = None,
     mode: str = "sample",
+    subtract_mean: bool = True,
     rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """Return per-point weights ``w_i = 1 + delta_hat_i``.
@@ -100,6 +101,11 @@ def compute_binned_weights(
         has prior variance ``C`` and therefore satisfies Eq. 5 of the doc
         in expectation. ``"mean"`` returns the Wiener filter posterior
         mean, which is data-aware but variance-shrunk.
+    subtract_mean
+        If True (default), subtract the empirical mean of the KDE input
+        before solving. If False, keep the raw overdensities -- the
+        weights then have ``<w> > 1`` and the recovered ``xi_w`` is
+        rescaled by ``<w>^2`` (see ``demos/scan_N_dependence.py``).
     rng
         ``numpy.random.Generator`` for the posterior sample. Default: a
         fresh seed.
@@ -114,11 +120,12 @@ def compute_binned_weights(
         r_kernel = default_kernel_radius(nbar)
 
     d = kde_overdensity(positions, nbar, r_kernel, box_size=box_size)
-    # The KDE is biased high at data points (we only sample where points
-    # exist, which preferentially is over-dense regions). Re-center so the
-    # empirical mean of d is zero, matching the Wiener filter assumption
-    # E[d] = 0 needed for an unbiased posterior.
-    d = d - d.mean()
+    if subtract_mean:
+        # The KDE is biased high at data points (we only sample where points
+        # exist, which preferentially is over-dense regions). Re-center so
+        # the empirical mean of d is zero, matching the Wiener filter
+        # assumption E[d] = 0 needed for an unbiased posterior.
+        d = d - d.mean()
     V_kernel = (4.0 / 3.0) * np.pi * r_kernel ** 3
     noise_var = 1.0 / (nbar * V_kernel)  # Poisson noise on the KDE estimate
 
