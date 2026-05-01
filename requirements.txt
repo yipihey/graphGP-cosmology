@@ -3,3 +3,8 @@ plotly>=5.18
 numpy>=1.24
 scipy>=1.11
 matplotlib>=3.7
+# 2pt-aware density pipeline (see IMPLEMENTATION_PLAN.md)
+Corrfunc>=2.5
+graphgp
+jax
+optax
