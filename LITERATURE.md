@@ -441,6 +441,133 @@ Munshi et al. (2022, *Mon. Not. R. Astron. Soc.* **513**, 4309) hit
   1815 (2009).
 
 
+## Trace-tidal split: per-particle local tensors from pair counts
+
+The natural unification of the multipole and Hahn-style cosmic-web
+constructions: for each particle ``i`` and bin ``j`` build the
+symmetric ``3x3`` pair tensor
+
+```
+T_i^(j)_{ab} = sum_{k != i, r_ik in B_j}  n_ik^a * n_ik^b,     n_ik = (x_k - x_i)/|...|
+```
+
+Trace-tidal decomposition:
+
+```
+Tr(T_i^(j))                 = b_i^(j)            scalar pair count = density (LISA L=0)
+T_i^(j) - Tr(T_i^(j))/3 * I = traceless tensor   local tidal / anisotropy at scale r_j
+```
+
+The trace recovers the existing 2pt LISA primitive. The traceless part
+encodes the L=2 angular structure as a full ``3x3`` tensor (six
+independent components) -- containing the same information as the three
+multipoles ``b_i^(j, L=2)`` along three orthogonal axes, but in a
+coordinate-free form.
+
+### Eigendecomposition: Hahn-style cosmic-web class per particle, per scale
+
+The eigenvalue *pattern* of the traceless tensor classifies the local
+cosmic-web type without requiring a continuous density-field
+reconstruction:
+
+| eigenvalue pattern (traceless, sum = 0)         | geometry          |
+| ----------------------------------------------- | ----------------- |
+| 1 large ``+``, 2 ``~equal -``                   | filament          |
+| 1 large ``-``, 2 ``~equal +``                   | sheet / pancake   |
+| 3 distinct (``+``, ``~0``, ``-``)               | triaxial          |
+| all near 0                                      | isotropic         |
+
+This is the discrete-sample analog of the smoothed-Hessian
+classification of Hahn et al. (2007) and Forero-Romero et al. (2009),
+but computed **directly from per-particle pair counts** at
+``O(N * k_pair)``. No density-field smoothing or Hessian computation
+required.
+
+Numerically verified in ``demos/demo_pair_tensor.py``: on three toy
+catalogs with the same density profile but different blob shapes,
+
+```
+catalog              mean traceless eigenvalues (j ~ 10 Mpc)    interpretation
+-------------------  ----------------------------------------    --------------
+isotropic blobs      (-0.005, +0.002, +0.003)                    no preferred axis
+z-pancakes (sheets)  (-0.104, +0.049, +0.055)                    sheet  along z (eigvec)
+z-filaments          (-0.154, -0.126, +0.279)                    filament along z
+```
+
+The ``z`` direction lights up unambiguously in both anisotropic
+geometries with the correct sign pattern.
+
+### Connection to the existing GP-Hessian classifier
+
+``graphGP_cosmo.py`` computes a per-halo Hessian of the GP-reconstructed
+density field and classifies cosmic-web environment from its eigenvalues.
+That construction needs the full GP regression first; the per-particle
+pair tensor here gets the same eigenvalue structure directly from
+``query_pairs`` plus a 3x3 outer-product accumulation. Same physics,
+~100x cheaper, and trivially scale-resolved (one tensor per bin).
+
+### Multi-scale tidal vector field per particle
+
+Stacking T_traceless across bins gives a ``(N_D, n_bins, 3, 3)`` array
+-- a per-particle, multi-scale "tidal-tensor field". Each entry is six
+free numbers, so the storage is moderate (``6 N_D n_bins`` floats:
+``~7 MB`` for ``N_D = 5000`` and ``n_bins = 30``). With this in hand:
+
+- Eigenvector orientation as a function of scale tracks how the local
+  filament/sheet axis evolves between scales (a "tidal renormalisation
+  flow" per particle).
+- Frobenius norm ``||T_traceless^(j)||_F`` measures the magnitude of
+  anisotropy at each scale, naturally complementing the scalar
+  overdensity ``delta_i^(j)``.
+- Comparison to galaxy spins / shapes / angular momenta gives a
+  per-particle intrinsic-alignment statistic (Lee & Pen 2002; Codis et
+  al. 2018) -- but with the tidal axes derived without any continuous
+  field reconstruction.
+
+### LISA aggregation including tidal information
+
+The scalar weight per particle generalises naturally to a
+density-plus-tidal combination
+
+```
+w_i = 1 + a * delta_i + b * Tr(M T_traceless^i)
+```
+
+with ``M`` a fixed 3x3 mask tensor selecting a preferred direction
+(LOS for redshift-space, intrinsic axis for IA studies, etc.) and
+``b`` a scalar tuning the relative weight of the anisotropy. This
+gives weights that distinguish two equally-overdense particles by
+the orientation of their local clustering -- something the scalar
+LISA cannot do.
+
+### What's new vs the literature
+
+- **Hahn+ 2007 / Forero-Romero+ 2009**: tidal tensor from smoothed
+  density Hessian. Continuous-field construction; one tensor per Eulerian
+  cell, one smoothing scale.
+- **Pichon-Codis et al.**: tidal tensor from a Voronoi tessellation +
+  potential reconstruction. Discrete but expensive.
+- **Schmittfull et al. (FAST-PT)**: bispectrum decomposition into
+  tidal-shear-density operators. Global, not per-particle.
+
+The per-particle pair tensor T_i^(j) appears not to have been written
+down in this exact form. It is the natural meeting point of the LISA
+framework (per-event statistic that aggregates to a global summary)
+and Hahn-style tidal classification (eigenvalues of a local tensor
+classify cosmic web). Same cost as a scalar pair count.
+
+### Additional references
+
+- B. Pichon, C. Codis, et al., *Spin alignment of dark matter halos
+  in filaments and walls*, MNRAS **427**, 3320 (2012).
+- M. Schmittfull, T. Baldauf, M. Zaldarriaga, *Iterative initial
+  condition reconstruction*, PRD **96**, 023505 (2017).
+- J. Lee and U.-L. Pen, *Theory of intrinsic galaxy spin alignments*,
+  ApJ **567**, L111 (2002).
+- S. Codis et al., *Spin alignment of dark matter haloes around
+  cosmic filaments*, MNRAS **481**, 4753 (2018).
+
+
 ## References (URLs)
 
 - Getis & Franklin (1987): https://esajournals.onlinelibrary.wiley.com/doi/10.2307/1938452
