@@ -172,6 +172,149 @@ Two natural follow-ups suggested by the literature:
    intensity at each data point.
 
 
+## Extension to three-point: how would a 3pt estimate change the weights?
+
+The LISA framework extends naturally to higher-order correlations,
+though we have not found this written out for point processes in either
+the spatial-statistics or the cosmology literature.
+
+### The 3pt LISA primitive
+
+For each particle ``i`` and triangle bin ``alpha`` (with side lengths
+``(s_1, s_2, s_3)`` in some tolerance), define
+
+```
+T_i^(alpha) = # of triangles in shape alpha that contain i as a vertex
+```
+
+with the natural per-particle overdensity
+
+```
+delta_i^(3, alpha) = T_i^(alpha) / E[T^(alpha)] - 1.
+```
+
+The expectation under uniform Poisson is
+
+```
+E[T^(alpha)] = (N - 1)(N - 2) * V_T(alpha) / V_box^2,
+```
+
+where ``V_T(alpha)`` is the geometric volume of valid triangle
+configurations at fixed first vertex (computable analytically for
+simple shapes; estimable via the random catalog otherwise).
+
+The 3pt analog of the LISA identity is
+
+```
+mean_i delta_i^(3, alpha) = DDD_alpha / RRR_alpha - 1 = zeta_simple(alpha).
+```
+
+We verified this numerically in ``demos/demo_3pt_lisa.py``: on a
+3000-point clustered toy with an equilateral bin at ``s ~ 8 +- 2`` Mpc,
+the per-particle mean and the global ``DDD/RRR - 1`` agree to machine
+precision (1e-12).
+
+### Window-aware form
+
+Replace the uniform-Poisson expectation with the random-catalog version.
+Two natural per-particle 3pt analogs of LS:
+
+```
+delta_i^(3, alpha)_DP  =  T_DDD_i N_R^2 / (T_DRR_i N_D^2) - 1     (Davis-Peebles)
+delta_i^(3, alpha)_LS  =  ( T_DDD_i - 3 T_DDR_i + 3 T_DRR_i - T_RRR_i ) / T_RRR_i_anchored
+```
+
+The DP form is the cleanest and most directly analogous to the 2pt
+construction; the full LS form requires per-particle DDR, DRR, RRR
+which costs an extra factor of ``N_R / N_D`` per term.
+
+### How the weights change
+
+The weight assignment problem from the doc (Eq. 2)
+
+```
+sum_{i<k} w_i w_k 1[r_ik in B_j] = (1 + xi_j) RR_j     (j = 1..N_b)
+```
+
+is augmented by 3pt constraints
+
+```
+sum_{i<j<k} w_i w_j w_k 1[(s_1,s_2,s_3) in alpha]
+                          = (1 + xi + xi + xi + zeta_alpha) RRR_alpha    (alpha = 1..N_T).
+```
+
+Linearised in ``delta_i = w_i - 1``, the 2pt and 3pt linear constraints
+share the same unknowns:
+
+```
+sum_i delta_i b_i^(j)        = -[ correction term at order xi^2 ]
+sum_i delta_i T_i^(alpha)    = -[ correction term at order xi*zeta + ... ]
+```
+
+with coefficients ``b_i^(j)`` (per-particle pair count) and
+``T_i^(alpha)`` (per-particle triangle count). Writing this as a stacked
+linear system
+
+```
+[ B  ] delta = r_2pt
+[ T  ]       = r_3pt
+```
+
+with ``B`` of shape ``(N_b, N_D)`` and ``T`` of shape ``(N_T, N_D)``,
+we add ``N_T`` rows. The solution space has dimension ``N_D - N_b - N_T``.
+For ``N_T`` ~ 100 triangle bins and ``N_D`` ~ 5000 the system remains
+massively under-determined, but each constraint **tightens** the
+admissible weights.
+
+### Aggregation at the LISA level
+
+The LISA-style scalar weight per particle generalises to a
+multi-order combination
+
+```
+delta_i = (sum_j a_j delta_i^(2,j) + sum_alpha b_alpha delta_i^(3,alpha))
+          / (sum_j a_j + sum_alpha b_alpha).
+```
+
+The natural choice ``a_j = RR_j`` and ``b_alpha = RRR_alpha`` weights
+by the volume of each scale (Poisson-noise optimal), automatically
+balancing 2pt and 3pt contributions according to their statistical
+power. Particles in **filaments** -- which have moderate 2pt
+overdensity but high 3pt overdensity (because their three-point shape
+preferentially contains aligned triples) -- get weights enhanced
+relative to the pure 2pt aggregate.
+
+### Cost
+
+Per-particle pair counting at moderate ``r_max`` is ``O(N log N)``.
+Triangle counting per particle is ``O(N * k_pair^2)`` where ``k_pair`` is
+the typical number of pair-neighbors per particle inside the triangle
+shell. For a Quijote-like 5000-halo catalog with 30 neighbors per
+particle in a 10-Mpc shell that's about ``5000 * 900 = 4.5 * 10^6``
+operations -- still sub-second. For ``N = 1e5`` with the same density
+it's ``1e5 * 900 = 1e8`` ops, a few seconds. Beyond ``N ~ 1e6`` the
+cost becomes uncomfortable and one would want to integrate the
+3pt LISA into the same multipole / FFT-based fast bispectrum estimators
+already used in cosmology (Slepian & Eisenstein 2015; Sugiyama+ 2019).
+
+### Status in the literature
+
+As far as we found:
+
+- **2pt LISA on point processes** is well-developed: Cressie & Collins
+  (2001) product-density LISA, Getis-Franklin local K function,
+  ``spatstat::localK``.
+- **3pt LISA on point processes** does not appear named in either
+  the spatial-statistics or cosmology literature. The closest cosmology
+  cousin is **Slepian & Eisenstein (2015)**'s ``O(N^2)`` 3pt estimator
+  via spherical harmonics; that is a global compression but conceptually
+  preserves a per-particle structure that could be relabeled as a 3pt
+  LISA.
+
+So this is genuinely an open direction; the demo verifying the identity
+is the seed for a real implementation.
+
+
 ## References (URLs)
 
 - Getis & Franklin (1987): https://esajournals.onlinelibrary.wiley.com/doi/10.2307/1938452
