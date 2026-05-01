@@ -28,21 +28,39 @@ class Basis:
 
 
 class CubicSplineBasis(Basis):
-    """Log-spaced cubic B-spline basis on ``[r_min, r_max]``."""
+    """Log-spaced cubic B-spline basis on ``[r_min, r_max]``.
+
+    Clamped knot vector ``[r_min]*4 + interior + [r_max]*4`` with
+    ``n_basis - 4`` strictly-interior log-spaced knots, giving
+    ``n_basis + k + 1`` knots total for a degree ``k=3`` B-spline.
+    """
+
+    _K = 3
 
     def __init__(self, n_basis: int = 12, r_min: float = 0.1, r_max: float = 200.0):
+        if n_basis < self._K + 1:
+            raise ValueError(
+                f"n_basis must be >= {self._K + 1} (k+1) for a cubic B-spline"
+            )
         super().__init__(n_basis=n_basis, r_min=r_min, r_max=r_max)
-        # ``n_basis`` interior knots + 4 boundary clamps on each side.
-        interior = np.logspace(np.log10(r_min), np.log10(r_max), n_basis)
-        self._knots = np.r_[[r_min] * 3, interior, [r_max] * 3]
+        n_interior = n_basis - (self._K + 1)
+        if n_interior > 0:
+            interior = np.logspace(
+                np.log10(r_min), np.log10(r_max), n_interior + 2
+            )[1:-1]  # strictly interior
+        else:
+            interior = np.array([], dtype=np.float64)
+        self._knots = np.r_[
+            [r_min] * (self._K + 1), interior, [r_max] * (self._K + 1)
+        ]
 
     def evaluate(self, r: np.ndarray) -> np.ndarray:
         r = np.asarray(r, dtype=np.float64)
         out = np.zeros((self.n_basis, r.size))
         for a in range(self.n_basis):
-            c = np.zeros(self.n_basis + 2)
+            c = np.zeros(self.n_basis)
             c[a] = 1.0
-            spline = BSpline(self._knots, c, k=3, extrapolate=False)
+            spline = BSpline(self._knots, c, k=self._K, extrapolate=False)
             out[a] = np.nan_to_num(spline(r), nan=0.0)
         return out
 

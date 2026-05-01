@@ -223,6 +223,39 @@ graphgp → returns weights. It will live alongside the existing optimizer and
 can be selected via a flag in `graphGP_cosmo`.
 
 
+## Open issue: exact Eq. 5 recovery
+
+The doc claims (Sec. 2.5) that the weighted-DD pair sum recovers
+``xi_LS(r)`` exactly. In practice the doc does not pin down what the
+"centered data indicator at each point" should be. The natural choice -- a
+top-hat KDE of radius ``R`` -- recovers ``xi(r)`` only at scales
+``r >> R``; for ``r << R`` the pair sum measures the smoothed auto-variance
+``sigma^2(R)`` instead, giving an approximately constant offset. With our
+clustered toy catalog (Gaussian blobs of size 5 Mpc inside a 200 Mpc box),
+the offset is a factor of ~5 across the inner bins.
+
+This is not a bug in the implementation; it is a property of the
+per-point Wiener filter on biased tracers (data points sit preferentially
+in over-dense regions, so the smoothing kernel sees a biased neighborhood).
+
+A fully exact-recovery construction is a research item. Two candidate
+fixes worth investigating:
+
+1. **Posterior sample with a calibrated prior.** Use the doc's Part III GP
+   sample form -- the prior covariance ``C(r) = xi(r)`` directly produces
+   pair sums equal to ``xi(r)`` in expectation, *if* the sample is drawn
+   from the prior at the data positions ignoring the data values. Combine
+   with the Wiener-filter posterior mean as a low-rank correction.
+2. **Direct quadratic solve of Eq. 2.** Rather than the linearized
+   Wiener form, solve ``sum_{i<k} w_i w_k 1[r in B_j] = (1+xi_j) RR_j``
+   as a constrained quadratic program in ``{w_i}``. Convex relaxations
+   (SDP) are tractable for ``N_D <= 1e4``.
+
+Until one of these is implemented, the per-point weights are *qualitatively*
+correct (right shape, monotone clustering signal) but not *quantitatively*
+LS-equivalent.
+
+
 ## Validation strategy
 
 For each of Parts I–III, a separate demo script in `demos/` runs:
