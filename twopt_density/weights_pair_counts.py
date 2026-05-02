@@ -64,10 +64,22 @@ def _shell_volumes(r_edges: np.ndarray) -> np.ndarray:
     return (4.0 / 3.0) * np.pi * (r_edges[1:] ** 3 - r_edges[:-1] ** 3)
 
 
+def _count_dtype(n_max: int) -> np.dtype:
+    """Smallest unsigned-int dtype that can hold counts up to ``n_max``."""
+    if n_max < 256:
+        return np.uint8
+    if n_max < 65_536:
+        return np.uint16
+    if n_max < 4_294_967_296:
+        return np.uint32
+    return np.uint64
+
+
 def per_particle_pair_counts(
     positions: np.ndarray,
     r_edges: np.ndarray,
     box_size: float | None = None,
+    dtype: np.dtype | None = None,
 ) -> np.ndarray:
     """Return ``(N, n_bins)`` array of per-particle pair counts.
 
@@ -75,6 +87,11 @@ def per_particle_pair_counts(
     ``r_ik`` falls in ``[r_edges[j], r_edges[j+1])``. Each unordered pair
     contributes to both ``b[i, j]`` and ``b[k, j]``, so
     ``sum_i b[i, j] = 2 * DD_j_unordered``.
+
+    The output uses an unsigned-integer dtype sized to ``N`` by default
+    (uint8 / uint16 / uint32 / uint64 chosen automatically). Caller can
+    override via ``dtype``. Halving the storage from float64 -> uint32
+    is a free win because per-particle counts are bounded by ``N - 1``.
 
     Implementation: ``cKDTree.query_pairs`` returns every pair within
     ``r_max`` once; we histogram and accumulate into the per-particle
@@ -86,9 +103,12 @@ def per_particle_pair_counts(
     r_max = float(r_edges[-1])
     tree = cKDTree(positions, boxsize=box_size if box_size else None)
 
+    if dtype is None:
+        dtype = _count_dtype(N)
+
     pairs = tree.query_pairs(r=r_max, output_type="ndarray")
     if len(pairs) == 0:
-        return np.zeros((N, n_bins), dtype=np.float64)
+        return np.zeros((N, n_bins), dtype=dtype)
 
     diff = positions[pairs[:, 0]] - positions[pairs[:, 1]]
     if box_size is not None:
@@ -100,9 +120,9 @@ def per_particle_pair_counts(
     pk = pairs[mask, 1]
     bj = bin_idx[mask]
 
-    b = np.zeros((N, n_bins), dtype=np.float64)
-    np.add.at(b, (pi, bj), 1.0)
-    np.add.at(b, (pk, bj), 1.0)
+    b = np.zeros((N, n_bins), dtype=dtype)
+    np.add.at(b, (pi, bj), np.array(1, dtype=dtype))
+    np.add.at(b, (pk, bj), np.array(1, dtype=dtype))
     return b
 
 
@@ -111,6 +131,7 @@ def per_particle_cross_counts(
     positions_b: np.ndarray,
     r_edges: np.ndarray,
     box_size: float | None = None,
+    dtype: np.dtype | None = None,
 ) -> np.ndarray:
     """Cross-catalog per-particle pair counts.
 
@@ -118,20 +139,20 @@ def per_particle_cross_counts(
     ``positions_b`` with separation in each bin. Self-pairs are NOT
     excluded (the two catalogs are assumed disjoint, e.g. data x random).
 
-    Returns
-    -------
-    b_AB : ``(N_a, n_bins)`` float array.
+    The dtype is sized to ``len(positions_b)`` (max possible count).
     """
     Na = len(positions_a)
+    Nb = len(positions_b)
     n_bins = len(r_edges) - 1
     r_max = float(r_edges[-1])
     tree_b = cKDTree(positions_b, boxsize=box_size if box_size else None)
 
-    # Neighbors of each a-point inside the b-catalog within r_max.
-    neighbors = tree_b.query_ball_point(positions_a, r=r_max)
-    b_AB = np.zeros((Na, n_bins), dtype=np.float64)
+    if dtype is None:
+        dtype = _count_dtype(Nb)
 
-    # Vectorized hist: flatten neighbor lists, compute distances, scatter.
+    neighbors = tree_b.query_ball_point(positions_a, r=r_max)
+    b_AB = np.zeros((Na, n_bins), dtype=dtype)
+
     flat_a = np.repeat(np.arange(Na), [len(L) for L in neighbors])
     flat_b = np.fromiter(
         (j for L in neighbors for j in L),
@@ -147,7 +168,8 @@ def per_particle_cross_counts(
     d = np.linalg.norm(diff, axis=1)
     bin_idx = np.searchsorted(r_edges, d, side="right") - 1
     mask = (bin_idx >= 0) & (bin_idx < n_bins)
-    np.add.at(b_AB, (flat_a[mask], bin_idx[mask]), 1.0)
+    np.add.at(b_AB, (flat_a[mask], bin_idx[mask]),
+              np.array(1, dtype=dtype))
     return b_AB
 
 
