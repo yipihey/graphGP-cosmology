@@ -31,7 +31,9 @@ import numpy as np
 from twopt_density import cosmology as cj
 from twopt_density.basis_xi import JAXBasis, xi_LS_basis
 from twopt_density.differentiable_lisa import build_state
-from twopt_density.spectra import make_log_k_grid, xi_from_Pk
+from twopt_density.spectra import (
+    FFTLogP2xi, make_log_k_grid, xi_from_Pk_fftlog,
+)
 
 
 FIG_DIR = os.path.join(os.path.dirname(__file__), "figures")
@@ -108,9 +110,11 @@ def panel_xi(out_path):
     # --- on intermediate scales (5 < s < 30 Mpc/h). The toy catalog has
     # --- Gaussian blobs that dwarf any reasonable matter clustering, so a
     # --- single linear amplitude rescaling is enough to compare shapes.
+    fft = FFTLogP2xi(k, l=0)
+
     s_fit = jnp.asarray(np.logspace(np.log10(5.0), np.log10(30.0), 30))
     P_fid = cj.run_halofit(k, sigma8=0.8, Om=0.31, **base)
-    xi_fid = np.asarray(xi_from_Pk(s_fit, k, P_fid))
+    xi_fid = np.asarray(xi_from_Pk_fftlog(s_fit, fft, P_fid))
     xi_data_fit = np.asarray(xi_LS_basis(state, jb, w_d, w_r, s_fit))
     b2 = float(np.dot(xi_data_fit, xi_fid) / np.dot(xi_fid, xi_fid))
     print(f"  fitted linear b^2 = {b2:.2f}")
@@ -122,7 +126,7 @@ def panel_xi(out_path):
             label="basis $\\xi_{data}$ (clustered toy catalog)")
     for Om, c in zip(Om_values, ["C0", "C1", "C2"]):
         P_NL = cj.run_halofit(k, sigma8=0.8, Om=Om, **base)
-        xi_m = b2 * np.asarray(xi_from_Pk(s_model, k, P_NL))
+        xi_m = b2 * np.asarray(xi_from_Pk_fftlog(s_model, fft, P_NL))
         ax.plot(np.asarray(s_model), xi_m, "-", color=c, lw=2,
                 label=rf"$b^2\, \xi_{{model}}(s|\Omega_m={Om})$, $b^2={b2:.1f}$")
     ax.set_xscale("log")
@@ -138,7 +142,8 @@ def panel_xi(out_path):
 
 def panel_grad(out_path):
     """jax.grad of xi_model wrt cosmological parameters on a fine s-grid."""
-    k = make_log_k_grid(1e-4, 1e2, 2000)
+    k = make_log_k_grid(1e-4, 1e2, 2048)
+    fft = FFTLogP2xi(k, l=0)
     r = jnp.asarray(np.logspace(np.log10(2.0), np.log10(80.0), 80))
     base = dict(sigma8=0.8, Om=0.31, Ob=0.049, h=0.68, ns=0.965, a=1.0)
 
@@ -146,7 +151,7 @@ def panel_grad(out_path):
         # theta = (Om, sigma8, h)
         P = cj.run_halofit(k, sigma8=theta[1], Om=theta[0], Ob=base["Ob"],
                            h=theta[2], ns=base["ns"], a=base["a"])
-        return xi_from_Pk(r, k, P)
+        return xi_from_Pk_fftlog(r, fft, P)
 
     print("  jacfwd cosmology gradient ...")
     t0 = time.perf_counter()
@@ -161,7 +166,7 @@ def panel_grad(out_path):
     ax.set_xscale("log")
     ax.set_xlabel("s [Mpc/h]")
     ax.set_ylabel(r"$\partial \xi / \partial \theta$")
-    ax.set_title("Cosmology sensitivity of $\\xi(s)$ via jax.jacfwd through syren-halofit")
+    ax.set_title("Cosmology sensitivity of $\\xi(s)$ via jax.jacfwd through syren-halofit + FFTLog")
     ax.axhline(0, color="k", lw=0.5, alpha=0.3)
     ax.legend(fontsize=9)
     fig.tight_layout()

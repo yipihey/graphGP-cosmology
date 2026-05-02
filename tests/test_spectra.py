@@ -8,11 +8,20 @@ jnp = pytest.importorskip("jax.numpy")
 
 from twopt_density import cosmology as cj
 from twopt_density.spectra import (
+    FFTLogP2xi,
     make_log_k_grid,
     sigma2_from_Pk,
     xi_from_Pk,
+    xi_from_Pk_fftlog,
     xi_model,
 )
+
+
+_HAS_MCFIT = True
+try:
+    import mcfit  # noqa: F401
+except ImportError:
+    _HAS_MCFIT = False
 
 
 @pytest.fixture
@@ -65,6 +74,58 @@ def test_xi_model_convenience(lcdm):
     xi_b = xi_from_Pk(r, k, P_NL)
     np.testing.assert_allclose(np.asarray(xi_a), np.asarray(xi_b),
                                rtol=1e-12, atol=1e-14)
+
+
+@pytest.mark.skipif(not _HAS_MCFIT, reason="mcfit not installed")
+def test_fftlog_agrees_with_trapezoid_at_small_r(lcdm):
+    """At small r where trapezoid is converged, FFTLog and trapezoid match
+    to ~1%. (At large r, trapezoid suffers from j_0 oscillation aliasing
+    and FFTLog is the reference.)"""
+    k = make_log_k_grid(1e-4, 1e2, 2048)
+    P = cj.run_halofit(k, **lcdm)
+    fft = FFTLogP2xi(k, l=0)
+    r = jnp.logspace(0, 0.6, 8)  # 1 - 4 Mpc/h: trapezoid still OK
+    xi_t = np.asarray(xi_from_Pk(r, k, P))
+    xi_f = np.asarray(xi_from_Pk_fftlog(r, fft, P))
+    rel = np.max(np.abs(xi_t - xi_f) / np.abs(xi_t))
+    assert rel < 0.05, f"max rel diff {rel:.3e}"
+
+
+@pytest.mark.skipif(not _HAS_MCFIT, reason="mcfit not installed")
+def test_fftlog_grad_matches_finite_difference(lcdm):
+    """jax.grad through FFTLog matches centered FD on cosmology pipeline."""
+    k = make_log_k_grid(1e-4, 1e2, 2048)
+    fft = FFTLogP2xi(k, l=0)
+    r = jnp.asarray(np.logspace(0, 1.5, 12))
+    fixed = {kk: lcdm[kk] for kk in ("sigma8", "Ob", "h", "ns", "a")}
+
+    def loss(Om):
+        P = cj.run_halofit(k, Om=Om, **fixed)
+        return jnp.sum(xi_from_Pk_fftlog(r, fft, P))
+
+    g = float(jax.grad(loss)(lcdm["Om"]))
+    eps = 1e-4
+    fd = (float(loss(lcdm["Om"] + eps)) - float(loss(lcdm["Om"] - eps))) / (2 * eps)
+    rel = abs(g - fd) / (abs(fd) + 1e-12)
+    assert rel < 1e-5, f"FFTLog d/dOm rel diff {rel:.3e}"
+
+
+@pytest.mark.skipif(not _HAS_MCFIT, reason="mcfit not installed")
+def test_fftlog_jit_roundtrip(lcdm):
+    k = make_log_k_grid(1e-4, 1e2, 2048)
+    fft = FFTLogP2xi(k, l=0)
+    r = jnp.linspace(2.0, 60.0, 25)
+
+    @jax.jit
+    def jitted(Om):
+        P = cj.run_halofit(k, sigma8=lcdm["sigma8"], Om=Om,
+                           Ob=lcdm["Ob"], h=lcdm["h"], ns=lcdm["ns"], a=lcdm["a"])
+        return xi_from_Pk_fftlog(r, fft, P)
+
+    xi_jit = np.asarray(jitted(0.31))
+    P = cj.run_halofit(k, **lcdm)
+    xi_eager = np.asarray(xi_from_Pk_fftlog(r, fft, P))
+    np.testing.assert_allclose(xi_jit, xi_eager, rtol=1e-12, atol=1e-14)
 
 
 def test_xi_jit_roundtrip(lcdm):
