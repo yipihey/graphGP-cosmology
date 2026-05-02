@@ -52,6 +52,8 @@ class APState(NamedTuple):
 
 
 def _ap_rescale(d, mu, alpha_par, alpha_perp):
+    """AP rescaling. ``alpha_par`` and ``alpha_perp`` may be scalars or
+    per-pair arrays of the same length as ``d``."""
     d_par = mu * d
     d_perp_sq = jnp.maximum(d * d - d_par * d_par, 0.0)
     d_perp = jnp.sqrt(d_perp_sq)
