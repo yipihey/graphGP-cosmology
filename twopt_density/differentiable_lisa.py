@@ -54,6 +54,9 @@ class FrozenPairGraph:
     DR_mu: Optional[jnp.ndarray] = None
     DR_d: Optional[jnp.ndarray] = None
     RR_per_bin: Optional[jnp.ndarray] = None
+    # Optional per-pair RR cache for downstream re-binning (e.g. AP).
+    RR_d: Optional[jnp.ndarray] = None
+    RR_mu: Optional[jnp.ndarray] = None
     n_bins: int = 0
     N_D: int = 0
     N_R: int = 0
@@ -65,6 +68,7 @@ def build_state(
     box_size: float,
     randoms: Optional[np.ndarray] = None,
     los: np.ndarray = np.array([0.0, 0.0, 1.0]),
+    cache_rr: bool = False,
 ) -> FrozenPairGraph:
     """Compute the frozen pair graph (NumPy / scipy KDTree, non-diff).
 
@@ -125,8 +129,7 @@ def build_state(
         DR_pi, DR_pk, DR_bin, DR_mu, DR_d = _bin_pairs(
             positions, randoms, False,
         )
-        # RR per-bin only (no pair list cached). Cheap bincount.
-        RR_pi, RR_pk, RR_bin, _, _ = _bin_pairs(randoms, randoms, True)
+        RR_pi, RR_pk, RR_bin, RR_mu, RR_d = _bin_pairs(randoms, randoms, True)
         RR_per_bin = 2.0 * np.bincount(RR_bin, minlength=n_bins).astype(np.float64)
         state.DR_pi = jnp.asarray(DR_pi)
         state.DR_pk = jnp.asarray(DR_pk)
@@ -135,6 +138,9 @@ def build_state(
         state.DR_d = jnp.asarray(DR_d)
         state.RR_per_bin = jnp.asarray(RR_per_bin)
         state.N_R = len(randoms)
+        if cache_rr:
+            state.RR_d = jnp.asarray(RR_d)
+            state.RR_mu = jnp.asarray(RR_mu)
     return state
 
 
