@@ -1,7 +1,15 @@
 """Shared test fixtures."""
 
+import jax
 import numpy as np
 import pytest
+
+
+# Enable double precision for JAX so jax.grad / Hessian-based tests
+# pass the higher-precision tolerances they rely on. Mirrors how the
+# library code (twopt_density.distance, twopt_density.cosmology, ...)
+# is configured at import time.
+jax.config.update("jax_enable_x64", True)
 
 
 @pytest.fixture

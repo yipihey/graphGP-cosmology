@@ -417,6 +417,65 @@ def test_wp_observed_continuous_bz_constant_b_matches_wp_observed():
     np.testing.assert_allclose(wp_c, wp_s, rtol=0.02)
 
 
+def test_wp_kernel_z_reduces_to_uniform_over_full_range():
+    """A flat (very wide) Gaussian kernel must reproduce the standard
+    z-integrated Landy-Szalay wp -- the kernel weights all z_pair bins
+    equally so the kernel-weighted DD/DR/RR are proportional to the
+    z-integrated counts, and the LS ratio is unchanged."""
+    import jax.numpy as jnp
+    from twopt_density.projected_xi import (
+        wp_kernel_z, wp_landy_szalay, wp_landy_szalay_zpaired,
+    )
+
+    rng = np.random.default_rng(0)
+    L = 200.0
+    pts1 = rng.uniform(2000, 2000 + L, size=(2000, 3))
+    pts2 = rng.uniform(2000, 2000 + L, size=(6000, 3))
+    z1 = rng.uniform(1.0, 2.0, size=2000)
+    z2 = rng.uniform(1.0, 2.0, size=6000)
+    rp_edges = np.array([10.0, 30.0, 60.0])
+    pi_max = 80.0
+
+    counts = wp_landy_szalay_zpaired(
+        pts1, pts2, z1, z2, rp_edges, pi_max=pi_max, n_pi=10,
+        n_z_pair=20,
+    )
+    # very wide kernel -> uniform z weighting
+    wp_kernel = np.asarray(wp_kernel_z(jnp.float64(1.5), sigma_z=100.0,
+                                         counts=counts))
+    standard = wp_landy_szalay(pts1, pts2, rp_edges, pi_max=pi_max, n_pi=10)
+    np.testing.assert_allclose(wp_kernel, standard.wp, rtol=0.02, atol=2.0)
+
+
+def test_wp_kernel_z_jax_grad_matches_finite_difference():
+    """``jax.grad(wp_kernel_z)`` must agree with central-difference
+    finite differences on the kernel-weighted estimator."""
+    import jax
+    import jax.numpy as jnp
+    from twopt_density.projected_xi import (
+        wp_kernel_z, wp_landy_szalay_zpaired,
+    )
+
+    rng = np.random.default_rng(0)
+    pts1 = rng.uniform(0, 200, size=(2000, 3))
+    pts2 = rng.uniform(0, 200, size=(6000, 3))
+    z1 = rng.uniform(1.0, 2.0, size=2000)
+    z2 = rng.uniform(1.0, 2.0, size=6000)
+    rp_edges = np.array([10.0, 30.0, 60.0])
+    counts = wp_landy_szalay_zpaired(
+        pts1, pts2, z1, z2, rp_edges, pi_max=80.0, n_pi=10, n_z_pair=20,
+    )
+
+    def wp_total(z):
+        return jnp.sum(wp_kernel_z(z, sigma_z=0.2, counts=counts))
+
+    g_jax = float(jax.grad(wp_total)(jnp.float64(1.5)))
+    h = 1e-3
+    g_fd = (float(wp_total(jnp.float64(1.5 + h)))
+            - float(wp_total(jnp.float64(1.5 - h)))) / (2 * h)
+    np.testing.assert_allclose(g_jax, g_fd, rtol=1e-4, atol=1e-6)
+
+
 def test_wp_landy_szalay_isotropic_recovers_zero_clustering():
     """Random-on-random vs random-on-random gives wp ~ 0 within Poisson."""
     from twopt_density.projected_xi import wp_landy_szalay
