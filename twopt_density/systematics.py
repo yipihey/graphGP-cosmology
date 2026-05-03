@@ -96,6 +96,85 @@ def data_residual_weights(
     return w, r_smooth
 
 
+def coordinate_templates(nside: int, kinds: Sequence[str] = ("gal", "ecl")):
+    """Geometric systematic templates derivable from healpix coordinates
+    alone -- no external data required.
+
+    The dominant Quaia angular systematics are stellar density (peaks
+    on the galactic plane) and Gaia scanning law (peaks on the ecliptic).
+    Both are well captured by smooth functions of galactic / ecliptic
+    latitude. These templates regress out the leading-order spatial
+    pattern without needing the Gaia source catalog or SFD dust maps.
+
+    ``kinds`` selects which template families to include:
+        'gal' : sin(|b_gal|) and sin^2(|b_gal|)
+        'ecl' : sin(|b_ecl|) and sin^2(|b_ecl|)
+        'gal_cos_l' : cos(l_gal), to pick up galactic-longitude
+                       asymmetries (e.g. Magellanic clouds).
+
+    Returns
+    -------
+    list of (NPIX,) healpix maps, ready to pass to
+    ``fit_template_weights(templates=...)``.
+    """
+    import healpy as hp
+    from astropy.coordinates import Galactic, ICRS, BarycentricMeanEcliptic
+    from astropy import units as u
+    from astropy.coordinates import SkyCoord
+
+    npix = 12 * nside ** 2
+    theta, phi = hp.pix2ang(nside, np.arange(npix))
+    ra = np.degrees(phi)
+    dec = 90.0 - np.degrees(theta)
+    sc = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+
+    out = []
+    if "gal" in kinds:
+        b_gal = sc.galactic.b.to(u.rad).value
+        out.append(np.sin(np.abs(b_gal)))
+        out.append(np.sin(np.abs(b_gal)) ** 2)
+    if "ecl" in kinds:
+        b_ecl = sc.transform_to(BarycentricMeanEcliptic()).lat.to(u.rad).value
+        out.append(np.sin(np.abs(b_ecl)))
+        out.append(np.sin(np.abs(b_ecl)) ** 2)
+    if "gal_cos_l" in kinds:
+        l_gal = sc.galactic.l.to(u.rad).value
+        out.append(np.cos(l_gal))
+        out.append(np.sin(l_gal))
+    return out
+
+
+def low_ell_templates(nside: int, lmax: int = 4):
+    """Spherical-harmonic Y_ell^m basis for ell = 1..lmax (skipping
+    monopole l=0, which is absorbed into the constant).
+
+    These are the smooth, large-scale modes that systematics (dust,
+    stars, scanning) tend to dominate. Projecting against them is a
+    principled way to remove "low-l contamination" without explicit
+    physical templates -- equivalent to the leading terms of any
+    smooth real-space template.
+    """
+    import healpy as hp
+
+    npix = 12 * nside ** 2
+    out = []
+    for ell in range(1, lmax + 1):
+        for m in range(0, ell + 1):
+            # one alm with this (l, m) coefficient set to 1
+            n_alm = hp.Alm.getsize(lmax)
+            alm_real = np.zeros(n_alm, dtype=np.complex128)
+            alm_imag = np.zeros(n_alm, dtype=np.complex128)
+            idx = hp.Alm.getidx(lmax, ell, m)
+            alm_real[idx] = 1.0 + 0j
+            real_map = hp.alm2map(alm_real, nside, lmax=lmax)
+            out.append(real_map)
+            if m > 0:
+                alm_imag[idx] = 0 + 1j
+                imag_map = hp.alm2map(alm_imag, nside, lmax=lmax)
+                out.append(imag_map)
+    return out
+
+
 def fit_template_weights(
     ra_deg: np.ndarray, dec_deg: np.ndarray,
     mask: np.ndarray, nside: int,

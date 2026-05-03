@@ -47,7 +47,10 @@ from twopt_density.limber import (
 )
 from twopt_density.projected_xi import _count_pairs_rp_pi, wp_landy_szalay
 from twopt_density.quaia import load_quaia, load_selection_function
-from twopt_density.systematics import data_residual_weights
+from twopt_density.systematics import (
+    coordinate_templates, data_residual_weights, fit_template_weights,
+    low_ell_templates,
+)
 
 
 jax.config.update("jax_enable_x64", True)
@@ -69,7 +72,7 @@ def _env_float(n, d):
 
 def panel_bao(rp_centres, wp_data, sigma_wp, rp_pred, wp_full, wp_smooth,
                 b_fit, sigma_chi_eff, pi_max, calib, n_d, out_path,
-                deproj_fwhm_deg=None):
+                deproj_label: str = "off"):
     fig, axs = plt.subplots(3, 1, figsize=(8.5, 10.5), sharex=True)
     ax_top, ax_res, ax_rat = axs
 
@@ -83,11 +86,8 @@ def panel_bao(rp_centres, wp_data, sigma_wp, rp_pred, wp_full, wp_smooth,
                  label=fr"halofit no-wiggle (EH zero-baryon), $b={b_fit:.2f}$")
     ax_top.set_xscale("log"); ax_top.set_yscale("symlog", linthresh=0.1)
     ax_top.set_ylabel(r"$w_p(r_p)$ [Mpc/h]")
-    deproj_label = (f", deproj FWHM={deproj_fwhm_deg:.0f}deg"
-                     if deproj_fwhm_deg is not None else
-                     ", no systematic deprojection")
     ax_top.set_title(r"Quaia G$<$20: full-sample BAO search with"
-                      r" analytic RR/DR" + deproj_label)
+                      r" analytic RR/DR (deproj: " + deproj_label + ")")
     ax_top.legend(fontsize=9); ax_top.grid(alpha=0.3, which="both")
     ax_top.axhline(0, color="k", lw=0.5, alpha=0.3)
     ax_top.axvspan(80, 130, alpha=0.10, color="C1")
@@ -193,23 +193,61 @@ def main():
     print(f"  analytic RR: {time.perf_counter()-t:.1f}s")
     print(f"  calibration factor MC/analytic = {calib:.4f}")
 
-    # ---- 1b. data-residual systematic weights ----
+    # ---- 1b. systematic deprojection ----
+    deproj_mode = os.environ.get("QUAIA_DEPROJ_MODE", "bootstrap").lower()
     use_deproj = _env_int("QUAIA_DEPROJ", 1) == 1
     smooth_deg = _env_float("QUAIA_DEPROJ_FWHM_DEG", 60.0)
-    if use_deproj:
+    lmax_deproj = _env_int("QUAIA_DEPROJ_LMAX", 4)
+    if not use_deproj:
+        w_data = None
+        deproj_label = "off"
+        print("\n=== systematic deprojection OFF (QUAIA_DEPROJ=0) ===")
+    elif deproj_mode == "bootstrap":
         print()
-        print(f"=== data-residual weights "
+        print(f"=== bootstrap data-residual weights "
               f"(smoothing FWHM = {smooth_deg:.0f} deg) ===")
         w_data, _ = data_residual_weights(
             ra_d_all, dec_d_all, mask, nside,
             smoothing_fwhm_deg=smooth_deg,
         )
+        deproj_label = f"bootstrap, FWHM={smooth_deg:.0f}deg"
+    elif deproj_mode == "geometric":
+        print()
+        print("=== geometric coordinate templates: |b_gal|, |b_ecl| moments ===")
+        templates = coordinate_templates(nside, kinds=("gal", "ecl"))
+        w_data, c, _ = fit_template_weights(
+            ra_d_all, dec_d_all, mask, nside, templates=templates,
+        )
+        print(f"  fitted coefficients: {c.round(4)}")
+        deproj_label = "geometric (|b_gal|, |b_ecl|)"
+    elif deproj_mode == "harmonic":
+        print()
+        print(f"=== low-ell Y_lm template projection (lmax={lmax_deproj}) ===")
+        templates = low_ell_templates(nside, lmax=lmax_deproj)
+        w_data, c, _ = fit_template_weights(
+            ra_d_all, dec_d_all, mask, nside, templates=templates,
+        )
+        print(f"  {len(templates)} Y_lm templates, "
+              f"|c|_max = {np.abs(c).max():.4f}")
+        deproj_label = f"harmonic Y_lm (lmax={lmax_deproj})"
+    elif deproj_mode == "combined":
+        print()
+        print(f"=== combined: geometric + low-ell Y_lm (lmax={lmax_deproj}) ===")
+        templates = (coordinate_templates(nside, kinds=("gal", "ecl"))
+                     + low_ell_templates(nside, lmax=lmax_deproj))
+        w_data, c, _ = fit_template_weights(
+            ra_d_all, dec_d_all, mask, nside, templates=templates,
+        )
+        print(f"  {len(templates)} templates, "
+              f"|c|_max = {np.abs(c).max():.4f}")
+        deproj_label = f"combined (geom + Y_lm lmax={lmax_deproj})"
+    else:
+        raise ValueError(f"unknown QUAIA_DEPROJ_MODE = {deproj_mode!r}; "
+                          "choose bootstrap / geometric / harmonic / combined")
+    if w_data is not None:
         print(f"  per-galaxy weights: mean = {w_data.mean():.4f}, "
               f"std = {w_data.std():.4f}, "
               f"min = {w_data.min():.3f}, max = {w_data.max():.3f}")
-    else:
-        w_data = None
-        print("\n=== systematic deprojection OFF (QUAIA_DEPROJ=0) ===")
 
     # ---- 2. DD pair counts on the full data sample ----
     print()
@@ -285,7 +323,7 @@ def main():
     panel_bao(rp_centres, wp_data, sigma_wp, rp_pred, wp_full, wp_smooth,
                 b_fit, sigma_chi_eff, pi_max, calib, len(xyz_d_all),
                 os.path.join(FIG_DIR, "quaia_bao_analytic.png"),
-                deproj_fwhm_deg=(smooth_deg if use_deproj else None))
+                deproj_label=deproj_label)
     print("  wrote quaia_bao_analytic.png")
 
     print()

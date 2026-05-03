@@ -589,6 +589,78 @@ def test_dr_analytic_simple_scaling():
     np.testing.assert_allclose(out, RR * (2.0 * 100 / 300))
 
 
+def test_coordinate_templates_have_correct_shape():
+    """``coordinate_templates`` returns the right number of healpix
+    maps with values in expected ranges."""
+    pytest.importorskip("healpy")
+    pytest.importorskip("astropy")
+    from twopt_density.systematics import coordinate_templates
+
+    nside = 16
+    npix = 12 * nside ** 2
+    out = coordinate_templates(nside, kinds=("gal", "ecl"))
+    assert len(out) == 4
+    for t in out:
+        assert t.shape == (npix,)
+        assert (t >= 0).all() and (t <= 1.0001).all(), \
+            f"sin/sin^2 should lie in [0, 1], got [{t.min():.3f}, {t.max():.3f}]"
+
+
+def test_low_ell_templates_orthogonality():
+    """Low-ell Y_lm templates returned by ``low_ell_templates`` should
+    be orthogonal under the healpix dot product."""
+    pytest.importorskip("healpy")
+    from twopt_density.systematics import low_ell_templates
+
+    nside = 32
+    templates = low_ell_templates(nside, lmax=2)
+    # build inner products
+    M = np.array([[(a * b).sum() for b in templates] for a in templates])
+    # diagonal should dominate (different (l, m) modes are orthogonal)
+    diag = np.diag(M)
+    off = M - np.diag(diag)
+    assert np.abs(off).max() < 0.01 * np.abs(diag).max(), (
+        f"templates not orthogonal: max off-diag {np.abs(off).max():.3f}, "
+        f"max diag {np.abs(diag).max():.3f}"
+    )
+
+
+def test_fit_template_weights_recovers_imposed_systematic():
+    """Inject a systematic that's a linear combination of the geometric
+    templates and check ``fit_template_weights`` recovers the
+    coefficients."""
+    pytest.importorskip("healpy")
+    pytest.importorskip("astropy")
+    import healpy as hp
+    from twopt_density.systematics import (
+        coordinate_templates, fit_template_weights,
+    )
+
+    rng = np.random.default_rng(0)
+    nside = 16
+    npix = 12 * nside ** 2
+    mu = np.cos(hp.pix2ang(nside, np.arange(npix))[0])
+    mask = 0.5 * (1.0 + np.tanh(5.0 * mu))
+    templates = coordinate_templates(nside, kinds=("gal",))
+    # inject 0.3 * t_0 - 0.2 * t_1 systematic
+    c_true = np.array([0.3, -0.2])
+    sys_density = 1.0 + sum(c_k * (t - t.mean())
+                              for c_k, t in zip(c_true, templates))
+    eff_density = mask * np.maximum(sys_density, 0.1)
+    p = eff_density / eff_density.sum()
+    pix = rng.choice(npix, size=200_000, p=p)
+    theta, phi = hp.pix2ang(nside, pix)
+    ra = np.degrees(phi); dec = 90.0 - np.degrees(theta)
+    w, c, _ = fit_template_weights(ra, dec, mask, nside, templates)
+    # recovery within Poisson noise; tolerances loose since the templates
+    # are not orthogonal in pixel space
+    # tolerance loose: templates aren't orthogonal in pixel space and
+    # the regression is on the full Poisson-noisy residual, so recovery
+    # is biased at the 20-30% level (mostly through the leading-order
+    # template degeneracy with monopole and large-scale Poisson modes)
+    np.testing.assert_allclose(c, c_true, atol=0.1)
+
+
 def test_data_residual_weights_uniform_field_returns_unit_weights():
     """A perfectly Poisson-distributed catalogue under the published
     selection function should yield ~ unit per-galaxy weights (no
