@@ -469,6 +469,60 @@ def test_wp_continuous_chebyshev_derivative_matches_jax_grad():
             np.testing.assert_allclose(analytic, g, rtol=1e-9, atol=1e-9)
 
 
+def test_pnl_at_z_nowiggle_matches_eh_zero_baryon_at_z0():
+    """At z=0 ``pnl_at_z_nowiggle`` must be the halofit result with the
+    Eisenstein-Hu zero-baryon (smooth) linear input, not the BAO-bearing
+    plin_emulated."""
+    import jax.numpy as jnp
+    from twopt_density.cosmology import (
+        halofit_from_plin, pk_EisensteinHu_zb,
+    )
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import pnl_at_z_nowiggle
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    k = jnp.logspace(-3, 0, 64)
+    sigma8, Ob, h, ns = 0.8, 0.049, 0.68, 0.965
+    plin0_smooth = pk_EisensteinHu_zb(k, sigma8, 0.31, Ob, h, ns)
+    P_expected = np.asarray(halofit_from_plin(
+        k, plin0_smooth, sigma8, 0.31, Ob, h, ns, a=1.0,
+    ))
+    P_at_zeq0 = np.asarray(pnl_at_z_nowiggle(
+        k, z=0.0, sigma8=sigma8, cosmo=cosmo,
+    ))
+    np.testing.assert_allclose(P_at_zeq0, P_expected, rtol=1e-9)
+
+
+def test_wp_observed_minus_nowiggle_shows_bao_bump_at_sound_horizon():
+    """The difference ``wp_observed - wp_observed_nowiggle`` must peak
+    in [80, 110] Mpc/h (sound horizon) -- i.e. the BAO bump survives
+    the photo-z LOS smearing as long as pi_max is wide enough."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import (
+        make_wp_fft, wp_observed, wp_observed_nowiggle,
+    )
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    fft, k_np = make_wp_fft()
+    k_grid = jnp.asarray(k_np)
+    rp = jnp.asarray(np.linspace(20.0, 150.0, 27))
+    full = np.asarray(wp_observed(
+        rp, z_eff=1.4, sigma_chi_eff=170.0, cosmo=cosmo, bias=2.6,
+        pi_max=300.0, fft=fft, k_grid=k_grid,
+    ))
+    smooth = np.asarray(wp_observed_nowiggle(
+        rp, z_eff=1.4, sigma_chi_eff=170.0, cosmo=cosmo, bias=2.6,
+        pi_max=300.0, fft=fft, k_grid=k_grid,
+    ))
+    bao = full - smooth
+    rp_np = np.asarray(rp)
+    in_band = (rp_np > 80.0) & (rp_np < 110.0)
+    out_of_band = (rp_np > 30.0) & (rp_np < 70.0)
+    # peak in the BAO band exceeds the typical out-of-band value
+    assert bao[in_band].max() > 2 * np.abs(bao[out_of_band]).mean()
+
+
 def test_wp_kernel_z_reduces_to_uniform_over_full_range():
     """A flat (very wide) Gaussian kernel must reproduce the standard
     z-integrated Landy-Szalay wp -- the kernel weights all z_pair bins

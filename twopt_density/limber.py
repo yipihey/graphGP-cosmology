@@ -736,6 +736,89 @@ def fit_bz_powerlaw(
     return result, cov, b_of_z_eval, (b0_fit, alpha_fit)
 
 
+def pnl_at_z_nowiggle(k, z: float, sigma8: float, cosmo: DistanceCosmo,
+                       Ob: float = 0.049, ns: float = 0.965,
+                       add_correction: bool = True):
+    """Halofit P_NL(k, z) with the *no-BAO-wiggles* linear input.
+
+    Same as ``pnl_at_z`` but feeds ``halofit_from_plin`` with the
+    Eisenstein-Hu zero-baryon (smooth) linear power instead of the
+    BAO-bearing ``plin_emulated``. Useful as the "smooth" baseline in
+    BAO residual analyses: the difference
+
+        wp(rp; pnl_at_z) - wp(rp; pnl_at_z_nowiggle)
+
+    isolates the linear BAO contribution to wp(rp).
+    """
+    import jax.numpy as jnp
+    from .cosmology import halofit_from_plin, pk_EisensteinHu_zb
+
+    a_z = 1.0 / (1.0 + jnp.asarray(z, dtype=jnp.float64))
+    D = linear_growth(jnp.asarray([z], dtype=jnp.float64), cosmo)[0]
+    plin0_smooth = pk_EisensteinHu_zb(k, sigma8, cosmo.Om, Ob, cosmo.h, ns)
+    plin_z = (D ** 2) * plin0_smooth
+    return halofit_from_plin(
+        k, plin_z, sigma8, cosmo.Om, Ob, cosmo.h, ns,
+        a=a_z, add_correction=add_correction,
+    )
+
+
+def wp_observed_nowiggle(
+    rp,
+    z_eff: float,
+    sigma_chi_eff,
+    cosmo: DistanceCosmo,
+    bias=1.0,
+    pi_max: float = 200.0,
+    pi_int_range: float = 800.0,
+    n_pi_true: int = 400,
+    sigma8: float = 0.8,
+    Ob: float = 0.049,
+    ns: float = 0.965,
+    k_min: float = 1e-4,
+    k_max: float = 1e2,
+    n_k: int = 4096,
+    fft=None,
+    k_grid=None,
+):
+    """No-BAO-wiggles companion to ``wp_observed``.
+
+    Mirrors ``wp_observed`` exactly but uses ``pnl_at_z_nowiggle``
+    (Eisenstein-Hu smooth) for the linear input, so the BAO bump in
+    wp(rp) at rp ~ sound horizon is absent. Subtract from
+    ``wp_observed`` to get the BAO contribution.
+    """
+    import jax.numpy as jnp
+    from jax.scipy.special import erf
+    from .spectra import xi_from_Pk_fftlog
+
+    rp = jnp.atleast_1d(jnp.asarray(rp, dtype=jnp.float64))
+    sigma = jnp.asarray(sigma_chi_eff, dtype=jnp.float64)
+    bias = jnp.asarray(bias, dtype=jnp.float64)
+    sigma_safe = jnp.maximum(sigma, 1e-8)
+
+    if fft is None or k_grid is None:
+        fft, k_np = make_wp_fft(k_min, k_max, n_k)
+        k_grid = jnp.asarray(k_np)
+    P = pnl_at_z_nowiggle(k_grid, z=z_eff, sigma8=sigma8, cosmo=cosmo,
+                            Ob=Ob, ns=ns)
+    s_grid = jnp.geomspace(0.5, 1500.0, 2048)
+    xi_grid = xi_from_Pk_fftlog(s_grid, fft, P)
+
+    pi_true = jnp.linspace(-pi_int_range, pi_int_range, n_pi_true)
+    s_eval = jnp.sqrt(rp[:, None] ** 2 + pi_true[None, :] ** 2)
+    xi_eval = jnp.interp(s_eval.ravel(), s_grid, xi_grid).reshape(s_eval.shape)
+
+    sigma_sqrt2 = sigma_safe * jnp.sqrt(2.0)
+    window = 0.5 * (
+        erf((pi_max - pi_true) / sigma_sqrt2)
+        + erf((pi_max + pi_true) / sigma_sqrt2)
+    )
+    integrand = xi_eval * window[None, :]
+    wp = jnp.trapezoid(integrand, pi_true, axis=1)
+    return bias ** 2 * wp
+
+
 def wp_limber(
     rp: np.ndarray,
     z_eff: float,
