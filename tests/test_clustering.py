@@ -523,6 +523,72 @@ def test_wp_observed_minus_nowiggle_shows_bao_bump_at_sound_horizon():
     assert bao[in_band].max() > 2 * np.abs(bao[out_of_band]).mean()
 
 
+def test_angular_corr_from_mask_matches_squared_mean_at_zero():
+    """At theta -> 0 the mask auto-correlation must equal <mask^2> via
+    Parseval. With anafast at finite lmax = 3*nside - 1 we capture
+    nearly all the power for a smooth mask -- check at the percent
+    level, which is the well-known truncation effect."""
+    pytest.importorskip("healpy")
+    from twopt_density.analytic_rr import angular_corr_from_mask
+
+    rng = np.random.default_rng(0)
+    nside = 32
+    npix = 12 * nside ** 2
+    # smooth mask: a half-sky cap with soft edge
+    import healpy as hp
+    mu = np.cos(hp.pix2ang(nside, np.arange(npix))[0])
+    mask = 0.5 * (1.0 + np.tanh(5.0 * mu))
+    _, xi = angular_corr_from_mask(mask, nside, theta_max_rad=0.05,
+                                    n_theta=10)
+    np.testing.assert_allclose(xi[0], (mask ** 2).mean(), rtol=2e-2)
+
+
+def test_rr_analytic_returns_finite_pair_count():
+    """Smoke test: analytic RR runs end-to-end on a half-sky cap mask
+    and returns finite, positive pair counts. (Quantitative validation
+    against MC on real Quaia is in the demo; toy NSIDE=8/16 surveys
+    are too coarse for the small-angle / Legendre approximation to
+    reach 10% accuracy on isolated rp bins.)"""
+    pytest.importorskip("healpy")
+    from twopt_density.analytic_rr import rr_analytic
+    from twopt_density.distance import DistanceCosmo
+
+    import healpy as hp
+    nside = 32
+    npix = 12 * nside ** 2
+    mu = np.cos(hp.pix2ang(nside, np.arange(npix))[0])
+    mask = (mu > -0.5).astype(np.float64)
+    z = np.random.default_rng(0).uniform(1.0, 1.5, size=2000)
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    rp_edges = np.array([100.0, 200.0, 400.0])
+    pi_edges = np.linspace(0.0, 400.0, 11)
+    res = rr_analytic(rp_edges, pi_edges, mask, nside, z, cosmo, N_r=5000)
+    assert np.isfinite(res.RR).all()
+    assert (res.RR >= 0).all()
+    assert res.RR.sum() > 0
+
+
+def test_calibrate_norm_to_mc_returns_median_ratio():
+    """``calibrate_norm_to_mc`` returns the median pair-by-pair ratio
+    of MC to analytic RR. Trivial unit test."""
+    from twopt_density.analytic_rr import calibrate_norm_to_mc
+
+    a = np.array([[1.0, 2.0], [3.0, 4.0]])
+    m = a * 1.08    # a uniform 8% offset
+    f = calibrate_norm_to_mc(a, m)
+    np.testing.assert_allclose(f, 1.08, rtol=1e-9)
+
+
+def test_dr_analytic_simple_scaling():
+    """``dr_analytic`` is just (2 N_d / N_r) * RR -- validate the trivial
+    scaling so the helper is locked in."""
+    from twopt_density.analytic_rr import dr_analytic
+
+    RR = np.array([[1.0, 2.0], [3.0, 4.0]])
+    out = dr_analytic(N_d=100, N_r=300, RR=RR)
+    np.testing.assert_allclose(out, RR * (2.0 * 100 / 300))
+
+
 def test_wp_kernel_z_reduces_to_uniform_over_full_range():
     """A flat (very wide) Gaussian kernel must reproduce the standard
     z-integrated Landy-Szalay wp -- the kernel weights all z_pair bins
