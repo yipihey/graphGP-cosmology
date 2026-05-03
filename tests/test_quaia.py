@@ -132,6 +132,59 @@ def test_load_quaia_minimal_fits_roundtrip(tmp_path):
     assert cat.z_random.max() <= cat.z_data.max() + 1e-6
 
 
+def test_make_random_from_selection_function():
+    """A random sampled from a healpix selection map respects the mask
+    (no points in zero-completeness pixels) and inherits the data n(z)."""
+    pytest.importorskip("healpy")
+    import healpy as hp
+    from twopt_density.quaia import make_random_from_selection_function
+
+    nside = 16
+    npix = 12 * nside ** 2
+    rng = np.random.default_rng(0)
+
+    # synthetic selection map: 50% of pixels at completeness 1, rest at 0
+    sel = np.zeros(npix, dtype=np.float64)
+    on_pix = rng.choice(npix, size=npix // 2, replace=False)
+    sel[on_pix] = 1.0
+
+    z_data = rng.uniform(0.5, 4.0, size=2000)
+    ra, dec, z = make_random_from_selection_function(
+        sel, n_random=10000, z_data=z_data, nside=nside, rng=rng,
+    )
+    assert ra.shape == (10000,) and dec.shape == (10000,) and z.shape == (10000,)
+    # all random points must land in pixels that have completeness > 0
+    pix = hp.ang2pix(nside, np.deg2rad(90.0 - dec), np.deg2rad(ra))
+    assert (sel[pix] > 0).all(), "random points landed in masked pixels"
+    # n(z) close to z_data n(z)
+    assert abs(z.mean() - z_data.mean()) < 0.05 * z_data.mean()
+
+
+def test_load_selection_function_round_trips():
+    """Synthesise a Quaia-format selection FITS and round-trip via the loader."""
+    import os, tempfile
+    pytest.importorskip("astropy")
+    from astropy.io import fits
+    from twopt_density.quaia import load_selection_function
+
+    nside = 8
+    npix = 12 * nside ** 2
+    sel = np.linspace(0.0, 1.0, npix, dtype=np.float64)
+
+    # The published format: 1 column 'T' with 1024-double rows (npix/1024 rows).
+    # For small NSIDE we just match column-name + flatten on read.
+    col = fits.Column(name="T", format="D", array=sel)
+    hdu = fits.BinTableHDU.from_columns([col])
+    hdu.header["NSIDE"] = nside
+    hdu.header["TTYPE1"] = "T"
+    with tempfile.TemporaryDirectory() as td:
+        fn = os.path.join(td, "sel.fits")
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(fn, overwrite=True)
+        sel_back, nside_back = load_selection_function(fn)
+    assert nside_back == nside and sel_back.size == npix
+    np.testing.assert_allclose(sel_back, sel, rtol=1e-12, atol=1e-14)
+
+
 def test_load_quaia_unknown_strategy_raises(tmp_path):
     pytest.importorskip("astropy")
     from astropy.table import Table

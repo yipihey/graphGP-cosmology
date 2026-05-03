@@ -3,3 +3,6 @@ __pycache__/
 .DS_Store
 *.egg-info/
 .env
+
+# downloaded survey catalogues -- not under version control
+data/
