@@ -5,7 +5,6 @@ __pycache__/
 .env
 
 # downloaded survey catalogues -- not under version control
-data/
+data/quaia/
 
-# don't ignore the staged pixwin file we want to ship
-!data/healpy/
+# (the rest of data/ is checked in: pixel-window FITS for analytic RR, etc.)
