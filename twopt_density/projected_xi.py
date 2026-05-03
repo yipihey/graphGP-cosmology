@@ -261,11 +261,18 @@ def _count_pairs_rp_pi(
     pi_edges: np.ndarray,
     auto: bool = False,
     chunk: int = 4000,
+    w1: np.ndarray = None,
+    w2: np.ndarray = None,
 ) -> np.ndarray:
     """Bin all pairs (i in pos1, j in pos2) into a (rp, pi) histogram.
 
     For ``auto=True`` (pos1 is pos2), each unordered pair is counted
     once: the chunked query enforces ``j > i_global``.
+
+    If per-object weights ``w1`` and ``w2`` are provided, each pair
+    contributes ``w1[i] * w2[j]`` to the histogram (vs unit weight
+    by default). Used for systematics deprojection where galaxies
+    carry per-object weights from a template fit.
     """
     from scipy.spatial import cKDTree
 
@@ -301,7 +308,15 @@ def _count_pairs_rp_pi(
         m = (rp < rp_max) & (pi < pi_max)
         if not m.any():
             continue
-        h, _, _ = np.histogram2d(rp[m], pi[m], bins=[rp_edges, pi_edges])
+        if w1 is None and w2 is None:
+            h, _, _ = np.histogram2d(rp[m], pi[m], bins=[rp_edges, pi_edges])
+        else:
+            ww = (
+                (w1[rows] if w1 is not None else 1.0)
+                * (w2[cols] if w2 is not None else 1.0)
+            )
+            h, _, _ = np.histogram2d(rp[m], pi[m], bins=[rp_edges, pi_edges],
+                                       weights=ww[m])
         counts += h
     return counts
 
@@ -313,6 +328,8 @@ def wp_landy_szalay(
     pi_max: float = 80.0,
     n_pi: int = 40,
     chunk: int = 4000,
+    w_data: np.ndarray = None,
+    w_random: np.ndarray = None,
 ) -> WpMeasurement:
     """Measure wp(rp) via 2D Landy-Szalay on a comoving point cloud.
 
@@ -323,17 +340,25 @@ def wp_landy_szalay(
         do NOT pass shift-to-positive coordinates.
     rp_edges : 1D array of rp bin edges, increasing.
     pi_max, n_pi : LOS bin extent and number of linear bins.
+    w_data, w_random : optional per-object weights (e.g. systematic
+        deprojection). The LS normalisation in ``WpMeasurement.xi_rp_pi``
+        uses ``N_d`` and ``N_r`` directly; with weights you typically
+        want them ``mean(w_i) = 1`` so the standard normalisation still
+        applies (this is what ``twopt_density.systematics`` produces).
     """
     rp_edges = np.asarray(rp_edges, dtype=np.float64)
     pi_edges = np.linspace(0.0, pi_max, n_pi + 1)
     rp_centres = 0.5 * (rp_edges[:-1] + rp_edges[1:])
 
     DD = _count_pairs_rp_pi(pos_data, pos_data, rp_edges, pi_edges,
-                            auto=True, chunk=chunk)
+                            auto=True, chunk=chunk,
+                            w1=w_data, w2=w_data)
     DR = _count_pairs_rp_pi(pos_data, pos_random, rp_edges, pi_edges,
-                            auto=False, chunk=chunk)
+                            auto=False, chunk=chunk,
+                            w1=w_data, w2=w_random)
     RR = _count_pairs_rp_pi(pos_random, pos_random, rp_edges, pi_edges,
-                            auto=True, chunk=chunk)
+                            auto=True, chunk=chunk,
+                            w1=w_random, w2=w_random)
 
     return WpMeasurement(
         rp_centres=rp_centres, rp_edges=rp_edges, pi_edges=pi_edges,

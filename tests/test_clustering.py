@@ -589,6 +589,97 @@ def test_dr_analytic_simple_scaling():
     np.testing.assert_allclose(out, RR * (2.0 * 100 / 300))
 
 
+def test_data_residual_weights_uniform_field_returns_unit_weights():
+    """A perfectly Poisson-distributed catalogue under the published
+    selection function should yield ~ unit per-galaxy weights (no
+    systematic to deproject). Allow ~5% scatter from finite-N noise."""
+    pytest.importorskip("healpy")
+    import healpy as hp
+    from twopt_density.systematics import data_residual_weights
+
+    rng = np.random.default_rng(0)
+    nside = 16
+    npix = 12 * nside ** 2
+    # smooth half-sky cap
+    mu = np.cos(hp.pix2ang(nside, np.arange(npix))[0])
+    mask = 0.5 * (1.0 + np.tanh(5.0 * mu))
+    # uniform random under the mask
+    n_obj = 60_000
+    p = mask / mask.sum()
+    pix = rng.choice(npix, size=n_obj, p=p)
+    theta, phi = hp.pix2ang(nside, pix)
+    ra = np.degrees(phi); dec = 90.0 - np.degrees(theta)
+    w, _ = data_residual_weights(ra, dec, mask, nside, smoothing_fwhm_deg=10.0)
+    # mean should be exactly 1 (by construction)
+    np.testing.assert_allclose(w.mean(), 1.0, rtol=1e-12)
+    # std should be small for a uniform Poisson sample
+    assert w.std() < 0.1, f"weight std too large: {w.std():.3f}"
+
+
+def test_data_residual_weights_recovers_imposed_systematic():
+    """Inject a known multiplicative systematic on the data density and
+    check that ``data_residual_weights`` produces weights that bring
+    the density back to flat (within Poisson)."""
+    pytest.importorskip("healpy")
+    import healpy as hp
+    from twopt_density.systematics import (
+        data_residual_weights, galaxy_count_map,
+    )
+
+    rng = np.random.default_rng(0)
+    nside = 16
+    npix = 12 * nside ** 2
+    mu = np.cos(hp.pix2ang(nside, np.arange(npix))[0])
+    mask = 0.5 * (1.0 + np.tanh(5.0 * mu))
+    # multiplicative systematic: 30% over/underdensity slowly varying
+    phi_arr = hp.pix2ang(nside, np.arange(npix))[1]
+    sys_density = 1.0 + 0.3 * np.cos(phi_arr)
+    eff_density = mask * sys_density
+    n_obj = 100_000
+    p = eff_density / eff_density.sum()
+    pix = rng.choice(npix, size=n_obj, p=p)
+    theta, phi = hp.pix2ang(nside, pix)
+    ra = np.degrees(phi); dec = 90.0 - np.degrees(theta)
+    w, _ = data_residual_weights(ra, dec, mask, nside, smoothing_fwhm_deg=45.0)
+    # weighted galaxy count should match expected = mean * mask, no
+    # systematic. Compare weighted vs unweighted residual variance:
+    n_obs = galaxy_count_map(ra, dec, nside)
+    good = mask > 0.05
+    n_bar = n_obs[good].sum() / mask[good].sum()
+    expected = n_bar * mask
+    raw_resid = (n_obs[good] - expected[good]) / expected[good]
+    # weighted: sum w_i in each pixel
+    pix_data = hp.ang2pix(nside, np.deg2rad(90.0 - dec), np.deg2rad(ra))
+    n_weighted = np.bincount(pix_data, weights=w, minlength=npix)
+    n_bar_w = n_weighted[good].sum() / mask[good].sum()
+    expected_w = n_bar_w * mask
+    weighted_resid = (n_weighted[good] - expected_w[good]) / expected_w[good]
+    # weighted residual variance reduced by the deprojection. The
+    # Poisson floor ~ 1/sqrt(N_per_pix) limits how far this can go;
+    # for 100k objects in ~ 2000 good pixels we expect a ~ 25-30%
+    # variance reduction (ratio ~ 0.7 - 0.75).
+    assert weighted_resid.std() < raw_resid.std() * 0.80, (
+        f"deprojection didn't reduce variance: raw {raw_resid.std():.3f}, "
+        f"weighted {weighted_resid.std():.3f}"
+    )
+
+
+def test_count_pairs_rp_pi_with_unit_weights_matches_unweighted():
+    """Weighted pair counter with all unit weights must match the
+    unweighted version pair-for-pair."""
+    from twopt_density.projected_xi import _count_pairs_rp_pi
+
+    rng = np.random.default_rng(0)
+    pos = rng.uniform(0, 200, size=(3000, 3))
+    rp_edges = np.array([5.0, 20.0, 50.0])
+    pi_edges = np.linspace(0, 80, 11)
+    plain = _count_pairs_rp_pi(pos, pos, rp_edges, pi_edges, auto=True)
+    weighted = _count_pairs_rp_pi(pos, pos, rp_edges, pi_edges, auto=True,
+                                    w1=np.ones(len(pos)),
+                                    w2=np.ones(len(pos)))
+    np.testing.assert_allclose(weighted, plain, rtol=1e-12)
+
+
 def test_wp_kernel_z_reduces_to_uniform_over_full_range():
     """A flat (very wide) Gaussian kernel must reproduce the standard
     z-integrated Landy-Szalay wp -- the kernel weights all z_pair bins

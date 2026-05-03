@@ -47,6 +47,7 @@ from twopt_density.limber import (
 )
 from twopt_density.projected_xi import _count_pairs_rp_pi, wp_landy_szalay
 from twopt_density.quaia import load_quaia, load_selection_function
+from twopt_density.systematics import data_residual_weights
 
 
 jax.config.update("jax_enable_x64", True)
@@ -67,7 +68,8 @@ def _env_float(n, d):
 
 
 def panel_bao(rp_centres, wp_data, sigma_wp, rp_pred, wp_full, wp_smooth,
-                b_fit, sigma_chi_eff, pi_max, calib, n_d, out_path):
+                b_fit, sigma_chi_eff, pi_max, calib, n_d, out_path,
+                deproj_fwhm_deg=None):
     fig, axs = plt.subplots(3, 1, figsize=(8.5, 10.5), sharex=True)
     ax_top, ax_res, ax_rat = axs
 
@@ -81,8 +83,11 @@ def panel_bao(rp_centres, wp_data, sigma_wp, rp_pred, wp_full, wp_smooth,
                  label=fr"halofit no-wiggle (EH zero-baryon), $b={b_fit:.2f}$")
     ax_top.set_xscale("log"); ax_top.set_yscale("symlog", linthresh=0.1)
     ax_top.set_ylabel(r"$w_p(r_p)$ [Mpc/h]")
+    deproj_label = (f", deproj FWHM={deproj_fwhm_deg:.0f}deg"
+                     if deproj_fwhm_deg is not None else
+                     ", no systematic deprojection")
     ax_top.set_title(r"Quaia G$<$20: full-sample BAO search with"
-                      r" analytic RR/DR -- no MC random")
+                      r" analytic RR/DR" + deproj_label)
     ax_top.legend(fontsize=9); ax_top.grid(alpha=0.3, which="both")
     ax_top.axhline(0, color="k", lw=0.5, alpha=0.3)
     ax_top.axvspan(80, 130, alpha=0.10, color="C1")
@@ -147,9 +152,15 @@ def main():
     xyz_d_all = np.asarray(cat.xyz_data[md])
     z_d_all = cat.z_data[md]
     sig_z_all = cat.z_data_err[md]
+    ra_d_all = cat.ra_data[md]
+    dec_d_all = cat.dec_data[md]
     if len(xyz_d_all) > n_data_max:
         idx = rng.choice(len(xyz_d_all), n_data_max, replace=False)
-        xyz_d_all, z_d_all, sig_z_all = xyz_d_all[idx], z_d_all[idx], sig_z_all[idx]
+        xyz_d_all = xyz_d_all[idx]
+        z_d_all = z_d_all[idx]
+        sig_z_all = sig_z_all[idx]
+        ra_d_all = ra_d_all[idx]
+        dec_d_all = dec_d_all[idx]
     print(f"data sample: N_d = {len(xyz_d_all):,}, "
           f"f_sky_eff = {mask.mean():.3f}, "
           f"<chi^2_p>(KDE) computed analytically")
@@ -182,12 +193,31 @@ def main():
     print(f"  analytic RR: {time.perf_counter()-t:.1f}s")
     print(f"  calibration factor MC/analytic = {calib:.4f}")
 
+    # ---- 1b. data-residual systematic weights ----
+    use_deproj = _env_int("QUAIA_DEPROJ", 1) == 1
+    smooth_deg = _env_float("QUAIA_DEPROJ_FWHM_DEG", 60.0)
+    if use_deproj:
+        print()
+        print(f"=== data-residual weights "
+              f"(smoothing FWHM = {smooth_deg:.0f} deg) ===")
+        w_data, _ = data_residual_weights(
+            ra_d_all, dec_d_all, mask, nside,
+            smoothing_fwhm_deg=smooth_deg,
+        )
+        print(f"  per-galaxy weights: mean = {w_data.mean():.4f}, "
+              f"std = {w_data.std():.4f}, "
+              f"min = {w_data.min():.3f}, max = {w_data.max():.3f}")
+    else:
+        w_data = None
+        print("\n=== systematic deprojection OFF (QUAIA_DEPROJ=0) ===")
+
     # ---- 2. DD pair counts on the full data sample ----
     print()
     print(f"=== DD pair counts on {len(xyz_d_all):,} data points ===")
     t = time.perf_counter()
     DD = _count_pairs_rp_pi(xyz_d_all, xyz_d_all, rp_edges, pi_edges,
-                              auto=True, chunk=4000)
+                              auto=True, chunk=4000,
+                              w1=w_data, w2=w_data)
     print(f"  {time.perf_counter()-t:.0f}s, DD total = {DD.sum():.0f}")
 
     # ---- 3. analytic RR (calibrated) and DR ----
@@ -254,7 +284,8 @@ def main():
 
     panel_bao(rp_centres, wp_data, sigma_wp, rp_pred, wp_full, wp_smooth,
                 b_fit, sigma_chi_eff, pi_max, calib, len(xyz_d_all),
-                os.path.join(FIG_DIR, "quaia_bao_analytic.png"))
+                os.path.join(FIG_DIR, "quaia_bao_analytic.png"),
+                deproj_fwhm_deg=(smooth_deg if use_deproj else None))
     print("  wrote quaia_bao_analytic.png")
 
     print()

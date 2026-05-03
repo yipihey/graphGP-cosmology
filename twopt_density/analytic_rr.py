@@ -287,6 +287,7 @@ def wp_from_analytic_random(
     chunk: int = 4000,
     N_r_effective: int = 1_000_000,
     rr_norm_factor: float = 1.0,
+    w_data: np.ndarray = None,
 ):
     """Landy-Szalay wp(rp) using analytic RR & DR -- no random catalog.
 
@@ -310,9 +311,11 @@ def wp_from_analytic_random(
     rp_edges = np.asarray(rp_edges, dtype=np.float64)
 
     # 1) DD pair counts via cKDTree (the only thing left that needs
-    # the actual point cloud)
+    # the actual point cloud). Optional per-galaxy weights for
+    # systematic deprojection.
     DD = _count_pairs_rp_pi(pos_data, pos_data, rp_edges, pi_edges,
-                              auto=True, chunk=chunk)
+                              auto=True, chunk=chunk,
+                              w1=w_data, w2=w_data)
     N_d = len(pos_data)
 
     # 2) analytic RR from the window (with calibration factor if provided)
@@ -320,10 +323,14 @@ def wp_from_analytic_random(
                         N_r=N_r_effective)
     RR = rr_norm_factor * res.RR
 
-    # 3) analytic DR from RR (and the assumption of unclustered data)
+    # 3) analytic DR from RR (and the assumption of unclustered data).
+    # When the data carries weights (mean-1 normalisation), DR scales
+    # by the same mean -- effectively unchanged.
     DR = dr_analytic(N_d, N_r_effective, RR)
 
-    # LS estimator with the standard normalisations
+    # LS estimator with the standard normalisations. With unit-mean
+    # weights, sum(w_i) ~ N_d and sum(w_i)^2 - sum(w_i^2) ~ N_d^2 - N_d
+    # -- the ``Nd_pairs = N_d (N_d-1)/2`` form is correct to O(1/N).
     Nd_pairs = N_d * (N_d - 1) / 2.0
     Nr_pairs = N_r_effective * (N_r_effective - 1) / 2.0
     DD_n = DD / Nd_pairs
