@@ -93,3 +93,64 @@ def test_load_quaia_signature():
     from twopt_density.quaia import load_quaia
     with pytest.raises(Exception):
         load_quaia("nonexistent.fits", "nonexistent_random.fits")
+
+
+def test_load_quaia_minimal_fits_roundtrip(tmp_path):
+    """Synthesise a minimal Quaia-schema FITS pair (data has redshift_quaia,
+    random has only (ra, dec, ebv) -- the published schema) and verify that
+    load_quaia produces a valid QuaiaCatalog with random z's drawn from the
+    data n(z)."""
+    pytest.importorskip("astropy")
+    from astropy.table import Table
+    from twopt_density.quaia import load_quaia
+
+    rng = np.random.default_rng(0)
+    N_d, N_r = 800, 8000
+    data = Table({
+        "ra": rng.uniform(0, 360, size=N_d),
+        "dec": np.degrees(np.arcsin(rng.uniform(-1, 1, size=N_d))),
+        "redshift_quaia": rng.uniform(0.5, 4.0, size=N_d),
+    })
+    random = Table({
+        "ra": rng.uniform(0, 360, size=N_r),
+        "dec": np.degrees(np.arcsin(rng.uniform(-1, 1, size=N_r))),
+        "ebv": rng.uniform(0.0, 0.5, size=N_r),
+    })
+    fn_d = tmp_path / "mini_quaia.fits"
+    fn_r = tmp_path / "mini_random.fits"
+    data.write(fn_d, overwrite=True)
+    random.write(fn_r, overwrite=True)
+
+    cat = load_quaia(str(fn_d), str(fn_r))
+
+    assert cat.N_data == N_d
+    assert cat.N_random == N_r
+    # default strategy "sample_from_data": random n(z) tracks data n(z)
+    assert abs(cat.z_random.mean() - cat.z_data.mean()) < 0.05 * cat.z_data.mean()
+    # z bounds preserved
+    assert cat.z_random.min() >= cat.z_data.min() - 1e-6
+    assert cat.z_random.max() <= cat.z_data.max() + 1e-6
+
+
+def test_load_quaia_unknown_strategy_raises(tmp_path):
+    pytest.importorskip("astropy")
+    from astropy.table import Table
+    from twopt_density.quaia import load_quaia
+
+    rng = np.random.default_rng(0)
+    data = Table({
+        "ra": rng.uniform(0, 360, size=100),
+        "dec": np.degrees(np.arcsin(rng.uniform(-1, 1, size=100))),
+        "redshift_quaia": rng.uniform(0.5, 4.0, size=100),
+    })
+    random = Table({
+        "ra": rng.uniform(0, 360, size=200),
+        "dec": np.degrees(np.arcsin(rng.uniform(-1, 1, size=200))),
+        "ebv": rng.uniform(0.0, 0.5, size=200),
+    })
+    fn_d = tmp_path / "d.fits"
+    fn_r = tmp_path / "r.fits"
+    data.write(fn_d, overwrite=True)
+    random.write(fn_r, overwrite=True)
+    with pytest.raises(ValueError):
+        load_quaia(str(fn_d), str(fn_r), random_z_strategy="bogus")

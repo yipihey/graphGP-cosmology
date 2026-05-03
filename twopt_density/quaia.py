@@ -2,29 +2,42 @@
 
 The Quaia catalog (Storey-Fisher et al. 2024, arXiv:2306.17749) is the
 all-sky Gaia x unWISE quasar sample (~1.3M objects with G < 20.5,
-spectro-photometric redshifts in 0.5 < z < 4.5). It is hosted on Zenodo
-at DOI 10.5281/zenodo.8060754, with a matched random catalogue
-(``quaia_G20.5_random.fits``).
+spectro-photometric redshifts in 0.5 < z < 4.5). Data products are
+hosted on Zenodo (DOI 10.5281/zenodo.8060755, see
+https://github.com/kstoreyf/gaia-quasars-lss). The published files are::
+
+    quaia_G20.0.fits                  # data, G < 20.0 cut
+    quaia_G20.5.fits                  # data, G < 20.5 cut (full sample)
+    random_G20.0_10x.fits             # 10x random for G < 20.0 sample
+    random_G20.5_10x.fits             # 10x random for G < 20.5 sample
+    selection_function_NSIDE64_G20.0.fits   # healpix completeness map
+    selection_function_NSIDE64_G20.5.fits
+
+The data catalog has columns ``ra, dec, redshift_quaia`` (and several
+metadata columns); the **random catalog has only sky positions**
+``(ra, dec, ebv)`` -- redshifts must be sampled from the data n(z) at
+load time, which is the standard Quaia analysis recipe.
 
 This module provides::
 
   load_quaia(catalog_path, randoms_path, fid_cosmo, ...) -> QuaiaCatalog
-      Read the real Quaia FITS files from a local path. Returns a
-      ``QuaiaCatalog`` named tuple with comoving xyz under a fiducial
-      cosmology (so the full SF&H + AP + cosmology-gradient pipeline
-      runs on the real data).
+      Read the real Quaia FITS files. ``randoms_path`` may also be the
+      string ``"sample_from_data"`` to use a uniform-on-mask synthetic
+      random with z drawn from the loaded data's n(z). Otherwise,
+      reads the random FITS file and assigns z's per
+      ``random_z_strategy`` (``"sample_from_data"`` or ``"copy_from_column"``).
 
   make_mock_quaia(n_data, n_random, fid_cosmo, ..., seed=...) -> QuaiaCatalog
       Synthesise a Quaia-shape mock with a galactic-plane mask
       (|b| > b_min), the published bimodal n(z), light Gaussian-blob
       clustering for the data, and uniform randoms under the same
       selection. Outputs the same ``QuaiaCatalog`` schema as the real
-      loader -- the rest of the pipeline does not care which it was.
+      loader.
 
-Once you have the real ``quaia_G20.5.fits`` and ``quaia_G20.5_random.fits``
+Once you have the real ``quaia_G20.5.fits`` and ``random_G20.5_10x.fits``
 on a machine that can reach Zenodo, the demo at
 ``demos/demo_quaia_mock.py`` becomes a real-data run by swapping
-``make_mock_quaia(...)`` for ``load_quaia(...)`` -- nothing else changes.
+``make_mock_quaia(...)`` for ``load_quaia(...)``.
 """
 
 from __future__ import annotations
@@ -215,6 +228,28 @@ def make_mock_quaia(
     )
 
 
+def _sample_z_from_data(z_data: np.ndarray, n: int,
+                         rng: np.random.Generator,
+                         n_bins: int = 200) -> np.ndarray:
+    """Draw ``n`` redshifts from the empirical n(z) of the data.
+
+    Standard Quaia recipe for assigning z to the (sky-only) random
+    catalog. Uses linear interpolation of the empirical CDF on a
+    histogram-binned n(z). For Quaia's smooth n(z) (~10^6 sources)
+    the result is indistinguishable from a kernel-density resample.
+    """
+    z_min = float(np.min(z_data))
+    z_max = float(np.max(z_data))
+    edges = np.linspace(z_min, z_max, n_bins + 1)
+    hist, _ = np.histogram(z_data, bins=edges)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    pdf = hist.astype(np.float64)
+    cdf = np.cumsum(pdf)
+    cdf = cdf / cdf[-1]
+    u = rng.uniform(size=n)
+    return np.interp(u, cdf, centres)
+
+
 def load_quaia(
     catalog_path: str,
     randoms_path: str,
@@ -223,13 +258,23 @@ def load_quaia(
     ra_key: str = "ra",
     dec_key: str = "dec",
     z_key: str = "redshift_quaia",
+    random_z_strategy: str = "sample_from_data",
+    rng_seed: int = 0,
 ) -> QuaiaCatalog:
-    """Load real Quaia FITS files into the same ``QuaiaCatalog`` schema
-    that ``make_mock_quaia`` returns.
+    """Load real Quaia FITS files into the ``QuaiaCatalog`` schema.
 
-    Default column names match the public Zenodo distribution
-    (``quaia_G20.5.fits``, ``quaia_G20.5_random.fits``). Override the
-    ``*_key`` arguments if your local copy differs.
+    Defaults match the public Zenodo distribution
+    (``quaia_G20.5.fits``, ``random_G20.5_10x.fits``). The catalog file
+    must have ``ra``, ``dec``, ``redshift_quaia`` columns; override the
+    ``*_key`` arguments for non-standard column names.
+
+    Random redshifts. The published random catalog only carries
+    ``(ra, dec, ebv)`` so we must assign z's at load time. Two strategies::
+
+      "sample_from_data"  -- draw z's from the empirical n(z) of the
+                             loaded data (the standard Quaia recipe).
+      "copy_from_column"  -- read a redshift column from the random
+                             FITS file (override ``z_key`` if needed).
 
     Notes
     -----
@@ -251,7 +296,17 @@ def load_quaia(
     z_d = np.asarray(cat[z_key], dtype=np.float64)
     ra_r = np.asarray(rnd[ra_key], dtype=np.float64)
     dec_r = np.asarray(rnd[dec_key], dtype=np.float64)
-    z_r = np.asarray(rnd[z_key], dtype=np.float64)
+
+    if random_z_strategy == "sample_from_data":
+        rng = np.random.default_rng(rng_seed)
+        z_r = _sample_z_from_data(z_d, len(ra_r), rng)
+    elif random_z_strategy == "copy_from_column":
+        z_r = np.asarray(rnd[z_key], dtype=np.float64)
+    else:
+        raise ValueError(
+            f"random_z_strategy must be 'sample_from_data' or "
+            f"'copy_from_column', got {random_z_strategy!r}"
+        )
 
     xyz_d = np.asarray(radec_z_to_cartesian(
         jnp.asarray(ra_d), jnp.asarray(dec_d), jnp.asarray(z_d), fid_cosmo,
