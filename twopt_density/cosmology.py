@@ -209,14 +209,21 @@ _HALOFIT_PARS_BARTLETT = jnp.array([
 ])
 
 
-def run_halofit(k, sigma8, Om, Ob, h, ns, a=1.0, add_correction=True):
-    """syren-halofit nonlinear P(k). Bartlett 2024 model is the default."""
+def halofit_from_plin(k, plin, sigma8, Om, Ob, h, ns, a=1.0,
+                       add_correction=True):
+    """Bartlett 2024 syren-halofit P_NL given an explicit linear input.
+
+    Body of ``run_halofit`` factored out so callers that need to evaluate
+    P_NL at z > 0 can supply ``plin = D^2(z) * plin(k, z=0)`` while still
+    feeding the NL emulators their training-time inputs ``(sigma8(z=0),
+    a=1/(1+z))``. ``run_halofit(k, ..., a=1)`` is the special case
+    ``plin = plin_emulated(...) at z=0``.
+    """
     pars = _HALOFIT_PARS_BARTLETT
     ksigma = ksigma_emulated(sigma8, Om, Ob, h, ns, a)
     neff = neff_emulated(sigma8, Om, Ob, h, ns, a)
     C = C_emulated(sigma8, Om, Ob, h, ns, a)
     y = k / ksigma
-    plin = plin_emulated(k, sigma8, Om, Ob, h, ns, a=a)
 
     an = (pars[0] + pars[1] * neff + pars[2] * neff ** 2 + pars[3] * neff ** 3
           + pars[4] * neff ** 4 - pars[5] * C)
@@ -254,6 +261,23 @@ def run_halofit(k, sigma8, Om, Ob, h, ns, a=1.0, add_correction=True):
     if add_correction:
         p_nl = p_nl * (1 + A_emulated(k, sigma8, Om, Ob, h, ns, a))
     return p_nl
+
+
+def run_halofit(k, sigma8, Om, Ob, h, ns, a=1.0, add_correction=True):
+    """syren-halofit nonlinear P(k) at z=0 (a=1).
+
+    For z > 0 use ``twopt_density.limber.pnl_at_z``, which feeds the
+    proper D^2(z)-scaled linear input into ``halofit_from_plin`` while
+    keeping the NL emulators on their training convention. Calling this
+    function with ``a < 1`` is supported but the linear input is kept at
+    z=0; the resulting P_NL only differs from the a=1 result via the NL
+    emulators (Omz, ksigma, neff, C, A) -- it is *not* P_NL(k, z) and
+    does not satisfy the linear-regime growth scaling.
+    """
+    plin = plin_emulated(k, sigma8, Om, Ob, h, ns, a=a)
+    return halofit_from_plin(
+        k, plin, sigma8, Om, Ob, h, ns, a=a, add_correction=add_correction,
+    )
 
 
 # ----- syren-new (extended cosmology, As parameterised) ---------------
