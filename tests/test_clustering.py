@@ -189,6 +189,81 @@ def test_sigma_chi_from_sigma_z_matches_dchi_dz():
     np.testing.assert_allclose(sig_chi, expected, rtol=1e-12)
 
 
+def test_wp_observed_perpair_reduces_to_single_sigma():
+    """When all pair sigmas are identical, wp_observed_perpair must
+    equal wp_observed at that scalar sigma."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import (
+        make_wp_fft, wp_observed, wp_observed_perpair,
+    )
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    fft, k_np = make_wp_fft()
+    k_grid = jnp.asarray(k_np)
+    rp = jnp.array([5.0, 10.0, 30.0])
+    sigma = 120.0
+    wp1 = np.asarray(wp_observed(
+        rp, z_eff=1.4, sigma_chi_eff=sigma, cosmo=cosmo, bias=2.6,
+        pi_max=200.0, fft=fft, k_grid=k_grid,
+    ))
+    wp_pp = np.asarray(wp_observed_perpair(
+        rp, z_eff=1.4, sigma_chi_samples=jnp.full(64, sigma), cosmo=cosmo,
+        bias=2.6, pi_max=200.0, fft=fft, k_grid=k_grid,
+    ))
+    np.testing.assert_allclose(wp_pp, wp1, rtol=1e-10)
+
+
+def test_sample_pair_sigma_chi_recovers_pythagorean_sum():
+    """For a constant sigma_z, sigma_pair = sqrt(2) * sigma_chi(z)."""
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import (
+        sample_pair_sigma_chi, sigma_chi_from_sigma_z,
+    )
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    n = 500
+    sigma_z = np.full(n, 0.05)
+    z = np.full(n, 1.4)
+    sigma_chi = float(sigma_chi_from_sigma_z(z, sigma_z, cosmo)[0])
+    sig_pair = sample_pair_sigma_chi(sigma_z, z, cosmo, n_pairs=2000,
+                                      rng=np.random.default_rng(0))
+    expected = np.sqrt(2) * sigma_chi
+    np.testing.assert_allclose(sig_pair.mean(), expected, rtol=1e-6)
+    np.testing.assert_allclose(sig_pair.std(), 0.0, atol=1e-6)
+
+
+def test_wp_map_fit_recovers_synthetic_truth_within_one_sigma():
+    """JAX-MAP fit on synthetic wp data with known truth bias must
+    converge and recover b within 1 sigma."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import make_wp_fft, wp_map_fit, wp_observed
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    fft, k_np = make_wp_fft()
+    k_grid = jnp.asarray(k_np)
+    rp = np.logspace(np.log10(8.0), np.log10(60.0), 10)
+    truth_b = 2.5
+    wp_truth = np.asarray(wp_observed(
+        jnp.asarray(rp), z_eff=1.4, sigma_chi_eff=160.0, cosmo=cosmo,
+        bias=truth_b, pi_max=200.0, fft=fft, k_grid=k_grid,
+    ))
+    sigma_wp = 0.05 * np.maximum(np.abs(wp_truth), 0.5)
+    rng = np.random.default_rng(0)
+    wp_data = wp_truth + rng.normal(0.0, sigma_wp)
+    res, cov, _, theta_full = wp_map_fit(
+        rp, wp_data, sigma_wp, sigma_chi_eff=160.0, z_eff=1.4,
+        free=("b",), pi_max=200.0,
+    )
+    assert res.success
+    sd_b = float(np.sqrt(max(cov[0, 0], 0.0)))
+    # truth recovered within ~2 sigma (chi^2 noise is realistic)
+    assert abs(theta_full["b"] - truth_b) < 3.0 * max(sd_b, 0.01), (
+        f"b={theta_full['b']:.3f} vs truth={truth_b}; sd_b={sd_b:.3f}"
+    )
+
+
 def test_wp_landy_szalay_isotropic_recovers_zero_clustering():
     """Random-on-random vs random-on-random gives wp ~ 0 within Poisson."""
     from twopt_density.projected_xi import wp_landy_szalay

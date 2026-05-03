@@ -210,6 +210,21 @@ def sigma_chi_from_sigma_z(z_obs: np.ndarray, sigma_z: np.ndarray,
     return dchi_dz * np.asarray(sigma_z, dtype=np.float64)
 
 
+def make_wp_fft(k_min: float = 1e-4, k_max: float = 1e2, n_k: int = 4096):
+    """Pre-build the FFTLog kernel + its k-grid used by ``wp_observed``.
+
+    ``mcfit.P2xi`` cannot be constructed inside a JIT trace, so the
+    fitter precomputes it once at non-traced time and threads it
+    through; the jitted loss then only depends on traced ``cosmo`` /
+    ``bias`` / ``sigma_chi`` values, not on the FFT setup.
+    """
+    from .spectra import FFTLogP2xi
+
+    k_np = np.logspace(np.log10(k_min), np.log10(k_max), n_k)
+    fft = FFTLogP2xi(k_np, l=0)
+    return fft, k_np
+
+
 def wp_observed(
     rp,
     z_eff: float,
@@ -225,6 +240,8 @@ def wp_observed(
     k_min: float = 1e-4,
     k_max: float = 1e2,
     n_k: int = 4096,
+    fft=None,
+    k_grid=None,
 ):
     """JAX-differentiable photo-z-aware projected correlation wp_obs(rp).
 
@@ -252,7 +269,7 @@ def wp_observed(
     """
     import jax.numpy as jnp
     from jax.scipy.special import erf
-    from .spectra import FFTLogP2xi, make_log_k_grid, xi_from_Pk_fftlog
+    from .spectra import xi_from_Pk_fftlog
 
     rp = jnp.atleast_1d(jnp.asarray(rp, dtype=jnp.float64))
     sigma = jnp.asarray(sigma_chi_eff, dtype=jnp.float64)
@@ -260,16 +277,19 @@ def wp_observed(
     sigma_safe = jnp.maximum(sigma, 1e-8)
 
     # 1) xi_real(s, z_eff) via FFTLog of P_NL(k, z_eff).
-    k = make_log_k_grid(k_min, k_max, n_k)
-    P = pnl_at_z(k, z=z_eff, sigma8=sigma8, cosmo=cosmo, Ob=Ob, ns=ns)
-    fft = FFTLogP2xi(k, l=0)
-    # xi_real evaluated on a dense s-grid spanning the static integration
-    # range. ``pi_int_range`` should be >> sqrt(pi_max^2 + (5*sigma_chi)^2)
-    # so the erf window has decayed at the boundary; default 800 Mpc/h
-    # covers Quaia (sigma_chi <~ 200 Mpc/h, pi_max <~ 200 Mpc/h).
-    rp_max = float(jnp.max(rp))
-    s_max = float(jnp.sqrt(rp_max ** 2 + pi_int_range ** 2) + 1.0)
-    s_grid = jnp.geomspace(0.5, s_max, 2048)
+    # ``mcfit`` cannot be JIT-traced, so when this function runs under
+    # jax.grad/jit the caller must pre-build (fft, k_grid) via
+    # ``make_wp_fft`` and pass them in. Default path: build once for
+    # eager use.
+    if fft is None or k_grid is None:
+        fft, k_np = make_wp_fft(k_min, k_max, n_k)
+        k_grid = jnp.asarray(k_np)
+    P = pnl_at_z(k_grid, z=z_eff, sigma8=sigma8, cosmo=cosmo, Ob=Ob, ns=ns)
+    # xi_real evaluated on a dense, *static* s-grid that spans more than
+    # any rp + pi_true we'll need; using a static range keeps the
+    # function jit-traceable. 1500 Mpc/h covers rp <~ 200 + pi_int_range
+    # 800; bump if you need wider rp.
+    s_grid = jnp.geomspace(0.5, 1500.0, 2048)
     xi_grid = xi_from_Pk_fftlog(s_grid, fft, P)
 
     # 2) integrate over pi_true with the erf window.
@@ -283,6 +303,195 @@ def wp_observed(
         + erf((pi_max + pi_true) / sigma_sqrt2)
     )                                                              # (n_pi,)
     integrand = xi_eval * window[None, :]
+    wp = jnp.trapezoid(integrand, pi_true, axis=1)
+    return bias ** 2 * wp
+
+
+_PARAM_NAMES = ("Om", "sigma8", "b")
+_PARAM_DEFAULTS = {"Om": 0.31, "sigma8": 0.81, "b": 2.6}
+_PARAM_BOUNDS = {"Om": (0.15, 0.55), "sigma8": (0.5, 1.1), "b": (0.3, 6.0)}
+
+
+def wp_map_fit(
+    rp_meas,
+    wp_meas,
+    sigma_wp,
+    sigma_chi_eff,
+    z_eff: float,
+    free=("Om", "sigma8", "b"),
+    fix=None,
+    pi_max: float = 200.0,
+    h: float = 0.68,
+    Ob: float = 0.049,
+    ns: float = 0.965,
+    n_pi_true: int = 400,
+):
+    """JAX MAP fit of subset of (Om, sigma8, b) on a wp(rp) measurement.
+
+    Diagonal-Gaussian chi^2 loss with the photo-z-aware ``wp_observed``
+    forward model. Any subset of (Om, sigma8, b) can be free; the rest
+    are fixed via ``fix={...}`` (defaults: Planck 0.31 / 0.81 / 2.6).
+
+    Returns
+    -------
+    result : FitResult on the free parameters only.
+    cov : (n_free, n_free) covariance from inverse Hessian.
+    wp_pred : (N_rp,) wp at the best fit.
+    theta_full : dict {name: value} including fixed parameters.
+
+    Notes
+    -----
+    On wp(rp) alone, (sigma8, b) are heavily degenerate -- the data
+    constrain only ``sigma8 * b``. To get a well-defined covariance fix
+    one of them (or fold in C_ell to break the degeneracy).
+    """
+    import jax
+    import jax.numpy as jnp
+    from .fit import map_fit
+
+    fix = dict(fix or {})
+    free = tuple(free)
+    for name in free:
+        if name not in _PARAM_NAMES:
+            raise ValueError(f"unknown parameter {name}; expected one of "
+                              f"{_PARAM_NAMES}")
+        fix.pop(name, None)
+    fixed = {**{k: _PARAM_DEFAULTS[k] for k in _PARAM_NAMES if k not in free},
+             **fix}
+
+    rp_jax = jnp.asarray(rp_meas, dtype=jnp.float64)
+    wp_jax = jnp.asarray(wp_meas, dtype=jnp.float64)
+    sig_jax = jnp.asarray(sigma_wp, dtype=jnp.float64)
+
+    fft, k_np = make_wp_fft()
+    k_grid = jnp.asarray(k_np)
+
+    def expand(theta):
+        out = {**fixed}
+        for i, name in enumerate(free):
+            out[name] = theta[i]
+        return out
+
+    def loss(theta):
+        p = expand(theta)
+        cosmo = DistanceCosmo(Om=p["Om"], h=h)
+        wp_pred = wp_observed(
+            rp_jax, z_eff=z_eff, sigma_chi_eff=sigma_chi_eff, cosmo=cosmo,
+            bias=p["b"], pi_max=pi_max, n_pi_true=n_pi_true,
+            sigma8=p["sigma8"], Ob=Ob, ns=ns, fft=fft, k_grid=k_grid,
+        )
+        return jnp.sum(((wp_jax - wp_pred) / sig_jax) ** 2)
+
+    theta0 = tuple(_PARAM_DEFAULTS[k] for k in free)
+    bounds = tuple(_PARAM_BOUNDS[k] for k in free)
+    result = map_fit(loss, theta0, bounds=bounds)
+
+    H = np.asarray(jax.hessian(loss)(jnp.asarray(result.theta)))
+    try:
+        cov = 2.0 * np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        cov = np.full((len(free), len(free)), np.nan)
+
+    theta_full = expand(jnp.asarray(result.theta))
+    theta_full = {k: float(v) for k, v in theta_full.items()}
+    cosmo_best = DistanceCosmo(Om=theta_full["Om"], h=h)
+    wp_pred = np.asarray(wp_observed(
+        rp_jax, z_eff=z_eff, sigma_chi_eff=sigma_chi_eff, cosmo=cosmo_best,
+        bias=theta_full["b"], pi_max=pi_max, n_pi_true=n_pi_true,
+        sigma8=theta_full["sigma8"], Ob=Ob, ns=ns,
+        fft=fft, k_grid=k_grid,
+    ))
+    return result, cov, wp_pred, theta_full
+
+
+def sample_pair_sigma_chi(
+    sigma_z_array: np.ndarray,
+    z_array: np.ndarray,
+    cosmo: DistanceCosmo,
+    n_pairs: int = 20000,
+    rng=None,
+) -> np.ndarray:
+    """Empirical per-pair LOS sigma sampled from the catalogue.
+
+    For an auto-correlation, each pair (i, j) has Gaussian LOS variance
+    sigma_chi_i^2 + sigma_chi_j^2 (treating photo-z's as independent
+    Gaussians on each side). Sample ``n_pairs`` random index pairs from
+    the catalogue and return the array of sqrt(sum-of-squares) so that
+    ``wp_observed_perpair`` can average the LOS window across the actual
+    pair-sigma distribution.
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+    n = len(sigma_z_array)
+    if n < 2:
+        raise ValueError("need >=2 objects for pair sampling")
+    sig_chi = sigma_chi_from_sigma_z(z_array, sigma_z_array, cosmo)
+    i = rng.integers(0, n, size=n_pairs)
+    j = rng.integers(0, n, size=n_pairs)
+    # avoid self-pairs (rare but messy)
+    same = (i == j)
+    if same.any():
+        j[same] = (j[same] + 1) % n
+    return np.sqrt(sig_chi[i] ** 2 + sig_chi[j] ** 2)
+
+
+def wp_observed_perpair(
+    rp,
+    z_eff: float,
+    sigma_chi_samples,
+    cosmo: DistanceCosmo,
+    bias=1.0,
+    pi_max: float = 200.0,
+    pi_int_range: float = 800.0,
+    n_pi_true: int = 400,
+    sigma8: float = 0.8,
+    Ob: float = 0.049,
+    ns: float = 0.965,
+    fft=None,
+    k_grid=None,
+):
+    """Photo-z-aware wp_observed averaged over an empirical per-pair
+    sigma_chi distribution.
+
+    Generalisation of ``wp_observed``: instead of assuming a single
+    effective LOS sigma, average the analytic erf window over the
+    empirical distribution of per-pair sigma_chi sampled from the
+    catalogue (see ``sample_pair_sigma_chi``). Reduces to ``wp_observed``
+    when all samples have the same value.
+
+    Fully JAX-differentiable in (cosmo, bias, sigma_chi_samples).
+    """
+    import jax.numpy as jnp
+    from jax.scipy.special import erf
+    from .spectra import xi_from_Pk_fftlog
+
+    rp = jnp.atleast_1d(jnp.asarray(rp, dtype=jnp.float64))
+    sigma_samples = jnp.asarray(sigma_chi_samples, dtype=jnp.float64)
+    sigma_safe = jnp.maximum(sigma_samples, 1e-8)
+    bias = jnp.asarray(bias, dtype=jnp.float64)
+
+    if fft is None or k_grid is None:
+        fft, k_np = make_wp_fft()
+        k_grid = jnp.asarray(k_np)
+
+    P = pnl_at_z(k_grid, z=z_eff, sigma8=sigma8, cosmo=cosmo, Ob=Ob, ns=ns)
+    s_grid = jnp.geomspace(0.5, 1500.0, 2048)
+    xi_grid = xi_from_Pk_fftlog(s_grid, fft, P)
+
+    pi_true = jnp.linspace(-pi_int_range, pi_int_range, n_pi_true)
+    s_eval = jnp.sqrt(rp[:, None] ** 2 + pi_true[None, :] ** 2)   # (n_rp, n_pi)
+    xi_eval = jnp.interp(s_eval.ravel(), s_grid, xi_grid).reshape(s_eval.shape)
+
+    # Per-sample erf window, then average over samples.
+    # shape: window[i, p] for sample i and pi-bin p
+    sigma_sqrt2 = sigma_safe[:, None] * jnp.sqrt(2.0)
+    window = 0.5 * (
+        erf((pi_max - pi_true[None, :]) / sigma_sqrt2)
+        + erf((pi_max + pi_true[None, :]) / sigma_sqrt2)
+    )                                                              # (n_samp, n_pi)
+    window_avg = jnp.mean(window, axis=0)                          # (n_pi,)
+
+    integrand = xi_eval * window_avg[None, :]
     wp = jnp.trapezoid(integrand, pi_true, axis=1)
     return bias ** 2 * wp
 
