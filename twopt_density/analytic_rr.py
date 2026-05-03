@@ -42,6 +42,37 @@ from typing import Tuple
 import numpy as np
 
 
+def _load_pixwin(nside: int, lmax: int):
+    """Pixel window function W_pix(l) for healpix at given NSIDE.
+
+    First tries ``hp.pixwin`` (which downloads from healpy.github.io).
+    Falls back to a local copy at ``data/healpy/pixel_window_n{NSIDE:04d}.fits``
+    if the download fails (sandbox / firewall).
+    """
+    import os
+    import healpy as hp
+    try:
+        return hp.pixwin(nside, lmax=lmax)
+    except Exception:
+        pass
+    # local fallback
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local = os.path.join(repo_root, "data", "healpy",
+                          f"pixel_window_n{nside:04d}.fits")
+    if not os.path.exists(local):
+        raise FileNotFoundError(
+            f"pixwin file not available locally at {local} "
+            "and hp.pixwin download failed; either disable "
+            "deconvolve_pixwin or stage the file from "
+            "https://raw.githubusercontent.com/healpy/healpy-data/master/"
+            f"pixel_window_functions/pixel_window_n{nside:04d}.fits"
+        )
+    from astropy.io import fits
+    with fits.open(local) as hdul:
+        wpix = np.asarray(hdul[1].data["TEMPERATURE"], dtype=np.float64)
+    return wpix[: lmax + 1]
+
+
 def angular_corr_from_mask(
     mask: np.ndarray, nside: int, lmax: int = None,
     n_theta: int = 600, theta_max_rad: float = 0.5,
@@ -59,9 +90,9 @@ def angular_corr_from_mask(
     The pixwin deconvolution matters at angles below ~ 1/lmax (fraction
     of a deg for NSIDE=64) -- it's exactly the regime where MC pair
     counts at small rp see additional structure that the smooth Legendre
-    approximation otherwise misses. Disabled by default because
-    ``hp.pixwin`` downloads a data file from healpy.github.io; enable
-    if the data file is locally available (or the sandbox has network).
+    approximation otherwise misses. The pixwin file is read via
+    ``_load_pixwin`` which falls back to a local copy in
+    ``data/healpy/`` if ``hp.pixwin``'s download fails.
 
     Returns
     -------
@@ -74,7 +105,7 @@ def angular_corr_from_mask(
         lmax = 3 * nside - 1
     cl = hp.anafast(mask, lmax=lmax)
     if deconvolve_pixwin:
-        wpix = hp.pixwin(nside, lmax=lmax)
+        wpix = _load_pixwin(nside, lmax=lmax)
         # avoid divide-by-zero at high l where pixwin -> 0
         wpix2 = np.maximum(wpix ** 2, 1e-6)
         cl = cl / wpix2

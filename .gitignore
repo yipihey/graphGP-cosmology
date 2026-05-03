@@ -6,3 +6,6 @@ __pycache__/
 
 # downloaded survey catalogues -- not under version control
 data/
+
+# don't ignore the staged pixwin file we want to ship
+!data/healpy/
