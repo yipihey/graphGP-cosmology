@@ -351,9 +351,11 @@ def _sample_z_from_data(z_data: np.ndarray, n: int,
 
 def load_quaia(
     catalog_path: str,
-    randoms_path: str,
+    randoms_path: Optional[str] = None,
     fid_cosmo: Optional[DistanceCosmo] = None,
     *,
+    selection_path: Optional[str] = None,
+    n_random_factor: int = 10,
     ra_key: str = "ra",
     dec_key: str = "dec",
     z_key: str = "redshift_quaia",
@@ -366,6 +368,12 @@ def load_quaia(
     (``quaia_G20.5.fits``, ``random_G20.5_10x.fits``). The catalog file
     must have ``ra``, ``dec``, ``redshift_quaia`` columns; override the
     ``*_key`` arguments for non-standard column names.
+
+    Random catalog. Either supply ``randoms_path`` (the published 10x
+    FITS) or ``selection_path`` (the small healpix completeness map);
+    in the latter case ``n_random_factor * N_data`` random points are
+    sampled locally from the selection function. Exactly one of the two
+    must be given.
 
     Random redshifts. The published random catalog only carries
     ``(ra, dec, ebv)`` so we must assign z's at load time. Two strategies::
@@ -384,27 +392,38 @@ def load_quaia(
     from astropy.table import Table
     import jax.numpy as jnp
 
+    if (randoms_path is None) == (selection_path is None):
+        raise ValueError(
+            "exactly one of randoms_path or selection_path must be given"
+        )
     if fid_cosmo is None:
         fid_cosmo = DistanceCosmo()
 
     cat = Table.read(catalog_path)
-    rnd = Table.read(randoms_path)
-
     ra_d = np.asarray(cat[ra_key], dtype=np.float64)
     dec_d = np.asarray(cat[dec_key], dtype=np.float64)
     z_d = np.asarray(cat[z_key], dtype=np.float64)
-    ra_r = np.asarray(rnd[ra_key], dtype=np.float64)
-    dec_r = np.asarray(rnd[dec_key], dtype=np.float64)
 
-    if random_z_strategy == "sample_from_data":
-        rng = np.random.default_rng(rng_seed)
-        z_r = _sample_z_from_data(z_d, len(ra_r), rng)
-    elif random_z_strategy == "copy_from_column":
-        z_r = np.asarray(rnd[z_key], dtype=np.float64)
+    rng = np.random.default_rng(rng_seed)
+
+    if randoms_path is not None:
+        rnd = Table.read(randoms_path)
+        ra_r = np.asarray(rnd[ra_key], dtype=np.float64)
+        dec_r = np.asarray(rnd[dec_key], dtype=np.float64)
+        if random_z_strategy == "sample_from_data":
+            z_r = _sample_z_from_data(z_d, len(ra_r), rng)
+        elif random_z_strategy == "copy_from_column":
+            z_r = np.asarray(rnd[z_key], dtype=np.float64)
+        else:
+            raise ValueError(
+                f"random_z_strategy must be 'sample_from_data' or "
+                f"'copy_from_column', got {random_z_strategy!r}"
+            )
     else:
-        raise ValueError(
-            f"random_z_strategy must be 'sample_from_data' or "
-            f"'copy_from_column', got {random_z_strategy!r}"
+        sel, nside = load_selection_function(selection_path)
+        n_random = n_random_factor * len(ra_d)
+        ra_r, dec_r, z_r = make_random_from_selection_function(
+            sel, n_random=n_random, z_data=z_d, nside=nside, rng=rng,
         )
 
     xyz_d = np.asarray(radec_z_to_cartesian(
