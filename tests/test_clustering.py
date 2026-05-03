@@ -264,6 +264,86 @@ def test_wp_map_fit_recovers_synthetic_truth_within_one_sigma():
     )
 
 
+def test_cl_gg_limber_is_jax_differentiable():
+    """JAX-cl_gg_limber must allow gradients through (Om, sigma8, bias)
+    -- needed for joint Cl+wp fits."""
+    import jax
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import cl_gg_limber
+
+    z = jnp.linspace(0.85, 2.45, 30)
+    nz = jnp.ones_like(z)
+    ell = jnp.array([20.0, 100.0])
+
+    def loss_om(Om):
+        return jnp.sum(cl_gg_limber(
+            ell, z, nz, DistanceCosmo(Om=Om, h=0.68), bias=2.0,
+        ) ** 2)
+    g_om = jax.grad(loss_om)(jnp.float64(0.31))
+    assert jnp.isfinite(g_om) and g_om != 0.0
+
+    def loss_b(b):
+        return jnp.sum(cl_gg_limber(
+            ell, z, nz, DistanceCosmo(Om=0.31, h=0.68), bias=b,
+        ) ** 2)
+    g_b = jax.grad(loss_b)(jnp.float64(2.0))
+    assert jnp.isfinite(g_b) and g_b != 0.0
+
+    def loss_s8(s8):
+        return jnp.sum(cl_gg_limber(
+            ell, z, nz, DistanceCosmo(Om=0.31, h=0.68),
+            bias=2.0, sigma8=s8,
+        ) ** 2)
+    g_s8 = jax.grad(loss_s8)(jnp.float64(0.81))
+    assert jnp.isfinite(g_s8) and g_s8 != 0.0
+
+
+def test_joint_cl_wp_map_fit_runs_and_returns_finite_covariance():
+    """Joint fit on synthetic Cl+wp must converge and return a finite
+    covariance for the (sigma8, b) constrained combination."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import (
+        cl_gg_limber, joint_cl_wp_map_fit, make_wp_fft, wp_observed,
+    )
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    fft, k_np = make_wp_fft()
+    k_grid = jnp.asarray(k_np)
+    truth_b = 2.5
+    truth_s8 = 0.83
+
+    z = np.linspace(0.85, 2.45, 30)
+    nz = np.ones_like(z)
+    ell = np.array([30., 50., 100., 200.])
+    cl_truth = np.asarray(cl_gg_limber(ell, z, nz, cosmo, bias=truth_b,
+                                         sigma8=truth_s8))
+    sigma_cl = 0.1 * np.maximum(np.abs(cl_truth), 1e-7)
+    rng = np.random.default_rng(0)
+    cl_data = cl_truth + rng.normal(0, sigma_cl)
+
+    rp = np.logspace(np.log10(8.0), np.log10(60.0), 8)
+    wp_truth = np.asarray(wp_observed(
+        jnp.asarray(rp), z_eff=1.4, sigma_chi_eff=160.0, cosmo=cosmo,
+        bias=truth_b, sigma8=truth_s8, pi_max=200.0,
+        fft=fft, k_grid=k_grid,
+    ))
+    sigma_wp = 0.1 * np.maximum(np.abs(wp_truth), 0.5)
+    wp_data = wp_truth + rng.normal(0, sigma_wp)
+    sig_chi_samples = np.full(64, 160.0)
+
+    res, cov, theta_full = joint_cl_wp_map_fit(
+        ell, cl_data, sigma_cl, z, nz,
+        rp, wp_data, sigma_wp, sig_chi_samples, z_eff=1.4,
+        free=("sigma8", "b"), pi_max=200.0, ell_min=20.0,
+    )
+    assert res.success
+    # joint sigma8*b should recover truth (the only well-constrained quantity)
+    np.testing.assert_allclose(theta_full["sigma8"] * theta_full["b"],
+                                truth_s8 * truth_b, rtol=0.05)
+
+
 def test_wp_landy_szalay_isotropic_recovers_zero_clustering():
     """Random-on-random vs random-on-random gives wp ~ 0 within Poisson."""
     from twopt_density.projected_xi import wp_landy_szalay

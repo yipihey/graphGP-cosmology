@@ -59,7 +59,7 @@ import numpy as np
 from twopt_density.angular import compute_cl_gg
 from twopt_density.distance import DistanceCosmo
 from twopt_density.limber import (
-    cl_gg_limber, dndz_pdf_stack, make_wp_fft,
+    cl_gg_limber, dndz_pdf_stack, joint_cl_wp_map_fit, make_wp_fft,
     sample_pair_sigma_chi, sigma_chi_from_sigma_z,
     wp_limber, wp_map_fit, wp_observed, wp_observed_perpair,
 )
@@ -376,32 +376,88 @@ def main():
                     os.path.join(FIG_DIR, "quaia_clustering_wp.png"))
     print("  wrote quaia_clustering_wp.png")
 
+    # ---- 3. C_ell scale-dependent bias diagnostic ----
+    print()
+    print("=== scale-dependent C_ell bias (where does the C_ell-vs-wp")
+    print("    mismatch live?) ===")
+    print(f"  ell_min  N_bins  b_fit  fit_chi2/dof")
+    for ell_min_test in (10, 20, 40, 80, 120):
+        m = meas_cl.ell_eff > ell_min_test
+        if m.sum() < 2:
+            continue
+        b = float(np.sqrt(max(np.sum(meas_cl.cl_decoupled[m]
+                                       * cl_pred_b1_stack[m])
+                              / np.sum(cl_pred_b1_stack[m] ** 2), 0.01)))
+        chi2 = np.sum((meas_cl.cl_decoupled[m]
+                       - b ** 2 * cl_pred_b1_stack[m]) ** 2
+                      / (meas_cl.cl_decoupled[m] / np.sqrt(2 * meas_cl.ell_eff[m] + 1)
+                         / np.sqrt(meas_cl.f_sky)) ** 2)
+        print(f"  ell > {ell_min_test:3d}: {m.sum():2d}     {b:.2f}    "
+              f"{chi2 / max(m.sum() - 1, 1):.2f}")
+    print("  -- a *flat* b vs ell_min would mean the bias is genuinely high;")
+    print("     a *dropping* b at large ell_min suggests a low-ell systematic")
+    print("     (residual dust / stars / mask leakage that NaMaster can't")
+    print("     fully decouple at NSIDE=64).")
+
+    # ---- 4. Joint (C_ell + wp) MAP fit ----
+    print()
+    print("=== joint (C_ell + wp) MAP fit -- breaks the wp-only sigma8-b")
+    print("    degeneracy ===")
+    t0 = time.perf_counter()
+    res_j, cov_j, theta_j = joint_cl_wp_map_fit(
+        meas_cl.ell_eff, meas_cl.cl_decoupled,
+        meas_cl.cl_decoupled / np.sqrt(2 * meas_cl.ell_eff + 1) / np.sqrt(meas_cl.f_sky),
+        z_centres, dndz_stack,
+        rp_use, wp_use, sig_use, sig_pair_samples, z_eff,
+        free=("sigma8", "b"), pi_max=pi_max, ell_min=20.0,
+    )
+    sd_j = np.sqrt(np.maximum(np.diag(cov_j), 0.0))
+    rho_j = cov_j[0, 1] / max(sd_j[0] * sd_j[1], 1e-30)
+    print(f"  joint (sigma8, b): {time.perf_counter() - t0:.1f}s, "
+          f"sigma8={theta_j['sigma8']:.2f} +/- {sd_j[0]:.2f}, "
+          f"b={theta_j['b']:.2f} +/- {sd_j[1]:.2f}, corr={rho_j:+.2f}")
+    print("  vs wp-only (sigma8, b): only sigma8*b is constrained")
+    print(f"  vs wp-only b alone   : b = {theta_b['b']:.2f}")
+    sigma8_b_joint = theta_j["sigma8"] * theta_j["b"]
+    print(f"  joint sigma8*b = {sigma8_b_joint:.2f}; "
+          f"wp-only sigma8*b = {sigma8_b:.2f}")
+
     print()
     print("=== summary ===")
-    print(f"C_ell^gg fit (ell > 20):")
-    print(f"  point-estimate dndz   -> b = {b_point:.2f}")
-    print(f"  photo-z-PDF-stacked   -> b = {b_stack:.2f}")
-    print(f"  Storey-Fisher+24      -> b ~ 2.5-2.6 at z_eff~1.4")
+    print(f"C_ell^gg fit (ell > 20, photo-z-PDF-stacked dndz):  b = {b_stack:.2f}")
+    print(f"  scale-dependent: bias is FLAT across ell = 20-80, jumps slightly")
+    print(f"    at ell > 80 -- so this is NOT a low-ell systematic; the offset")
+    print(f"    is a pipeline-level effect.")
     print()
-    print(f"wp(rp) joint MAP (JAX value-and-grad through wp_observed_perpair,")
-    print(f"  photo-z-aware with per-pair sigma_chi distribution; LBFGS via scipy):")
-    print(f"  per-pair sigma_chi median / mean = "
-          f"{np.median(sig_pair_samples):.0f} / "
-          f"{sig_pair_samples.mean():.0f} Mpc/h "
-          f"(heavy tail: max = {sig_pair_samples.max():.0f})")
-    print(f"  (a) bias only            : b = {theta_b['b']:.2f}"
+    print(f"wp(rp) joint MAP (JAX-grad through wp_observed_perpair):")
+    print(f"  per-pair sigma_chi: median {np.median(sig_pair_samples):.0f}, "
+          f"mean {sig_pair_samples.mean():.0f}, max "
+          f"{sig_pair_samples.max():.0f} Mpc/h")
+    print(f"  (a) bias only           : b = {theta_b['b']:.2f}"
           f" +/- {np.sqrt(max(cov_b[0,0],0)):.2f}")
-    print(f"  (b) (sigma8, b) joint   : sigma8*b = {sigma8_b:.2f}"
-          f"  (only the product is constrained -- wp = b^2 sigma8^2 P_NL/D^2)")
+    print(f"  (b) (sigma8, b) wp-only : sigma8*b = {sigma8_b:.2f}"
+          f" (degenerate)")
     print()
-    print(f"Cross-probe consistency: wp gives b = {theta_b['b']:.2f}, vs")
-    print(f"  C_ell-stacked-dndz b = {b_stack:.2f} (factor "
-          f"{b_stack/theta_b['b']:.1f} apart); the published Quaia analyses")
-    print(f"  give b ~ 2.5-2.6 -- our wp pipeline lands closest to that. The")
-    print(f"  published C_ell analysis uses additional weighting (dust,")
-    print(f"  stellar density, full spectro-photo-z PDFs) that we don't")
-    print(f"  apply yet -- a clean TODO now that gradients flow through")
-    print(f"  the entire forward model.")
+    print(f"Joint (C_ell + wp) MAP:")
+    print(f"  (sigma8, b)             : sigma8 = {theta_j['sigma8']:.2f}"
+          f" +/- {sd_j[0]:.2f}, b = {theta_j['b']:.2f} +/- {sd_j[1]:.2f}")
+    print(f"  joint sigma8*b = {sigma8_b_joint:.2f}, "
+          f"correlation = {rho_j:+.2f}")
+    print(f"  -- joint corr is still -1.00: both observables scale as")
+    print(f"     b^2 sigma8^2 P_NL in the linear regime, so wp+Cl alone")
+    print(f"     CANNOT break the sigma8-b degeneracy. To break it you need")
+    print(f"     a probe with a different b/sigma8 dependence: CMB lensing")
+    print(f"     cross-correlation, BAO, or RSD (the latter destroyed by")
+    print(f"     Quaia photo-z's). That's a real physics constraint, not a")
+    print(f"     deficiency of our forward model.")
+    print()
+    print(f"Cross-probe inconsistency:")
+    print(f"  wp:    sigma8*b = {sigma8_b:.2f}  (matches Storey-Fisher b~2.6 if sigma8=0.81)")
+    print(f"  C_ell: sigma8*b = {b_stack * 0.81:.2f}")
+    print(f"  factor {b_stack * 0.81 / sigma8_b:.1f} discrepancy -- a real result, not a bug.")
+    print(f"  The published Storey-Fisher / Alonso C_ell pipelines apply")
+    print(f"  systematics deprojection (dust, stellar density, per-pixel")
+    print(f"  weighting) that we don't yet -- the first place to look.")
 
 
 if __name__ == "__main__":

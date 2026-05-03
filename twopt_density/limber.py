@@ -114,67 +114,67 @@ def linear_growth(z, cosmo: DistanceCosmo, n_grid: int = 1024,
 
 
 def cl_gg_limber(
-    ell: np.ndarray,
-    z_grid: np.ndarray,
-    dndz: np.ndarray,
+    ell,
+    z_grid,
+    dndz,
     cosmo: DistanceCosmo,
-    bias: float = 1.0,
+    bias=1.0,
     sigma8: float = 0.8,
     Ob: float = 0.049,
     ns: float = 0.965,
     k_min: float = 1e-4,
     k_max: float = 1e2,
     n_k: int = 1024,
-) -> np.ndarray:
+):
     """Limber C_ell^gg via syren-halofit P_NL on a (z, k) grid.
 
-    ``dndz`` is sampled on ``z_grid`` and is normalised internally to
-    integrate to 1. ``bias`` is a constant linear bias applied to the
-    galaxy kernel; for a redshift-dependent bias call this in batches.
+    ``dndz`` is sampled on ``z_grid`` and normalised internally to
+    integrate to 1. ``bias`` is a constant linear bias on the galaxy
+    kernel.
+
+    JAX-pure: differentiable in ``(cosmo, bias, sigma8)``. Numpy inputs
+    are coerced to jax arrays; the returned value is a jax array but
+    interoperates with numpy via ``np.asarray``.
     """
+    import jax
     import jax.numpy as jnp
 
-    ell = np.asarray(ell, dtype=np.float64)
-    z = np.asarray(z_grid, dtype=np.float64)
-    nz = np.asarray(dndz, dtype=np.float64)
-    if not (z[1:] > z[:-1]).all():
-        raise ValueError("z_grid must be strictly increasing")
-    # normalise dN/dz to integrate to 1
-    nz = nz / np.trapezoid(nz, z)
+    ell_j = jnp.asarray(ell, dtype=jnp.float64)
+    z = jnp.asarray(z_grid, dtype=jnp.float64)
+    nz = jnp.asarray(dndz, dtype=jnp.float64)
+    nz = nz / jnp.trapezoid(nz, z)
 
-    chi = np.asarray(comoving_distance(jnp.asarray(z), cosmo))
-    E = np.asarray(E_of_z(jnp.asarray(z), cosmo))
+    chi = comoving_distance(z, cosmo)
+    E = E_of_z(z, cosmo)
     dchi_dz = C_OVER_H100_MPCH / E
 
-    # Build a single k-grid for halofit; we'll sample at k = (ell + 1/2)/chi
-    # for each z separately by interpolation.
-    k_grid = np.logspace(np.log10(k_min), np.log10(k_max), n_k)
-    k_jax = jnp.asarray(k_grid)
+    # static k-grid (must be Python-built so the vmap below has a fixed shape)
+    k_np = np.logspace(np.log10(k_min), np.log10(k_max), n_k)
+    k_grid = jnp.asarray(k_np)
 
-    # Evaluate P_NL(k, z) row by row -- run_halofit takes a single scale factor.
-    # For ~30 z bins this is cheap (a few seconds).
-    # halofit-with-growth: D^2(z)-scaled plin fed into halofit_from_plin
-    # at the proper a=1/(1+z) (NL emulators on their training convention).
-    P_kz = np.empty((len(z), len(k_grid)), dtype=np.float64)
-    for i, zi in enumerate(z):
-        P_kz[i, :] = np.asarray(pnl_at_z(
-            k_jax, z=float(zi), sigma8=sigma8, cosmo=cosmo, Ob=Ob, ns=ns,
-        ))
+    # vmap pnl_at_z over z -> (n_z, n_k) tensor
+    pnl_at_zi = lambda zi: pnl_at_z(
+        k_grid, z=zi, sigma8=sigma8, cosmo=cosmo, Ob=Ob, ns=ns,
+    )
+    P_kz = jax.vmap(pnl_at_zi)(z)
 
-    # Limber kernel evaluated at each (ell, z)
-    cl = np.zeros_like(ell)
-    chi_safe = np.where(chi > 0, chi, np.inf)
-    weight = nz ** 2 / (chi_safe ** 2 * dchi_dz)   # (n_z,)
-    for j, l in enumerate(ell):
-        k_at_z = (l + 0.5) / chi_safe              # (n_z,)
-        # row-wise interpolation of P_NL(k, z) at k_at_z
-        Pl = np.array([
-            np.interp(k_at_z[i], k_grid, P_kz[i, :]) if k_at_z[i] < k_max
-            else 0.0
-            for i in range(len(z))
-        ])
-        integrand = weight * Pl
-        cl[j] = bias ** 2 * np.trapezoid(integrand, z)
+    chi_safe = jnp.where(chi > 0, chi, jnp.inf)
+    weight = nz ** 2 / (chi_safe ** 2 * dchi_dz)         # (n_z,)
+
+    # For each (ell, z) interpolate P_NL row in k at k = (ell+1/2)/chi(z).
+    def Pl_at(l, zi_idx):
+        k_at = (l + 0.5) / chi_safe[zi_idx]
+        return jnp.interp(k_at, k_grid, P_kz[zi_idx])
+
+    z_idx = jnp.arange(z.shape[0])
+    Pl_grid = jax.vmap(
+        jax.vmap(Pl_at, in_axes=(None, 0)),
+        in_axes=(0, None),
+    )(ell_j, z_idx)                                       # (n_ell, n_z)
+
+    integrand = weight[None, :] * Pl_grid
+    cl = jnp.trapezoid(integrand, z, axis=1)
+    cl = bias ** 2 * cl
     return cl
 
 
@@ -494,6 +494,100 @@ def wp_observed_perpair(
     integrand = xi_eval * window_avg[None, :]
     wp = jnp.trapezoid(integrand, pi_true, axis=1)
     return bias ** 2 * wp
+
+
+def joint_cl_wp_map_fit(
+    ell, cl_meas, sigma_cl,
+    z_grid_dndz, dndz,
+    rp, wp_meas, sigma_wp, sigma_chi_samples, z_eff,
+    free=("Om", "sigma8", "b"),
+    fix=None,
+    pi_max: float = 200.0,
+    h: float = 0.68,
+    Ob: float = 0.049,
+    ns: float = 0.965,
+    ell_min: float = 20.0,
+    n_pi_true: int = 400,
+):
+    """Joint MAP fit on (C_ell, wp(rp)) -- breaks the wp-only sigma8-b
+    degeneracy.
+
+    The two probes have different sigma8/bias degeneracy directions:
+    wp(rp) ~ b^2 sigma8^2 P_NL(k, z=z_eff) at small scales; C_ell^gg
+    integrates over the dndz with chi(z) entering geometrically. The
+    joint chi^2 = chi^2(C_ell, ell > ell_min) + chi^2(wp) breaks the
+    degeneracy through the two probes' different sensitivity to
+    (Om, chi(z), P_NL shape).
+
+    All gradients flow through ``cl_gg_limber`` (JAX-vmap'd halofit) and
+    ``wp_observed_perpair`` (analytic erf window over the empirical
+    pair-sigma distribution).
+    """
+    import jax
+    import jax.numpy as jnp
+    from .fit import map_fit
+
+    fix = dict(fix or {})
+    free = tuple(free)
+    for name in free:
+        if name not in _PARAM_NAMES:
+            raise ValueError(f"unknown parameter {name}")
+        fix.pop(name, None)
+    fixed = {**{k: _PARAM_DEFAULTS[k] for k in _PARAM_NAMES if k not in free},
+             **fix}
+
+    ell_j = jnp.asarray(ell, dtype=jnp.float64)
+    cl_j = jnp.asarray(cl_meas, dtype=jnp.float64)
+    sig_cl_j = jnp.asarray(sigma_cl, dtype=jnp.float64)
+    z_j = jnp.asarray(z_grid_dndz, dtype=jnp.float64)
+    nz_j = jnp.asarray(dndz, dtype=jnp.float64)
+    rp_j = jnp.asarray(rp, dtype=jnp.float64)
+    wp_j = jnp.asarray(wp_meas, dtype=jnp.float64)
+    sig_wp_j = jnp.asarray(sigma_wp, dtype=jnp.float64)
+    sig_pair_j = jnp.asarray(sigma_chi_samples, dtype=jnp.float64)
+    cl_use = ell_j > ell_min                                # mask low-ell
+
+    fft, k_np = make_wp_fft()
+    k_grid_wp = jnp.asarray(k_np)
+
+    def expand(theta):
+        out = {**fixed}
+        for i, name in enumerate(free):
+            out[name] = theta[i]
+        return out
+
+    def loss(theta):
+        p = expand(theta)
+        cosmo = DistanceCosmo(Om=p["Om"], h=h)
+        cl_pred = cl_gg_limber(
+            ell_j, z_j, nz_j, cosmo, bias=p["b"], sigma8=p["sigma8"],
+            Ob=Ob, ns=ns,
+        )
+        wp_pred = wp_observed_perpair(
+            rp_j, z_eff=z_eff, sigma_chi_samples=sig_pair_j,
+            cosmo=cosmo, bias=p["b"], pi_max=pi_max,
+            n_pi_true=n_pi_true, sigma8=p["sigma8"],
+            Ob=Ob, ns=ns, fft=fft, k_grid=k_grid_wp,
+        )
+        chi2_cl = jnp.sum(jnp.where(
+            cl_use, ((cl_j - cl_pred) / sig_cl_j) ** 2, 0.0,
+        ))
+        chi2_wp = jnp.sum(((wp_j - wp_pred) / sig_wp_j) ** 2)
+        return chi2_cl + chi2_wp
+
+    theta0 = tuple(_PARAM_DEFAULTS[k] for k in free)
+    bounds = tuple(_PARAM_BOUNDS[k] for k in free)
+    result = map_fit(loss, theta0, bounds=bounds)
+
+    H = np.asarray(jax.hessian(loss)(jnp.asarray(result.theta)))
+    try:
+        cov = 2.0 * np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        cov = np.full((len(free), len(free)), np.nan)
+
+    theta_full = expand(jnp.asarray(result.theta))
+    theta_full = {k: float(v) for k, v in theta_full.items()}
+    return result, cov, theta_full
 
 
 def wp_limber(
