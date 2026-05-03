@@ -417,6 +417,58 @@ def test_wp_observed_continuous_bz_constant_b_matches_wp_observed():
     np.testing.assert_allclose(wp_c, wp_s, rtol=0.02)
 
 
+def test_wp_continuous_estimator_runs_and_is_jax_evaluable():
+    """End-to-end SF21 build on a tiny clustered catalog. Verify the
+    estimator returns finite wp(rp, z) and that the analytic Chebyshev
+    derivative matches a finite-difference cross-check."""
+    import jax
+    import jax.numpy as jnp
+    from twopt_density.wp_continuous import wp_continuous_estimator
+
+    rng = np.random.default_rng(0)
+    L = 1000.0
+    n_centers = 30
+    centers = rng.uniform(0, L, size=(n_centers, 3))
+    xyz_d = np.vstack([rng.normal(c, 8.0, (200, 3)) for c in centers])
+    xyz_d = np.mod(xyz_d, L).astype(np.float64)
+    xyz_r = rng.uniform(0, L, size=(15000, 3))
+    z_d = rng.uniform(1.4, 1.6, len(xyz_d))
+    z_r = rng.uniform(1.4, 1.6, len(xyz_r))
+
+    est = wp_continuous_estimator(
+        xyz_d, xyz_r, z_d, z_r,
+        rp_min=5.0, rp_max=80.0, z_min=1.4, z_max=1.6,
+        K_rp=4, K_z=2, pi_max=80.0,
+    )
+    # finite wp at multiple (rp, z)
+    for rp in (10.0, 30.0):
+        for z in (1.45, 1.55):
+            v = float(est.wp_eval(rp, z))
+            assert np.isfinite(v)
+
+    # analytic dwp/dz matches jax.grad cross-check
+    rp_test = 20.0; z_test = 1.5
+    analytic = float(est.dwp_dz(rp_test, z_test))
+    g = float(jax.grad(lambda z: est.wp_eval(rp_test, z))(jnp.float64(z_test)))
+    np.testing.assert_allclose(analytic, g, rtol=1e-9, atol=1e-9)
+
+
+def test_wp_continuous_chebyshev_derivative_matches_jax_grad():
+    """Standalone test: ``_cheb_dT_dx_jax`` must agree with
+    ``jax.grad(_cheb_T_jax)`` for K up to 6."""
+    import jax
+    import jax.numpy as jnp
+    from twopt_density.wp_continuous import _cheb_T_jax, _cheb_dT_dx_jax
+
+    for K in (2, 3, 5, 6):
+        for x in (-0.5, 0.0, 0.3, 0.7):
+            analytic = np.asarray(_cheb_dT_dx_jax(jnp.float64(x), K))
+            g = np.asarray(jax.jacobian(
+                lambda y: _cheb_T_jax(y, K)
+            )(jnp.float64(x)))
+            np.testing.assert_allclose(analytic, g, rtol=1e-9, atol=1e-9)
+
+
 def test_wp_kernel_z_reduces_to_uniform_over_full_range():
     """A flat (very wide) Gaussian kernel must reproduce the standard
     z-integrated Landy-Szalay wp -- the kernel weights all z_pair bins
