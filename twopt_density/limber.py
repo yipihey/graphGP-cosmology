@@ -49,8 +49,8 @@ def pnl_at_z(k, z: float, sigma8: float, cosmo: DistanceCosmo,
     """
     import jax.numpy as jnp
 
-    a_z = 1.0 / (1.0 + float(z))
-    D = float(linear_growth(np.array([z]), cosmo)[0])
+    a_z = 1.0 / (1.0 + jnp.asarray(z, dtype=jnp.float64))
+    D = linear_growth(jnp.asarray([z], dtype=jnp.float64), cosmo)[0]
     plin0 = plin_emulated(k, sigma8, cosmo.Om, Ob, cosmo.h, ns, a=1.0)
     plin_z = (D ** 2) * plin0
     return halofit_from_plin(
@@ -59,28 +59,58 @@ def pnl_at_z(k, z: float, sigma8: float, cosmo: DistanceCosmo,
     )
 
 
+def dndz_pdf_stack(
+    z_grid: np.ndarray,
+    z_obs: np.ndarray,
+    sigma_z: np.ndarray,
+    sigma_z_floor: float = 1e-3,
+) -> np.ndarray:
+    """Photo-z PDF-stacked dN/dz on ``z_grid``.
+
+    Each object contributes a Gaussian ``N(z_obs_i, sigma_z_i^2)``
+    instead of a delta at its point estimate. The output is summed over
+    all objects (un-normalised; the Limber kernel renormalises).
+
+    For Quaia this should be the published spectro-photometric PDFs;
+    until those are loaded we approximate each PDF as a Gaussian with
+    width ``redshift_quaia_err``. ``sigma_z_floor`` clamps the kernel
+    width to avoid 0/0 when a few objects have zero error.
+    """
+    z_obs = np.asarray(z_obs, dtype=np.float64)
+    sig = np.maximum(np.asarray(sigma_z, dtype=np.float64), sigma_z_floor)
+    # vectorised Gaussian sum, summed in O(N_obj * N_z)
+    dz = z_grid[:, None] - z_obs[None, :]                  # (N_z, N_obj)
+    pdfs = np.exp(-0.5 * (dz / sig[None, :]) ** 2) / (np.sqrt(2 * np.pi) * sig[None, :])
+    return pdfs.sum(axis=1)                                # (N_z,)
+
+
 def linear_growth(z, cosmo: DistanceCosmo, n_grid: int = 1024,
-                   z_max_table: float = 100.0) -> np.ndarray:
+                   z_max_table: float = 100.0):
     """Normalised linear growth D(z)/D(0) for a flat (w0, wa) cosmology.
 
     Solves the integral form D(a) ∝ H(a) ∫_0^a da' / [a' H(a')]^3
     on a tabulated a-grid and divides by D(a=1).
+
+    JAX-pure: differentiable in ``cosmo`` and accepts traced ``z``.
     """
     import jax.numpy as jnp
-    a = 1.0 / (1.0 + z_max_table)
-    a_grid = np.linspace(a, 1.0, n_grid)
+    a_min = 1.0 / (1.0 + z_max_table)
+    a_grid = jnp.linspace(a_min, 1.0, n_grid)
     z_grid = 1.0 / a_grid - 1.0
-    E = np.asarray(E_of_z(jnp.asarray(z_grid), cosmo))
+    E = E_of_z(z_grid, cosmo)
     integrand = 1.0 / (a_grid * E) ** 3
-    cum = np.concatenate([[0.0], np.cumsum(
-        0.5 * (integrand[:-1] + integrand[1:]) * np.diff(a_grid)
-    )])
+    da = a_grid[1] - a_grid[0]
+    cum = jnp.concatenate([
+        jnp.zeros(1),
+        jnp.cumsum(0.5 * (integrand[:-1] + integrand[1:]) * da),
+    ])
     D_unnorm = E * cum
-    D_today = float(D_unnorm[-1])
+    D_today = D_unnorm[-1]
     D = D_unnorm / D_today
-    z_arr = np.atleast_1d(np.asarray(z, dtype=np.float64))
+    z_arr = jnp.atleast_1d(jnp.asarray(z, dtype=jnp.float64))
     a_q = 1.0 / (1.0 + z_arr)
-    return np.interp(a_q, a_grid, D)
+    # interp expects increasing xp -> a_grid is increasing
+    return jnp.interp(a_q, a_grid, D)
 
 
 def cl_gg_limber(
@@ -168,6 +198,93 @@ def xi_real_at_z(
     fft = FFTLogP2xi(k, l=0)
     s_jax = jnp.asarray(np.asarray(s, dtype=np.float64))
     return np.asarray(xi_from_Pk_fftlog(s_jax, fft, P), dtype=np.float64)
+
+
+def sigma_chi_from_sigma_z(z_obs: np.ndarray, sigma_z: np.ndarray,
+                            cosmo: DistanceCosmo) -> np.ndarray:
+    """Per-object comoving LOS error sigma_chi = (dchi/dz) * sigma_z."""
+    import jax.numpy as jnp
+    z_jax = jnp.asarray(z_obs, dtype=np.float64)
+    E = np.asarray(E_of_z(z_jax, cosmo))
+    dchi_dz = C_OVER_H100_MPCH / E
+    return dchi_dz * np.asarray(sigma_z, dtype=np.float64)
+
+
+def wp_observed(
+    rp,
+    z_eff: float,
+    sigma_chi_eff,
+    cosmo: DistanceCosmo,
+    bias=1.0,
+    pi_max: float = 200.0,
+    pi_int_range: float = 800.0,
+    n_pi_true: int = 400,
+    sigma8: float = 0.8,
+    Ob: float = 0.049,
+    ns: float = 0.965,
+    k_min: float = 1e-4,
+    k_max: float = 1e2,
+    n_k: int = 4096,
+):
+    """JAX-differentiable photo-z-aware projected correlation wp_obs(rp).
+
+    Forward model for the observed wp(rp) accounting for per-pair
+    Gaussian photo-z scatter:
+
+        xi_obs(rp, pi_obs) = int dpi_true xi_real(sqrt(rp^2 + pi_true^2))
+                              * G(pi_obs - pi_true; sigma_pair)
+        wp_obs(rp; pi_max) = int_{-pi_max}^{pi_max} xi_obs(rp, pi_obs) dpi_obs
+
+    Switching the order of integration gives a single 1D integral over
+    pi_true with an analytic erf window:
+
+        wp_obs(rp) = int dpi_true xi_real(...) * (1/2)
+            * [erf((pi_max - pi_true) / (sigma_pair sqrt(2)))
+             + erf((pi_max + pi_true) / (sigma_pair sqrt(2)))]
+
+    where ``sigma_chi_eff`` is the effective per-pair LOS sigma:
+    ``sqrt(2) * <sigma_chi>`` for an auto-correlation. This function is
+    fully JAX-differentiable in ``(bias, sigma_chi_eff, cosmo)`` --
+    ``cosmo`` enters via ``pnl_at_z`` (P_NL(k, z) -> xi_real(s) FFTLog).
+
+    The deterministic ``wp_limber`` (real-space, no photo-z kernel) is
+    recovered in the limit ``sigma_chi_eff -> 0`` and ``pi_max -> inf``.
+    """
+    import jax.numpy as jnp
+    from jax.scipy.special import erf
+    from .spectra import FFTLogP2xi, make_log_k_grid, xi_from_Pk_fftlog
+
+    rp = jnp.atleast_1d(jnp.asarray(rp, dtype=jnp.float64))
+    sigma = jnp.asarray(sigma_chi_eff, dtype=jnp.float64)
+    bias = jnp.asarray(bias, dtype=jnp.float64)
+    sigma_safe = jnp.maximum(sigma, 1e-8)
+
+    # 1) xi_real(s, z_eff) via FFTLog of P_NL(k, z_eff).
+    k = make_log_k_grid(k_min, k_max, n_k)
+    P = pnl_at_z(k, z=z_eff, sigma8=sigma8, cosmo=cosmo, Ob=Ob, ns=ns)
+    fft = FFTLogP2xi(k, l=0)
+    # xi_real evaluated on a dense s-grid spanning the static integration
+    # range. ``pi_int_range`` should be >> sqrt(pi_max^2 + (5*sigma_chi)^2)
+    # so the erf window has decayed at the boundary; default 800 Mpc/h
+    # covers Quaia (sigma_chi <~ 200 Mpc/h, pi_max <~ 200 Mpc/h).
+    rp_max = float(jnp.max(rp))
+    s_max = float(jnp.sqrt(rp_max ** 2 + pi_int_range ** 2) + 1.0)
+    s_grid = jnp.geomspace(0.5, s_max, 2048)
+    xi_grid = xi_from_Pk_fftlog(s_grid, fft, P)
+
+    # 2) integrate over pi_true with the erf window.
+    pi_true = jnp.linspace(-pi_int_range, pi_int_range, n_pi_true)
+    s_eval = jnp.sqrt(rp[:, None] ** 2 + pi_true[None, :] ** 2)   # (n_rp, n_pi)
+    xi_eval = jnp.interp(s_eval.ravel(), s_grid, xi_grid).reshape(s_eval.shape)
+
+    sigma_sqrt2 = sigma_safe * jnp.sqrt(2.0)
+    window = 0.5 * (
+        erf((pi_max - pi_true) / sigma_sqrt2)
+        + erf((pi_max + pi_true) / sigma_sqrt2)
+    )                                                              # (n_pi,)
+    integrand = xi_eval * window[None, :]
+    wp = jnp.trapezoid(integrand, pi_true, axis=1)
+    return bias ** 2 * wp
 
 
 def wp_limber(

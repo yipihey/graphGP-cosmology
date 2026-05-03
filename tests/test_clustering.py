@@ -105,6 +105,90 @@ def test_cl_gg_limber_matches_pyccl():
     np.testing.assert_allclose(cl_mine, cl_ccl, rtol=0.03)
 
 
+def test_dndz_pdf_stack_normalised_and_smooth():
+    """Stacked dN/dz on objects with one identical photo-z and width
+    must be a Gaussian centred on that z."""
+    from twopt_density.limber import dndz_pdf_stack
+
+    z_grid = np.linspace(0.0, 4.0, 400)
+    z_obs = np.full(1000, 1.4)
+    sigma_z = np.full(1000, 0.1)
+    dndz = dndz_pdf_stack(z_grid, z_obs, sigma_z)
+    # Normalise
+    dndz = dndz / np.trapezoid(dndz, z_grid)
+    expected = (1 / (np.sqrt(2 * np.pi) * 0.1)
+                * np.exp(-0.5 * ((z_grid - 1.4) / 0.1) ** 2))
+    np.testing.assert_allclose(dndz, expected, atol=1e-3)
+
+
+def test_wp_observed_recovers_wp_limber_when_sigma_zero():
+    """In the (sigma_chi -> 0, pi_max -> inf) limit, wp_observed must
+    reduce to the deterministic real-space wp_limber."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import wp_limber, wp_observed
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    rp = jnp.array([5.0, 10.0, 20.0, 50.0])
+    wp_obs = np.asarray(wp_observed(
+        rp, z_eff=1.5, sigma_chi_eff=1e-6, cosmo=cosmo, bias=2.6,
+        pi_max=400.0, n_pi_true=400,
+    ))
+    wp_real = wp_limber(np.asarray(rp), z_eff=1.5, cosmo=cosmo, bias=2.6,
+                        pi_max=400.0, n_pi=400)
+    np.testing.assert_allclose(wp_obs, wp_real, rtol=2e-3)
+
+
+def test_wp_observed_is_differentiable_in_cosmo_bias_sigma():
+    """Gradients of a wp_observed-derived loss wrt (Om, b, sigma_chi)
+    must all be finite -- the whole forward model is JAX-pure."""
+    import jax
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import wp_observed
+
+    rp = jnp.array([10.0, 30.0])
+    z_eff = 1.5
+    pi_max = 200.0
+
+    def loss_om(Om):
+        c = DistanceCosmo(Om=Om, h=0.68)
+        return jnp.sum(wp_observed(rp, z_eff=z_eff, sigma_chi_eff=120.0,
+                                    cosmo=c, bias=2.6, pi_max=pi_max) ** 2)
+    g_om = jax.grad(loss_om)(jnp.float64(0.31))
+    assert jnp.isfinite(g_om) and abs(g_om) > 0
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    def loss_b(b):
+        return jnp.sum(wp_observed(rp, z_eff=z_eff, sigma_chi_eff=120.0,
+                                    cosmo=cosmo, bias=b, pi_max=pi_max) ** 2)
+    g_b = jax.grad(loss_b)(jnp.float64(2.6))
+    assert jnp.isfinite(g_b) and abs(g_b) > 0
+
+    def loss_sig(sig):
+        return jnp.sum(wp_observed(rp, z_eff=z_eff, sigma_chi_eff=sig,
+                                    cosmo=cosmo, bias=2.6, pi_max=pi_max) ** 2)
+    g_sig = jax.grad(loss_sig)(jnp.float64(120.0))
+    assert jnp.isfinite(g_sig) and abs(g_sig) > 0
+
+
+def test_sigma_chi_from_sigma_z_matches_dchi_dz():
+    """sigma_chi = (c/H_0/E(z)) * sigma_z."""
+    import jax.numpy as jnp
+    from twopt_density.distance import (
+        C_OVER_H100_MPCH, DistanceCosmo, E_of_z,
+    )
+    from twopt_density.limber import sigma_chi_from_sigma_z
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    z = np.array([0.5, 1.0, 1.5, 2.0])
+    sigma_z = np.full_like(z, 0.05)
+    sig_chi = sigma_chi_from_sigma_z(z, sigma_z, cosmo)
+    E = np.asarray(E_of_z(jnp.asarray(z), cosmo))
+    expected = C_OVER_H100_MPCH / E * 0.05
+    np.testing.assert_allclose(sig_chi, expected, rtol=1e-12)
+
+
 def test_wp_landy_szalay_isotropic_recovers_zero_clustering():
     """Random-on-random vs random-on-random gives wp ~ 0 within Poisson."""
     from twopt_density.projected_xi import wp_landy_szalay

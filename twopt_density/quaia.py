@@ -77,6 +77,12 @@ class QuaiaCatalog:
 
     fid_cosmo: DistanceCosmo
 
+    # per-object photo-z 1-sigma error (absolute units, dz). For Quaia this
+    # is the published ``redshift_quaia_err`` column; it propagates through
+    # the differentiable photo-z-aware forward model in ``limber.py``.
+    # Optional: ``None`` for catalogues without error estimates (mocks etc.).
+    z_data_err: Optional[np.ndarray] = None
+
     @property
     def N_data(self) -> int:
         return len(self.ra_data)
@@ -230,7 +236,7 @@ def make_mock_quaia(
     return QuaiaCatalog(
         ra_data=ra_d, dec_data=dec_d, z_data=z_d, xyz_data=xyz_d,
         ra_random=ra_r, dec_random=dec_r, z_random=z_r, xyz_random=xyz_r,
-        fid_cosmo=fid_cosmo,
+        fid_cosmo=fid_cosmo,        # mock: no per-object photo-z error
     )
 
 
@@ -359,6 +365,7 @@ def load_quaia(
     ra_key: str = "ra",
     dec_key: str = "dec",
     z_key: str = "redshift_quaia",
+    z_err_key: str = "redshift_quaia_err",
     random_z_strategy: str = "sample_from_data",
     rng_seed: int = 0,
 ) -> QuaiaCatalog:
@@ -403,6 +410,10 @@ def load_quaia(
     ra_d = np.asarray(cat[ra_key], dtype=np.float64)
     dec_d = np.asarray(cat[dec_key], dtype=np.float64)
     z_d = np.asarray(cat[z_key], dtype=np.float64)
+    z_d_err = (
+        np.asarray(cat[z_err_key], dtype=np.float64)
+        if z_err_key in cat.colnames else None
+    )
 
     rng = np.random.default_rng(rng_seed)
 
@@ -436,5 +447,5 @@ def load_quaia(
     return QuaiaCatalog(
         ra_data=ra_d, dec_data=dec_d, z_data=z_d, xyz_data=xyz_d,
         ra_random=ra_r, dec_random=dec_r, z_random=z_r, xyz_random=xyz_r,
-        fid_cosmo=fid_cosmo,
+        fid_cosmo=fid_cosmo, z_data_err=z_d_err,
     )
