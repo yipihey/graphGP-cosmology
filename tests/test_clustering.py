@@ -344,6 +344,79 @@ def test_joint_cl_wp_map_fit_runs_and_returns_finite_covariance():
                                 truth_s8 * truth_b, rtol=0.05)
 
 
+def test_fit_bz_powerlaw_recovers_truth_on_synthetic_per_bin_data():
+    """fit_bz_powerlaw on N synthetic per-bin wp measurements at known
+    truth b(z) = b0 ((1+z)/(1+z_pivot))^alpha must recover (b0, alpha)
+    within the joint covariance."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import (
+        fit_bz_powerlaw, make_wp_fft, sigma_chi_from_sigma_z, wp_observed,
+    )
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    fft, k_np = make_wp_fft()
+    k_grid = jnp.asarray(k_np)
+    sigma8 = 0.81
+    truth_b0, truth_alpha, z_pivot = 2.0, 1.5, 1.5
+    b_true = lambda z: truth_b0 * ((1 + z) / (1 + z_pivot)) ** truth_alpha
+
+    per_bin = []
+    for z_eff in (1.0, 1.4, 1.8, 2.2):
+        b_z = b_true(z_eff)
+        sigma_chi = float(np.sqrt(2) * np.asarray(sigma_chi_from_sigma_z(
+            np.array([z_eff]), np.array([0.04 * (1 + z_eff)]), cosmo,
+        ))[0])
+        rp = np.logspace(np.log10(10), np.log10(50), 8)
+        wp_truth = np.asarray(wp_observed(
+            jnp.asarray(rp), z_eff=z_eff, sigma_chi_eff=sigma_chi,
+            cosmo=cosmo, bias=b_z, sigma8=sigma8, pi_max=200.0,
+            fft=fft, k_grid=k_grid,
+        ))
+        sigma_wp = 0.07 * np.maximum(np.abs(wp_truth), 0.05)
+        rng = np.random.default_rng(int(z_eff * 100))
+        wp = wp_truth + rng.normal(0, sigma_wp)
+        per_bin.append({"z_eff": z_eff, "sigma_chi_eff": sigma_chi,
+                        "rp": rp, "wp": wp, "sigma_wp": sigma_wp})
+
+    res, cov, b_of_z, (b0_f, alpha_f) = fit_bz_powerlaw(
+        per_bin, cosmo=cosmo, sigma8=sigma8, z_pivot=z_pivot,
+        theta0=(2.0, 0.0),
+    )
+    assert res.success
+    sd_b0 = float(np.sqrt(max(cov[0, 0], 0.0)))
+    sd_a = float(np.sqrt(max(cov[1, 1], 0.0)))
+    assert abs(b0_f - truth_b0) < 5.0 * max(sd_b0, 0.05)
+    assert abs(alpha_f - truth_alpha) < 5.0 * max(sd_a, 0.05)
+
+
+def test_wp_observed_continuous_bz_constant_b_matches_wp_observed():
+    """With constant b(z) and a delta-like dndz, wp_observed_continuous_bz
+    must reduce to wp_observed at that single z."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import (
+        make_wp_fft, wp_observed, wp_observed_continuous_bz,
+    )
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    fft, k_np = make_wp_fft()
+    k_grid = jnp.asarray(k_np)
+    z = np.linspace(1.4, 1.5, 30)              # very narrow z-window
+    nz = np.exp(-0.5 * ((z - 1.45) / 0.005) ** 2)  # delta-like
+    rp = jnp.array([10.0, 20.0])
+    b_const = 2.6
+    wp_c = np.asarray(wp_observed_continuous_bz(
+        rp, z, nz, jnp.full(z.shape, b_const), sigma_chi_eff=160.0,
+        cosmo=cosmo, pi_max=200.0, fft=fft, k_grid=k_grid,
+    ))
+    wp_s = np.asarray(wp_observed(
+        rp, z_eff=1.45, sigma_chi_eff=160.0, cosmo=cosmo, bias=b_const,
+        pi_max=200.0, fft=fft, k_grid=k_grid,
+    ))
+    np.testing.assert_allclose(wp_c, wp_s, rtol=0.02)
+
+
 def test_wp_landy_szalay_isotropic_recovers_zero_clustering():
     """Random-on-random vs random-on-random gives wp ~ 0 within Poisson."""
     from twopt_density.projected_xi import wp_landy_szalay

@@ -309,7 +309,7 @@ def wp_observed(
 
 _PARAM_NAMES = ("Om", "sigma8", "b")
 _PARAM_DEFAULTS = {"Om": 0.31, "sigma8": 0.81, "b": 2.6}
-_PARAM_BOUNDS = {"Om": (0.15, 0.55), "sigma8": (0.5, 1.1), "b": (0.3, 6.0)}
+_PARAM_BOUNDS = {"Om": (0.15, 0.55), "sigma8": (0.5, 1.1), "b": (0.05, 6.0)}
 
 
 def wp_map_fit(
@@ -588,6 +588,152 @@ def joint_cl_wp_map_fit(
     theta_full = expand(jnp.asarray(result.theta))
     theta_full = {k: float(v) for k, v in theta_full.items()}
     return result, cov, theta_full
+
+
+def wp_observed_continuous_bz(
+    rp,
+    z_grid,
+    dndz,
+    b_z,
+    sigma_chi_eff,
+    cosmo: DistanceCosmo,
+    pi_max: float = 200.0,
+    pi_int_range: float = 800.0,
+    n_pi_true: int = 400,
+    sigma8: float = 0.8,
+    Ob: float = 0.049,
+    ns: float = 0.965,
+    fft=None,
+    k_grid=None,
+):
+    """Photo-z-aware wp(rp) prediction with a *continuous b(z)*.
+
+    For an auto-correlation, pairs are dominated by galaxies near the
+    same z (the cross-z pair contribution is suppressed by the small
+    angular-correlation cross-section at large LOS separations). So the
+    effective wp is weighted by the *pair* redshift distribution
+    p_pair(z) ~ [n(z)]^2 b(z)^2:
+
+        wp_pred(rp) = int dz [n(z)]^2 b(z)^2 wp_real_kernel(rp; z, sigma_chi)
+                     / int dz [n(z)]^2
+
+    JAX-pure -- gradients flow through (cosmo, b_z, sigma_chi_eff,
+    sigma8). Use ``jax.vmap`` internally to evaluate ``wp_observed`` at
+    each z without a Python loop. ``b_z`` is an array on ``z_grid``;
+    a parametric model b(z) can be evaluated externally and passed in.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    rp_j = jnp.atleast_1d(jnp.asarray(rp, dtype=jnp.float64))
+    z = jnp.asarray(z_grid, dtype=jnp.float64)
+    nz = jnp.asarray(dndz, dtype=jnp.float64)
+    b_z = jnp.asarray(b_z, dtype=jnp.float64)
+    nz = nz / jnp.trapezoid(nz, z)
+
+    if fft is None or k_grid is None:
+        fft, k_np = make_wp_fft()
+        k_grid = jnp.asarray(k_np)
+
+    def wp_at_z(zi):
+        # wp_observed at b=1 for this z; gradients flow through cosmo.
+        return wp_observed(
+            rp_j, z_eff=zi, sigma_chi_eff=sigma_chi_eff, cosmo=cosmo,
+            bias=1.0, pi_max=pi_max, pi_int_range=pi_int_range,
+            n_pi_true=n_pi_true, sigma8=sigma8, Ob=Ob, ns=ns,
+            fft=fft, k_grid=k_grid,
+        )
+
+    wp_grid = jax.vmap(wp_at_z)(z)              # (n_z, n_rp)
+
+    weight = nz ** 2 * b_z ** 2                 # (n_z,)
+    integrand = weight[:, None] * wp_grid       # (n_z, n_rp)
+    norm = jnp.trapezoid(nz ** 2, z)            # normalised so b=const
+                                                # recovers single-z wp at z_eff
+    return jnp.trapezoid(integrand, z, axis=0) / norm
+
+
+def fit_bz_powerlaw(
+    per_bin_data,
+    cosmo: DistanceCosmo,
+    sigma8: float = 0.81,
+    pi_max: float = 200.0,
+    Ob: float = 0.049,
+    ns: float = 0.965,
+    n_pi_true: int = 400,
+    theta0=(2.0, 1.0),
+    bounds=((0.3, 8.0), (-3.0, 5.0)),
+    z_pivot: float = 1.5,
+):
+    """JAX-MAP joint fit of b(z) = b0 * ((1+z)/(1+z_pivot))^alpha across
+    multiple per-z-bin wp(rp) measurements.
+
+    A *single* wp(rp) measurement only constrains the n(z)^2 b^2-weighted
+    effective bias (one number) -- the rp shape is z-independent at our
+    SNR, so it carries no b(z)-shape info. With multiple z-bins each
+    binned wp probes b at a different z_eff, and a parametric b(z)
+    couples them: 2 parameters fit against N_bin*N_rp constraints.
+
+    Parameters
+    ----------
+    per_bin_data : list of dicts, each with keys
+        ``{z_eff, sigma_chi_eff, rp, wp, sigma_wp}``
+        (rp/wp/sigma_wp are 1-D arrays; only entries with sigma_wp > 0
+        contribute to the chi^2).
+
+    Returns
+    -------
+    result, cov, b_of_z, (b0_fit, alpha_fit)
+    """
+    import jax
+    import jax.numpy as jnp
+    from .fit import map_fit
+
+    fft, k_np = make_wp_fft()
+    k_grid = jnp.asarray(k_np)
+
+    # pre-stack per-bin tensors
+    bins = []
+    for d in per_bin_data:
+        bins.append({
+            "z_eff": float(d["z_eff"]),
+            "sigma_chi_eff": float(d["sigma_chi_eff"]),
+            "rp": jnp.asarray(d["rp"], dtype=jnp.float64),
+            "wp": jnp.asarray(d["wp"], dtype=jnp.float64),
+            "sigma_wp": jnp.asarray(d["sigma_wp"], dtype=jnp.float64),
+        })
+
+    def b_of_z_jax(z, b0, alpha):
+        return b0 * ((1.0 + z) / (1.0 + z_pivot)) ** alpha
+
+    def loss(theta):
+        b0, alpha = theta[0], theta[1]
+        chi2 = jnp.float64(0.0)
+        for b in bins:
+            b_z = b_of_z_jax(b["z_eff"], b0, alpha)
+            wp_pred = wp_observed(
+                b["rp"], z_eff=b["z_eff"],
+                sigma_chi_eff=b["sigma_chi_eff"], cosmo=cosmo,
+                bias=b_z, pi_max=pi_max, n_pi_true=n_pi_true,
+                sigma8=sigma8, Ob=Ob, ns=ns, fft=fft, k_grid=k_grid,
+            )
+            chi2 = chi2 + jnp.sum(((b["wp"] - wp_pred) / b["sigma_wp"]) ** 2)
+        return chi2
+
+    result = map_fit(loss, theta0, bounds=bounds)
+    H = np.asarray(jax.hessian(loss)(jnp.asarray(result.theta)))
+    try:
+        cov = 2.0 * np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        cov = np.full((2, 2), np.nan)
+
+    b0_fit, alpha_fit = float(result.theta[0]), float(result.theta[1])
+
+    def b_of_z_eval(z, b0=b0_fit, alpha=alpha_fit):
+        z = np.asarray(z, dtype=np.float64)
+        return b0 * ((1.0 + z) / (1.0 + z_pivot)) ** alpha
+
+    return result, cov, b_of_z_eval, (b0_fit, alpha_fit)
 
 
 def wp_limber(
