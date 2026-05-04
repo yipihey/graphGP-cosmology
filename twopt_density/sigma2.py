@@ -229,6 +229,164 @@ def sigma2_shell_from_xi(
     return float(np.trapezoid(4.0 * np.pi * r ** 2 * xi * K, r))
 
 
+# ----------------------------------------------------------------------
+#  JAX-pure forward model: sigma^2(R, z, cosmo, b, sigma_8) and
+#  dsigma^2/dR from the syren-halofit P_NL(k, z) via Fourier
+#  representation of the top-hat sphere window.
+# ----------------------------------------------------------------------
+
+
+def _W_TH_kR(kR):
+    """Fourier transform of the 3D top-hat sphere window of radius R,
+    evaluated at ``x = k R``::
+
+        W_TH(x) = 3 (sin x - x cos x) / x^3.
+
+    Returns ``W_TH(kR)``; the small-x limit is taped via Taylor:
+    ``W_TH(x) -> 1 - x^2/10 + x^4/280`` for ``x -> 0``. JAX-safe.
+    """
+    import jax.numpy as jnp
+
+    x = jnp.asarray(kR, dtype=jnp.float64)
+    eps = 1e-3
+    safe = jnp.where(jnp.abs(x) > eps, x, jnp.where(x >= 0, eps, -eps))
+    big = 3.0 * (jnp.sin(safe) - safe * jnp.cos(safe)) / (safe ** 3)
+    small = 1.0 - x ** 2 / 10.0 + (x ** 4) / 280.0
+    return jnp.where(jnp.abs(x) > eps, big, small)
+
+
+def _dW_TH_kR_dR(k, R):
+    """Derivative of the top-hat window w.r.t. R, evaluated at
+    ``(k, R)``. Useful for ``d sigma^2 / d R``::
+
+        d/dR [W_TH(kR)] = 3/(kR)^3 [3 kR cos(kR)
+                                    + ((kR)^2 - 3) sin(kR)] * k
+    """
+    import jax.numpy as jnp
+
+    kj = jnp.asarray(k, dtype=jnp.float64)
+    x = kj * R
+    eps = 1e-3
+    safe = jnp.where(jnp.abs(x) > eps, x, eps)
+    # d/dx W_TH(x) = (9 cos x - 9 x sin x - 9 cos x + 3 x sin x) / x^4
+    #              = 3 (3 sin x - 3 cos x / x) ... let me derive directly:
+    # W_TH(x) = 3 (sin x - x cos x) / x^3
+    # dW/dx   = [3 cos x dx + 3 x sin x dx - 3 cos x dx] / x^3
+    #             - 9 (sin x - x cos x) / x^4
+    #         = 3 x sin x / x^3 - 9 (sin x - x cos x) / x^4
+    #         = (3 sin x) / x^2 - 9 sin x / x^4 + 9 cos x / x^3
+    big = (3.0 * jnp.sin(safe) / safe ** 2
+             - 9.0 * jnp.sin(safe) / safe ** 4
+             + 9.0 * jnp.cos(safe) / safe ** 3)
+    small = -x / 5.0 + x ** 3 / 70.0
+    dW_dx = jnp.where(jnp.abs(x) > eps, big, small)
+    return dW_dx * kj
+
+
+def sigma2_predicted(
+    R, z_eff: float, cosmo, bias: float = 1.0, sigma8: float = 0.81,
+    Ob: float = 0.049, ns: float = 0.965,
+    k_min: float = 1e-4, k_max: float = 1e2, n_k: int = 4096,
+    nowiggle: bool = False,
+):
+    """JAX-pure sigma^2(R, z, cosmo, bias, sigma_8) from the syren-halofit
+    P_NL(k, z) via the standard Fourier-space form::
+
+        sigma^2(R) = (b^2 / (2 pi^2))  int dk  k^2  W_TH^2(kR)  P_NL(k, z).
+
+    Uses ``twopt_density.limber.pnl_at_z`` (full-baryon halofit) by
+    default; set ``nowiggle=True`` to use the EH zero-baryon
+    ``pnl_at_z_nowiggle`` for BAO-template construction.
+
+    Differentiable in ``(cosmo, bias, sigma8)``.
+
+    Returns
+    -------
+    s2 : (n_R,) jax array of sigma^2 values.
+    """
+    import jax.numpy as jnp
+    from .limber import pnl_at_z, pnl_at_z_nowiggle
+
+    R_arr = jnp.atleast_1d(jnp.asarray(R, dtype=jnp.float64))
+    k_np = np.logspace(np.log10(k_min), np.log10(k_max), n_k)
+    k_grid = jnp.asarray(k_np)
+    if nowiggle:
+        Pk = pnl_at_z_nowiggle(k_grid, z=z_eff, sigma8=sigma8,
+                                  cosmo=cosmo, Ob=Ob, ns=ns)
+    else:
+        Pk = pnl_at_z(k_grid, z=z_eff, sigma8=sigma8,
+                        cosmo=cosmo, Ob=Ob, ns=ns)
+    # vector form: integrand_{R,k} = k^2 W_TH^2(kR) P(k); trapezoid in k
+    kR = k_grid[None, :] * R_arr[:, None]
+    W = _W_TH_kR(kR)
+    integrand = (k_grid[None, :] ** 2) * (W ** 2) * Pk[None, :]
+    s2 = (bias ** 2) / (2.0 * jnp.pi ** 2) * jnp.trapezoid(
+        integrand, k_grid, axis=1
+    )
+    return s2
+
+
+def dsigma2_dR_predicted(
+    R, z_eff: float, cosmo, bias: float = 1.0, sigma8: float = 0.81,
+    Ob: float = 0.049, ns: float = 0.965,
+    k_min: float = 1e-4, k_max: float = 1e2, n_k: int = 4096,
+    nowiggle: bool = False,
+):
+    """JAX-pure ``d sigma^2 / dR`` from the same Fourier form::
+
+        d sigma^2 / dR = (b^2 / pi^2)  int dk  k^2  W_TH(kR) (dW_TH/dR)
+                                          P_NL(k, z).
+
+    Differentiable in ``(cosmo, bias, sigma8)`` and returns the
+    *exact* derivative of ``sigma2_predicted``.
+    """
+    import jax.numpy as jnp
+    from .limber import pnl_at_z, pnl_at_z_nowiggle
+
+    R_arr = jnp.atleast_1d(jnp.asarray(R, dtype=jnp.float64))
+    k_np = np.logspace(np.log10(k_min), np.log10(k_max), n_k)
+    k_grid = jnp.asarray(k_np)
+    if nowiggle:
+        Pk = pnl_at_z_nowiggle(k_grid, z=z_eff, sigma8=sigma8,
+                                  cosmo=cosmo, Ob=Ob, ns=ns)
+    else:
+        Pk = pnl_at_z(k_grid, z=z_eff, sigma8=sigma8,
+                        cosmo=cosmo, Ob=Ob, ns=ns)
+    kR = k_grid[None, :] * R_arr[:, None]
+    W = _W_TH_kR(kR)
+    dW = _dW_TH_kR_dR(k_grid[None, :], R_arr[:, None])
+    integrand = (k_grid[None, :] ** 2) * (2.0 * W * dW) * Pk[None, :]
+    out = (bias ** 2) / (2.0 * jnp.pi ** 2) * jnp.trapezoid(
+        integrand, k_grid, axis=1
+    )
+    return out
+
+
+def sigma2_bao_template(
+    R_grid, z_eff: float, cosmo, bias: float = 1.0, sigma8: float = 0.81,
+    Ob: float = 0.049, ns: float = 0.965,
+    derivative: bool = False, alpha: float = 1.0,
+    k_min: float = 1e-4, k_max: float = 1e2, n_k: int = 4096,
+):
+    """BAO template ``T(R) = sigma^2_full(R/alpha) - sigma^2_nowiggle(R/alpha)``,
+    optionally for ``d sigma^2 / dR`` rather than ``sigma^2``.
+
+    Returns a numpy array (jax-array materialised to host) of shape
+    ``(n_R,)`` ready for the matched filter.
+    """
+    import jax.numpy as jnp
+
+    R_alpha = jnp.asarray(R_grid, dtype=jnp.float64) / float(alpha)
+    fn = dsigma2_dR_predicted if derivative else sigma2_predicted
+    s_full = fn(R_alpha, z_eff=z_eff, cosmo=cosmo, bias=bias,
+                  sigma8=sigma8, Ob=Ob, ns=ns,
+                  k_min=k_min, k_max=k_max, n_k=n_k, nowiggle=False)
+    s_smooth = fn(R_alpha, z_eff=z_eff, cosmo=cosmo, bias=bias,
+                    sigma8=sigma8, Ob=Ob, ns=ns,
+                    k_min=k_min, k_max=k_max, n_k=n_k, nowiggle=True)
+    return np.asarray(s_full - s_smooth, dtype=np.float64)
+
+
 def sigma2_from_xi(
     r_grid: np.ndarray, xi: np.ndarray,
     R_grid: np.ndarray, kernel: str = "tophat",

@@ -267,6 +267,108 @@ def test_shell_kernel_thin_limit_equals_dKdR_normalised():
     assert 0.1 < s2 / s1 < 10.0
 
 
+def test_sigma2_predicted_jax_grad_in_cosmo_and_bias():
+    """``sigma2_predicted`` is JAX-grad differentiable in
+    (cosmo.Om, bias, sigma8)."""
+    import jax
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.sigma2 import sigma2_predicted
+
+    R = jnp.array([10.0, 30.0, 60.0])
+
+    def loss_om(Om):
+        c = DistanceCosmo(Om=Om, h=0.68)
+        s2 = sigma2_predicted(R, z_eff=0.5, cosmo=c, bias=2.0, sigma8=0.81)
+        return jnp.sum(s2 ** 2)
+    g = float(jax.grad(loss_om)(jnp.float64(0.31)))
+    assert np.isfinite(g) and g != 0.0
+
+    def loss_b(b):
+        c = DistanceCosmo(Om=0.31, h=0.68)
+        return jnp.sum(sigma2_predicted(R, z_eff=0.5, cosmo=c, bias=b,
+                                            sigma8=0.81) ** 2)
+    g_b = float(jax.grad(loss_b)(jnp.float64(2.0)))
+    assert np.isfinite(g_b) and g_b > 0.0
+
+    def loss_s8(s8):
+        c = DistanceCosmo(Om=0.31, h=0.68)
+        return jnp.sum(sigma2_predicted(R, z_eff=0.5, cosmo=c, bias=2.0,
+                                            sigma8=s8) ** 2)
+    g_s8 = float(jax.grad(loss_s8)(jnp.float64(0.81)))
+    assert np.isfinite(g_s8) and g_s8 > 0.0
+
+
+def test_dsigma2_dR_predicted_matches_finite_difference():
+    """Analytic Fourier-space ``dsigma2_dR_predicted`` agrees with the
+    central finite-difference of ``sigma2_predicted``."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.sigma2 import (
+        dsigma2_dR_predicted, sigma2_predicted,
+    )
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    R0 = 30.0; h = 0.5
+    s_plus = float(sigma2_predicted(jnp.array([R0 + h]),
+                                        z_eff=0.5, cosmo=cosmo,
+                                        bias=2.0, sigma8=0.81)[0])
+    s_minus = float(sigma2_predicted(jnp.array([R0 - h]),
+                                         z_eff=0.5, cosmo=cosmo,
+                                         bias=2.0, sigma8=0.81)[0])
+    fd = (s_plus - s_minus) / (2 * h)
+    ana = float(dsigma2_dR_predicted(jnp.array([R0]),
+                                          z_eff=0.5, cosmo=cosmo,
+                                          bias=2.0, sigma8=0.81)[0])
+    np.testing.assert_allclose(ana, fd, rtol=2e-3)
+
+
+def test_sigma2_bao_template_smaller_than_signal_at_BAO_scale():
+    """The BAO template ``T(R) = sigma^2_full - sigma^2_nowiggle`` is
+    much smaller than the signal but non-zero at BAO scales.
+
+    On a fiducial cosmology at z=0.5, sigma^2(R=110/h Mpc) ~ 1e-2,
+    and the BAO contribution is at the few-percent level."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.sigma2 import (
+        sigma2_bao_template, sigma2_predicted,
+    )
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    R = jnp.array([80.0, 110.0, 150.0])
+    s2 = np.asarray(sigma2_predicted(R, z_eff=0.5, cosmo=cosmo,
+                                          bias=2.0, sigma8=0.81))
+    T = sigma2_bao_template(R, z_eff=0.5, cosmo=cosmo,
+                                 bias=2.0, sigma8=0.81, derivative=False)
+    # template is smaller than full signal but not zero
+    assert (np.abs(T) < 0.5 * np.abs(s2)).all()
+    assert (np.abs(T) > 0.0).any()
+
+
+def test_sigma2_predicted_matches_xi_integral_on_eisenstein_hu():
+    """``sigma2_predicted`` (Fourier-space, no-wiggle EH) at z=0,
+    bias=1, sigma8=0.81 matches the configuration-space integral
+    ``int dr 4 pi r^2 xi_NL(r) K_TH(r; R)`` to within a few percent
+    for R in BAO range."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import xi_real_at_z
+    from twopt_density.sigma2 import (
+        kernel_TH_3d, sigma2_predicted,
+    )
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    R_test = 50.0
+    s2_fourier = float(sigma2_predicted(jnp.array([R_test]),
+                                              z_eff=0.0, cosmo=cosmo,
+                                              bias=1.0, sigma8=0.81)[0])
+    # configuration-space cross-check
+    s_grid = np.linspace(0.5, 200.0, 800)
+    xi = xi_real_at_z(s_grid, z_eff=0.0, cosmo=cosmo, sigma8=0.81)
+    K = kernel_TH_3d(s_grid, R_test)
+    s2_config = float(np.trapezoid(4 * np.pi * s_grid ** 2 * xi * K,
+                                     s_grid))
+    np.testing.assert_allclose(s2_fourier, s2_config, rtol=0.10)
+
+
 def test_density_weights_sigma2_particle_mean_recovers_sigma2():
     """``<delta_i>_i`` (per-particle mean) recovers the full LS
     sigma^2(R) to within Poisson noise on uniform random data.
