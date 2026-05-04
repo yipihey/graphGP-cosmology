@@ -1,0 +1,128 @@
+[package]
+name = "morton_cascade"
+version = "0.1.0"
+edition = "2024"
+description = "Hierarchical cell-count cascade for spatial point distributions"
+authors = ["Tom Abel <tabel@stanford.edu>"]
+license = "MIT OR Apache-2.0"
+autoexamples = false
+
+[lib]
+name = "morton_cascade"
+path = "src/lib.rs"
+
+[[bin]]
+name = "morton-cascade"
+path = "src/bin/morton-cascade.rs"
+
+[[example]]
+name = "fingerprint_export"
+path = "examples/fingerprint_export.rs"
+
+[[example]]
+name = "test_3d"
+path = "examples/test_3d.rs"
+
+[[example]]
+name = "test_nd"
+path = "examples/test_nd.rs"
+
+[[example]]
+name = "benchmark_packed"
+path = "examples/benchmark_packed.rs"
+
+[[example]]
+name = "pmf_cox_demo"
+path = "examples/pmf_cox_demo.rs"
+
+[dependencies]
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[[example]]
+name = "profile_pmf_windows"
+path = "examples/profile_pmf_windows.rs"
+
+[[example]]
+name = "confirm_alloc"
+path = "examples/confirm_alloc.rs"
+
+[[example]]
+name = "bench_bitvec"
+path = "examples/bench_bitvec.rs"
+
+[[example]]
+name = "diag_ls_xi"
+path = "examples/diag_ls_xi.rs"
+
+[[example]]
+name = "diag_rr_only"
+path = "examples/diag_rr_only.rs"
+
+[[example]]
+name = "diag_tiny"
+path = "examples/diag_tiny.rs"
+
+[[example]]
+name = "diag_dups"
+path = "examples/diag_dups.rs"
+
+[[example]]
+name = "diag_dups_good"
+path = "examples/diag_dups_good.rs"
+
+[[example]]
+name = "xi_smoke"
+path = "examples/xi_smoke.rs"
+
+[[example]]
+name = "bench_phase1"
+path = "examples/bench_phase1.rs"
+
+[[example]]
+name = "bench_threshold_scan"
+path = "examples/bench_threshold_scan.rs"
+
+[[example]]
+name = "bench_threshold_sweep"
+path = "examples/bench_threshold_sweep.rs"
+
+[[example]]
+name = "bench_default_vs_old"
+path = "examples/bench_default_vs_old.rs"
+
+[[example]]
+name = "field_stats_demo"
+path = "examples/field_stats_demo.rs"
+
+[[example]]
+name = "multi_run_demo"
+path = "examples/multi_run_demo.rs"
+
+[[example]]
+name = "per_particle_attribution"
+path = "examples/per_particle_attribution.rs"
+
+[[example]]
+name = "profile_field_stats_gradient"
+path = "examples/profile_field_stats_gradient.rs"
+
+[[example]]
+name = "profile_multi_run"
+path = "examples/profile_multi_run.rs"
+
+[[example]]
+name = "optimize_data_weights"
+path = "examples/optimize_data_weights.rs"
+
+[[example]]
+name = "optimize_data_weights_logloss"
+path = "examples/optimize_data_weights_logloss.rs"
+
+[[example]]
+name = "optimize_data_weights_newton_cg"
+path = "examples/optimize_data_weights_newton_cg.rs"

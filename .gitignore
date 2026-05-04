@@ -17,3 +17,6 @@ paper/*.aux
 paper/*.log
 paper/*.out
 paper/*.toc
+
+# Rust build artifacts
+morton_cascade/target/
