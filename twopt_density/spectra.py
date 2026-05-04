@@ -1,0 +1,137 @@
+"""Hankel transform xi(r) and sigma^2(R) from a P(k) callable.
+
+Direct trapezoid integration on a log-k grid::
+
+    xi(r)      = (1 / (2 pi^2)) integral k^2 P(k) j_0(k r) dk
+    sigma^2(R) = (1 / (2 pi^2)) integral k^2 P(k) W^2(k R) dk
+
+with the top-hat window ``W(x) = 3 (sin x - x cos x) / x^3``. Both are
+written as JAX functions so gradients flow through the cosmological
+parameters that drive ``P_k`` (typically a partial of
+``twopt_density.cosmology.run_halofit`` or ``pnl_new_emulated``).
+
+A log-k grid with ~2000 points covering ``[1e-4, 100] h/Mpc`` is
+sufficient for sub-percent accuracy on the relevant scales (r in
+[1, 200] Mpc/h). The FFTLog approach would be faster for very dense
+r-grids; this trapezoid implementation is JAX-clean and adequate for the
+typical ~50-200 r-points used in inference.
+"""
+
+from __future__ import annotations
+
+from typing import Callable, Optional
+
+import jax
+import jax.numpy as jnp
+
+
+jax.config.update("jax_enable_x64", True)
+
+
+def _j0(x):
+    """Spherical Bessel j_0(x) = sin(x)/x, with the limit at x=0."""
+    return jnp.where(jnp.abs(x) < 1e-8, 1.0 - x ** 2 / 6.0, jnp.sin(x) / x)
+
+
+def _W_tophat(x):
+    """Top-hat window W(x) = 3 (sin x - x cos x) / x^3, with the limit at 0."""
+    safe = jnp.where(jnp.abs(x) < 1e-3, 1.0, x)
+    W_smooth = 1.0 - x ** 2 / 10.0  # leading expansion at small x
+    W_full = 3.0 * (jnp.sin(safe) - safe * jnp.cos(safe)) / safe ** 3
+    return jnp.where(jnp.abs(x) < 1e-3, W_smooth, W_full)
+
+
+def make_log_k_grid(k_min: float = 1e-4, k_max: float = 1e2, n: int = 2000):
+    """Standard log-k integration grid."""
+    return jnp.logspace(jnp.log10(k_min), jnp.log10(k_max), n)
+
+
+def xi_from_Pk(
+    r: jnp.ndarray,
+    k: jnp.ndarray,
+    P_k: jnp.ndarray,
+) -> jnp.ndarray:
+    """Hankel transform: ``xi(r) = (1/2pi^2) int k^2 P(k) j_0(kr) dk``.
+
+    ``r``: (n_r,) radii. ``k``, ``P_k``: (n_k,) on the same log-k grid.
+    Uses ``jnp.trapezoid`` over ``log k`` with the substitution
+    ``dk = k d(log k)``, so the integrand becomes ``k^3 P(k) j_0(kr)``.
+    """
+    log_k = jnp.log(k)
+    kr = jnp.outer(r, k)                     # (n_r, n_k)
+    integrand = (k ** 3 * P_k)[None, :] * _j0(kr)
+    return jnp.trapezoid(integrand, log_k, axis=1) / (2.0 * jnp.pi ** 2)
+
+
+def sigma2_from_Pk(
+    R: jnp.ndarray,
+    k: jnp.ndarray,
+    P_k: jnp.ndarray,
+) -> jnp.ndarray:
+    """Top-hat ``sigma^2(R) = (1/2pi^2) int k^2 P(k) W^2(kR) dk``."""
+    log_k = jnp.log(k)
+    kR = jnp.outer(R, k)
+    W2 = _W_tophat(kR) ** 2
+    integrand = (k ** 3 * P_k)[None, :] * W2
+    return jnp.trapezoid(integrand, log_k, axis=1) / (2.0 * jnp.pi ** 2)
+
+
+def xi_model(
+    r: jnp.ndarray,
+    P_k_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    k_grid: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    """Convenience: evaluate ``P_k_fn(k_grid)`` then transform to xi(r)."""
+    if k_grid is None:
+        k_grid = make_log_k_grid()
+    P_k = P_k_fn(k_grid)
+    return xi_from_Pk(r, k_grid, P_k)
+
+
+# ----- FFTLog (Hamilton 2000) via mcfit's JAX backend -----------------
+
+class FFTLogP2xi:
+    """FFTLog spherical-Bessel-l Hankel transform from P(k) to xi(r).
+
+    Wraps ``mcfit.P2xi`` with the JAX backend so the kernel is precomputed
+    once on a fixed log-k grid and reused under JIT/grad. The output r-grid
+    is dictated by FFTLog symmetry (``k_min * r_max ~ const``); use
+    ``xi_at(P_k, query_r)`` to interpolate to arbitrary query separations.
+
+    No bin-edge cusps and no Hankel ringing -- the standard alternative to
+    direct trapezoid integration ``xi_from_Pk``. Forward and gradient
+    agree with trapezoid to ~1% on smooth P(k); FFTLog wins on
+    oscillatory observables like the BAO bump and on gradient quality at
+    large r.
+
+    Requires mcfit (``pip install mcfit``).
+    """
+
+    def __init__(self, k: jnp.ndarray, l: int = 0, lowring: bool = True,
+                 N_pad: complex = 2j):
+        from mcfit import P2xi  # delayed import; mcfit is optional
+        self._p2xi = P2xi(k, l=l, lowring=lowring, N=N_pad, backend="jax")
+        self.k = k
+        self.r = jnp.asarray(self._p2xi.y)
+        self.l = l
+
+    def __call__(self, P_k: jnp.ndarray) -> jnp.ndarray:
+        """Return xi at the FFTLog-paired r-grid (``self.r``)."""
+        _, xi = self._p2xi(P_k, extrap=False)
+        return xi
+
+    def xi_at(self, P_k: jnp.ndarray, query_r: jnp.ndarray) -> jnp.ndarray:
+        """Evaluate xi at arbitrary query separations via log-r interpolation."""
+        xi_grid = self(P_k)
+        log_r = jnp.log(self.r)
+        log_q = jnp.log(query_r)
+        return jnp.interp(log_q, log_r, xi_grid, left=0.0, right=0.0)
+
+
+def xi_from_Pk_fftlog(
+    r: jnp.ndarray,
+    fft: FFTLogP2xi,
+    P_k: jnp.ndarray,
+) -> jnp.ndarray:
+    """Convenience: FFTLog xi(r) interpolated to arbitrary ``r``."""
+    return fft.xi_at(P_k, r)

@@ -3,3 +3,17 @@ __pycache__/
 .DS_Store
 *.egg-info/
 .env
+
+# downloaded survey catalogues -- not under version control
+data/quaia/
+
+# (the rest of data/ is checked in: pixel-window FITS for analytic RR, etc.)
+data/planck/PR4_variations/
+data/planck/planck_pr4_kappa_*.fits
+data/desi/*.fits
+
+# LaTeX intermediates
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.toc

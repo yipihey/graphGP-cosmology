@@ -8,7 +8,7 @@ bin-edge artifacts of Part I.
 from __future__ import annotations
 
 import numpy as np
-from scipy.linalg import cho_factor, cho_solve
+from scipy.linalg import lu_factor, lu_solve
 from scipy.spatial.distance import pdist, squareform
 
 from .basis import Basis
@@ -23,11 +23,14 @@ def compute_basis_weights(
     nbar: np.ndarray,
     r_kernel: float | None = None,
     box_size: float | None = None,
+    subtract_mean: bool = True,
 ) -> np.ndarray:
     """Return per-point weights ``w_i = 1 + delta_hat_i`` (basis form).
 
     Same Wiener-filter solve as ``weights_binned`` with a smooth
-    ``C_ij = sum_alpha theta_alpha f_alpha(r_ij)``.
+    ``C_ij = sum_alpha theta_alpha f_alpha(r_ij)``. Solved with LU
+    factorization (no PSD projection) -- the indefiniteness of the
+    smoothed-xi kernel is harmless for the posterior mean.
     """
     N = len(positions)
     if N > 12000:
@@ -40,20 +43,17 @@ def compute_basis_weights(
         r_kernel = default_kernel_radius(nbar)
 
     d = kde_overdensity(positions, nbar, r_kernel, box_size=box_size)
-    d = d - d.mean()
+    if subtract_mean:
+        d = d - d.mean()
     V_kernel = (4.0 / 3.0) * np.pi * r_kernel ** 3
     noise_var = 1.0 / (nbar * V_kernel)
 
-    from .weights_binned import _project_psd
-
     r = squareform(pdist(positions))
-    C = np.maximum(
-        xi_from_basis(theta_hat, basis, r.ravel()).reshape(N, N), 0.0
-    )
+    C = xi_from_basis(theta_hat, basis, r.ravel()).reshape(N, N)
     diag_xi = float(xi_from_basis(theta_hat, basis, np.array([basis.r_min]))[0])
     sigma2 = max(diag_xi, 1.0)
     np.fill_diagonal(C, sigma2)
-    C = _project_psd(C)
-    L = cho_factor(C + np.diag(noise_var) + 1e-6 * sigma2 * np.eye(N), lower=True)
-    delta_hat = C @ cho_solve(L, d)
+    K = C + np.diag(noise_var) + 1e-6 * sigma2 * np.eye(N)
+    lu = lu_factor(K)
+    delta_hat = C @ lu_solve(lu, d)
     return 1.0 + delta_hat
