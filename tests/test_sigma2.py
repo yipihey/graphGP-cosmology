@@ -403,3 +403,105 @@ def test_density_weights_sigma2_particle_mean_recovers_sigma2():
     assert abs(sigma2_from_w - sigma2_LS) < 0.15, (
         f"<delta_i> = {sigma2_from_w:.3f} vs LS = {sigma2_LS:.3f}"
     )
+
+
+def test_sigma2_cyl_predicted_shrinks_with_photoz_smear():
+    """Cylinder variance with photo-z LOS smear should be smaller
+    than the unsmeared version: convolving the count along LOS by a
+    Gaussian reduces the per-cylinder variance."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.sigma2 import sigma2_cyl_predicted
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    R = jnp.array([30.0, 60.0])
+    s2_clean = sigma2_cyl_predicted(R, pi_max=200.0, z_eff=1.5, cosmo=cosmo,
+                                          bias=2.6, sigma8=0.81)
+    s2_smear = sigma2_cyl_predicted(R, pi_max=200.0, z_eff=1.5, cosmo=cosmo,
+                                          bias=2.6, sigma8=0.81,
+                                          sigma_chi=170.0)
+    assert (np.asarray(s2_smear) < np.asarray(s2_clean)).all()
+    # but both positive -- still a real variance
+    assert (np.asarray(s2_clean) > 0).all()
+    assert (np.asarray(s2_smear) > 0).all()
+
+
+def test_sigma2_cyl_jax_grad_in_bias_and_sigma8():
+    """``sigma2_cyl_predicted`` is JAX-grad differentiable in
+    (bias, sigma8)."""
+    import jax
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.sigma2 import sigma2_cyl_predicted
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    R = jnp.array([30.0, 80.0])
+
+    def loss_b(b):
+        return jnp.sum(sigma2_cyl_predicted(R, pi_max=200.0, z_eff=1.5,
+                                                  cosmo=cosmo, bias=b,
+                                                  sigma8=0.81) ** 2)
+    g_b = float(jax.grad(loss_b)(jnp.float64(2.6)))
+    assert np.isfinite(g_b) and g_b > 0.0
+
+    def loss_s8(s8):
+        return jnp.sum(sigma2_cyl_predicted(R, pi_max=200.0, z_eff=1.5,
+                                                  cosmo=cosmo, bias=2.6,
+                                                  sigma8=s8) ** 2)
+    g_s8 = float(jax.grad(loss_s8)(jnp.float64(0.81)))
+    assert np.isfinite(g_s8) and g_s8 > 0.0
+
+
+def test_sigma2_gkappa_predicted_decreases_with_R():
+    """``sigma^2_{g-kappa}(R)`` decreases monotonically with the
+    smoothing radius R (smoothing kills small-scale power)."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.sigma2 import sigma2_gkappa_predicted
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    z = jnp.linspace(0.85, 2.45, 60)
+    nz = jnp.exp(-0.5 * ((z - 1.5) / 0.5) ** 2)
+    b_z = jnp.full_like(z, 2.6)
+    R = jnp.array([20.0, 60.0, 120.0])
+    s2 = np.asarray(sigma2_gkappa_predicted(R, z, nz, b_z, cosmo,
+                                                  sigma8=0.81))
+    # monotone decrease
+    assert s2[0] > s2[1] > s2[2] > 0.0
+
+
+def test_sigma2_gkappa_jax_grad_differentiable():
+    """``sigma2_gkappa_predicted`` is differentiable in (sigma8, b_z)."""
+    import jax
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.sigma2 import sigma2_gkappa_predicted
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    z = jnp.linspace(0.85, 2.45, 40)
+    nz = jnp.exp(-0.5 * ((z - 1.5) / 0.5) ** 2)
+    R = jnp.array([60.0])
+
+    def loss(s8):
+        b_z = jnp.full_like(z, 2.6)
+        return jnp.sum(sigma2_gkappa_predicted(R, z, nz, b_z, cosmo,
+                                                       sigma8=s8) ** 2)
+    g = float(jax.grad(loss)(jnp.float64(0.81)))
+    assert np.isfinite(g) and g > 0.0
+
+
+def test_sigma2_RR_analytic_window_runs_on_synthetic_mask():
+    """Direct analytic-window sigma^2_RR returns a positive,
+    finite array on a synthetic galactic-cap mask."""
+    pytest.importorskip("healpy")
+    import healpy as hp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.sigma2 import sigma2_RR_analytic_window
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    nside = 32
+    npix = 12 * nside ** 2
+    theta, phi = hp.pix2ang(nside, np.arange(npix))
+    # galactic-style mask: |b| > 10 deg
+    mask = np.where(np.abs(np.pi / 2 - theta) > np.deg2rad(10.0), 1.0, 0.0)
+    z_data = np.linspace(0.8, 2.5, 500)
+    R_grid = np.array([30.0, 80.0])
+    out = sigma2_RR_analytic_window(R_grid, mask, nside, z_data, cosmo,
+                                          n_rp=40, n_pi=40)
+    assert np.all(np.isfinite(out))
+    assert (out >= 0).all()

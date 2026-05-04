@@ -712,3 +712,301 @@ def sigma2_from_data_only(
         else:
             out[i] = 0.0
     return out
+
+
+# ----------------------------------------------------------------------
+#  Direct analytic-window sigma^2 RR (no (rp, pi) discretisation).
+# ----------------------------------------------------------------------
+
+
+def sigma2_RR_analytic_window(
+    R_grid,
+    mask: np.ndarray, nside: int,
+    z_data: np.ndarray, cosmo,
+    kernel: str = "tophat",
+    n_chi_eff: int = 60,
+    n_chi_bins: int = 80,
+    kde_bandwidth: float = 0.05,
+    n_rp: int = 60, n_pi: int = 80,
+    pi_max: float = None,
+    lmax: int = None,
+    theta_max_rad: float = 0.5,
+    taper: str = "hann",
+    N_r: int = None,
+):
+    """Direct analytic-window ``sigma^2_RR(R)`` without going through
+    binned ``(rp, pi)`` pair counts.
+
+    Computes the per-pair-density form of the random-random kernel
+    sum ``int d^3 x_1 d^3 x_2 rho_R(x_1) rho_R(x_2) K(|x_1 - x_2|; R)``
+    by evaluating the same separable-window integrand as
+    ``rr_analytic`` -- ``chi_eff^2 * xi_mask(rp/chi_eff)
+    * n(chi_eff + pi/2) * n(chi_eff - pi/2)`` -- on a fine continuous
+    ``(rp, pi)`` grid and projecting it through the 3D-separation
+    kernel ``K(sqrt(rp^2 + pi^2); R)``.
+
+    Equivalent to ``sigma2_from_rp_pi_pairs(rp_c, pi_c, RR_analytic, ...)``
+    in the limit of fine binning, but skips the binning step entirely
+    so the result is independent of the choice of ``(rp_edges,
+    pi_edges)`` at the science-measurement stage.
+
+    Parameters
+    ----------
+    R_grid : array of sphere radii [Mpc/h] at which to evaluate sigma^2.
+    mask, nside : HEALPix angular completeness map.
+    z_data : observed redshifts; used to build n(chi).
+    cosmo : DistanceCosmo.
+    kernel : "tophat", "gaussian", or "derivative".
+    n_rp, n_pi : grid resolution for the continuous (rp, pi) integration.
+    pi_max : truncation of the LOS integral [Mpc/h]; default ``2 max(R)``
+             for top-hat (which has compact support) or
+             ``6 max(R)`` for Gaussian.
+    taper, lmax : passed through to ``angular_corr_from_mask``.
+
+    Returns
+    -------
+    sigma2_RR : (n_R,) array, in *per-pair-density* units (matching
+    the convention of ``rr_analytic``). To convert to a count, multiply
+    by ``N_r * (N_r - 1) / 2`` for some chosen ``N_r``.
+    """
+    from .analytic_rr import angular_corr_from_mask, radial_pair_density_from_z
+
+    R_grid = np.asarray(R_grid, dtype=np.float64).ravel()
+    R_max = float(R_grid.max())
+    if pi_max is None:
+        pi_max = 2.0 * R_max if kernel == "tophat" else 6.0 * R_max
+
+    # Use the same angular-mask correlation and radial pair-density as
+    # rr_analytic so the discretisation-free sigma^2 matches the
+    # binned (rp, pi) projection in the fine-bin limit.
+    theta_grid, xi_mask = angular_corr_from_mask(
+        mask, nside, lmax=lmax, theta_max_rad=theta_max_rad, taper=taper,
+    )
+    chi_grid, n_chi = radial_pair_density_from_z(
+        z_data, cosmo, n_chi_bins=n_chi_bins, kde_bandwidth=kde_bandwidth,
+    )
+    chi_min = float(chi_grid[0]); chi_max = float(chi_grid[-1])
+    f_sky = float(np.mean(mask))
+    chi2_p = float(np.trapezoid(n_chi * chi_grid ** 2, chi_grid))
+
+    # Continuous (rp, pi) grid for the projection. Top-hat: rp in [0, 2R_max].
+    rp_grid = np.linspace(0.0, 2.0 * R_max, n_rp)
+    pi_grid = np.linspace(0.0, pi_max, n_pi)
+    K_fn = _kernel_for(kernel)
+    # for each (rp, pi), the per-pair density kernel:
+    #   2 pi rp * int dchi_eff chi_eff^2 xi_mask(rp/chi_eff)
+    #                           n(chi_eff + pi/2) n(chi_eff - pi/2)
+    # is the rr_analytic integrand. We evaluate this 2D table once.
+    rr_table = np.zeros((n_rp, n_pi), dtype=np.float64)
+    for j, pi in enumerate(pi_grid):
+        chi_lo = chi_min + pi / 2.0
+        chi_hi = chi_max - pi / 2.0
+        if chi_hi <= chi_lo:
+            continue
+        chi_eff = np.linspace(chi_lo, chi_hi, n_chi_eff)
+        for i, rp in enumerate(rp_grid):
+            if rp <= 0:
+                continue
+            theta_at = rp / chi_eff
+            xi_at = np.interp(theta_at, theta_grid, xi_mask,
+                               left=xi_mask[0], right=0.0)
+            n1 = np.interp(chi_eff + pi / 2.0, chi_grid, n_chi,
+                            left=0, right=0)
+            n2 = np.interp(chi_eff - pi / 2.0, chi_grid, n_chi,
+                            left=0, right=0)
+            rr_table[i, j] = 2.0 * np.pi * rp * np.trapezoid(
+                chi_eff ** 2 * xi_at * n1 * n2, chi_eff,
+            )
+    rr_table *= 1.0 / (2.0 * f_sky ** 2 * chi2_p ** 2)
+
+    # Project rr_table onto K_TH(s = sqrt(rp^2 + pi^2); R) for each R.
+    s_grid = np.sqrt(rp_grid[:, None] ** 2 + pi_grid[None, :] ** 2)
+    out = np.zeros_like(R_grid)
+    for i, R in enumerate(R_grid):
+        K_2d = K_fn(s_grid, float(R))
+        # 2D trapezoid in (rp, pi); the 2 from |pi| -> pi positive
+        # already absorbed into the rr_table normalisation.
+        integrand = rr_table * K_2d
+        out[i] = np.trapezoid(np.trapezoid(integrand, pi_grid, axis=1),
+                                rp_grid)
+    if N_r is not None:
+        out = out * (N_r * N_r)
+    return out
+
+
+# ----------------------------------------------------------------------
+#  sigma^2-style g-kappa cross via 2D angular top-hat smoothing.
+# ----------------------------------------------------------------------
+
+
+# Precomputed 2D-top-hat Fourier window via scipy.special.j1 (used as a
+# lookup table inside JAX via jnp.interp). 8 k samples per unit out to
+# x = 200 captures the slow oscillating tail well; W_disk -> 0 at large
+# x via 1/x^(3/2) decay.
+_W_DISK_X = np.linspace(0.0, 200.0, 8000)
+import scipy.special as _sp_special
+_W_DISK_VAL = np.where(
+    _W_DISK_X > 1e-3,
+    2.0 * _sp_special.j1(_W_DISK_X) / np.maximum(_W_DISK_X, 1e-12),
+    1.0 - _W_DISK_X ** 2 / 8.0 + (_W_DISK_X ** 4) / 192.0,
+)
+
+
+def _W_TH_2d(x):
+    """2D top-hat angular window in flat-sky Fourier:
+    ``W_TH^{2D}(x = ell theta_R) = 2 J_1(x) / x``.
+
+    Implemented via a precomputed ``scipy.special.j1`` lookup
+    interpolated in JAX -- ``jax.scipy.special.bessel_jn`` is
+    unstable for ``x > 0`` on this build.
+    """
+    import jax.numpy as jnp
+    return jnp.interp(jnp.asarray(x, dtype=jnp.float64),
+                         jnp.asarray(_W_DISK_X), jnp.asarray(_W_DISK_VAL))
+
+
+def sigma2_gkappa_predicted(
+    R, z_grid, dndz, b_z, cosmo,
+    sigma8: float = 0.81, Ob: float = 0.049, ns: float = 0.965,
+    z_star: float = 1090.0,
+    chi_eff: float = None,
+    ell_min: float = 1.0, ell_max: float = 5000.0, n_ell: int = 600,
+    nowiggle: bool = False,
+):
+    """JAX-pure sigma^2_{g-kappa}(R), the variance of the cross
+    product of the 2D-top-hat-smoothed galaxy and CMB-lensing
+    convergence fields, smoothed with angular radius ``theta_R = R /
+    chi_eff``.
+
+    sigma^2_{g-kappa}(R) = int d ell ell / (2 pi)
+                              C_ell^{g-kappa} W_TH^{2D}(ell theta_R)^2
+
+    The Limber-projected cross spectrum ``C_ell^{g-kappa}`` is the same
+    one used in ``twopt_density.lensing.cl_gkappa_limber``. The
+    chi_eff for the angle conversion is taken as the Limber
+    effective comoving distance: dndz-weighted mean chi.
+    """
+    import jax
+    import jax.numpy as jnp
+    from .lensing import cl_gkappa_limber, cl_gkappa_limber_nowiggle
+
+    R_arr = jnp.atleast_1d(jnp.asarray(R, dtype=jnp.float64))
+    ell = jnp.asarray(np.linspace(float(ell_min), float(ell_max), n_ell),
+                         dtype=jnp.float64)
+    if nowiggle:
+        cl = cl_gkappa_limber_nowiggle(
+            ell, z_grid, dndz, b_z, cosmo,
+            sigma8=sigma8, Ob=Ob, ns=ns, z_star=z_star,
+        )
+    else:
+        cl = cl_gkappa_limber(
+            ell, z_grid, dndz, b_z, cosmo,
+            sigma8=sigma8, Ob=Ob, ns=ns, z_star=z_star,
+        )
+
+    if chi_eff is None:
+        from .distance import comoving_distance
+        chi_z = comoving_distance(jnp.asarray(z_grid, dtype=jnp.float64),
+                                     cosmo)
+        nz = jnp.asarray(dndz, dtype=jnp.float64)
+        nz = nz / jnp.trapezoid(nz, jnp.asarray(z_grid, dtype=jnp.float64))
+        chi_eff = float(jnp.trapezoid(
+            chi_z * nz, jnp.asarray(z_grid, dtype=jnp.float64)))
+
+    theta_R = R_arr / float(chi_eff)
+    # outer product ell x R
+    x = ell[None, :] * theta_R[:, None]
+    W2 = _W_TH_2d(x) ** 2
+    integrand = ell[None, :] * cl[None, :] * W2 / (2.0 * jnp.pi)
+    return jnp.trapezoid(integrand, ell, axis=1)
+
+
+# ----------------------------------------------------------------------
+#  Cylindrical sigma^2: photo-z LOS-smeared variance for Quaia-type data.
+# ----------------------------------------------------------------------
+
+
+def sigma2_cyl_predicted(
+    R, pi_max,
+    z_eff: float, cosmo,
+    bias: float = 1.0, sigma8: float = 0.81,
+    Ob: float = 0.049, ns: float = 0.965,
+    sigma_chi: float = 0.0,
+    k_perp_min: float = 1e-4, k_perp_max: float = 1e2, n_k_perp: int = 256,
+    k_par_min: float = 1e-4, k_par_max: float = 1e2, n_k_par: int = 256,
+    nowiggle: bool = False,
+):
+    """JAX-pure sigma^2 of the count in a cylinder of transverse
+    radius ``R`` and half-length ``pi_max``, evaluated at ``z_eff``
+    under the syren-halofit P_NL.
+
+        sigma^2_cyl(R, pi_max) =
+           b^2 / (2 pi^2)  int d k_perp k_perp  W_disk^2(k_perp R)
+                         x int d k_par / (2 pi)  W_los^2(k_par pi_max)
+                                                exp(-k_par^2 sigma_chi^2)
+                                                P(k = sqrt(k_perp^2 + k_par^2), z)
+
+    The disk window is ``W_disk(x) = 2 J_1(x)/x`` and the LOS top-hat
+    is ``W_los(y) = sin(y)/y``. The optional ``sigma_chi`` Gaussian
+    factor models per-galaxy photo-z LOS smear: with ``sigma_chi >
+    0`` the cylinder count is convolved by a Gaussian along LOS
+    before differentiation, multiplying ``W_los`` by
+    ``exp(-k_par^2 sigma_chi^2 / 2)``.
+
+    The cylinder-variance is the natural sigma^2 analogue for
+    photometric data (Quaia): the LOS smear destroys 3D-sphere
+    estimates but cylinders at scale R > sigma_chi still have well-
+    defined clustering variance.
+    """
+    import jax
+    import jax.numpy as jnp
+    from .limber import pnl_at_z, pnl_at_z_nowiggle
+
+    R_arr = jnp.atleast_1d(jnp.asarray(R, dtype=jnp.float64))
+    k_perp_np = np.logspace(np.log10(k_perp_min), np.log10(k_perp_max),
+                                n_k_perp)
+    k_par_np = np.logspace(np.log10(k_par_min), np.log10(k_par_max),
+                               n_k_par)
+    kp = jnp.asarray(k_perp_np); kz = jnp.asarray(k_par_np)
+    kp_grid = kp[None, :, None]                      # (1, n_kp, 1)
+    kz_grid = kz[None, None, :]                      # (1, 1, n_kz)
+    R_grid = R_arr[:, None, None]                     # (n_R, 1, 1)
+
+    # disk window via scipy.j1 lookup (jax.scipy.special.bessel_jn unstable)
+    x_disk = kp_grid * R_grid
+    eps = 1e-3
+    W_disk = _W_TH_2d(x_disk)
+
+    # LOS top-hat with optional photo-z Gaussian smearing
+    y_los = kz_grid * float(pi_max)
+    safe_los = jnp.where(jnp.abs(y_los) > eps, y_los, eps)
+    W_los_big = jnp.sin(safe_los) / safe_los
+    W_los_small = 1.0 - y_los ** 2 / 6.0 + (y_los ** 4) / 120.0
+    W_los = jnp.where(jnp.abs(y_los) > eps, W_los_big, W_los_small)
+    if sigma_chi > 0.0:
+        W_los = W_los * jnp.exp(-(kz_grid ** 2)
+                                  * (float(sigma_chi) ** 2) / 2.0)
+
+    # 2D power on the (k_perp, k_par) grid via P(|k|)
+    k_mag = jnp.sqrt(kp_grid ** 2 + kz_grid ** 2)
+    # We need P at every grid point; vectorised via evaluating P on a
+    # 1D fine grid and interpolating.
+    k_eval = jnp.asarray(np.logspace(-4.5, 2.5, 2048))
+    if nowiggle:
+        Pk1d = pnl_at_z_nowiggle(k_eval, z=z_eff, sigma8=sigma8,
+                                    cosmo=cosmo, Ob=Ob, ns=ns)
+    else:
+        Pk1d = pnl_at_z(k_eval, z=z_eff, sigma8=sigma8,
+                          cosmo=cosmo, Ob=Ob, ns=ns)
+    # interpolate -- jnp.interp is 1D so we flatten + reshape
+    Pk = jnp.interp(k_mag.ravel(), k_eval, Pk1d).reshape(k_mag.shape)
+
+    # integrand: (b^2 / (2 pi^2)) * k_perp * W_disk^2 * W_los^2 * P
+    integrand = (kp_grid * (W_disk ** 2) * (W_los ** 2) * Pk)
+
+    # 2D trapezoid: integrate over k_par first, then k_perp
+    int_kz = jnp.trapezoid(integrand, kz, axis=2)         # (n_R, n_kp)
+    out = (bias ** 2) / (2.0 * jnp.pi ** 2) * jnp.trapezoid(
+        int_kz, kp, axis=1
+    )
+    return out
