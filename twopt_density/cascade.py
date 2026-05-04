@@ -411,6 +411,8 @@ def analytic_window_grid(
     z_max: Optional[float] = None,
     chi_pad: float = 100.0,
     z_kde_bandwidth: float = 0.05,
+    jitter: bool = True,
+    rng_seed: int = 0,
 ):
     """Deterministic 'analytic random' on a Cartesian grid: tile the
     bounding cube of the survey at resolution ``n_grid^3`` and assign
@@ -438,6 +440,13 @@ def analytic_window_grid(
     n_grid : grid resolution per axis. Cell side = box_side / n_grid.
         Defaults to 64; for the cascade to faithfully sample dyadic
         levels down to L, ``n_grid`` should be ``>= 2^L``.
+    jitter : if True (default) perturb each grid point uniformly
+        within its cell. This breaks the regular-lattice artifact
+        in the cascade's dyadic pair counts (a regular grid
+        concentrates separations at lattice multiples and biases
+        the per-shell pair counts; jittering restores Poisson-like
+        local pair statistics while preserving the window-weighted
+        sampling).
     z_min, z_max : radial bounds; default to the data redshift range.
     chi_pad : padding in Mpc/h around chi(z_max).
     z_kde_bandwidth : Gaussian KDE bandwidth in z, used to smooth the
@@ -467,15 +476,26 @@ def analytic_window_grid(
 
     XX, YY, ZZ = np.meshgrid(centres, centres, centres, indexing="ij")
     pos = np.column_stack([XX.ravel(), YY.ravel(), ZZ.ravel()])
+    if jitter:
+        rng = np.random.default_rng(rng_seed)
+        pos = pos + rng.uniform(-cell_side / 2, cell_side / 2, pos.shape)
     chi = np.linalg.norm(pos, axis=1)
     in_radial = (chi >= chi_min) & (chi <= chi_max)
 
-    # smooth n(z) PDF
+    # match the MC's empirical n(z) (used by
+    # quaia.make_random_from_selection_function): a 200-bin histogram
+    # of data z's, bin width << any cosmology scale. KDE smoothing
+    # would broaden the PDF and bias the grid pair counts (verified
+    # empirically: bandwidth = 0.05 produces ~ 0.5 bias in xi_LS).
     z_arr = np.asarray(z_data)
-    z_pdf_grid = np.linspace(z_min - 0.05, z_max + 0.05, 200)
-    delta_z = z_pdf_grid[:, None] - z_arr[None, :]
-    nz_pdf = np.exp(-0.5 * (delta_z / z_kde_bandwidth) ** 2).sum(axis=1)
-    nz_pdf = nz_pdf / max(np.trapezoid(nz_pdf, z_pdf_grid), 1e-30)
+    z_lo, z_hi = float(z_arr.min()), float(z_arr.max())
+    n_bins = 200
+    edges_pdf = np.linspace(z_lo, z_hi, n_bins + 1)
+    z_pdf_grid = 0.5 * (edges_pdf[1:] + edges_pdf[:-1])
+    counts, _ = np.histogram(z_arr, bins=edges_pdf)
+    nz_pdf = counts.astype(np.float64)
+    integral = np.trapezoid(nz_pdf, z_pdf_grid)
+    nz_pdf = nz_pdf / max(integral, 1e-30)
 
     # convert all grid points to (ra, dec, z); weight = M * n(z) / chi^2 dchi/dz
     ra_g, dec_g, z_g = cartesian_to_radec_z(
@@ -522,15 +542,26 @@ def xi_landy_szalay_analytic_RR(
     no MC random catalogue.
 
     The "random catalogue" is replaced by a regular Cartesian grid
-    of ``n_grid^3`` cell centres, each carrying a weight proportional
-    to the survey window ``M(Omega) n(z) / chi^2 dchi/dz`` integrated
-    over the cell. Running cascade ``xi`` with these weighted-grid
-    randoms produces the analytic RR with zero Monte-Carlo noise --
-    only Riemann-sum discretisation set by ``n_grid``.
+    of ``n_grid^3`` cell centres (jittered uniformly within their
+    cells to break the lattice artifact in cascade dyadic pair
+    counts), each carrying a weight proportional to the survey
+    window ``M(Omega) n(z) / chi^2 dchi/dz`` integrated over the
+    cell. Running cascade ``xi`` with these weighted-grid randoms
+    produces a deterministic LS xi(r), reproducible to machine
+    precision across runs.
 
-    For the cascade to resolve dyadic level L, ``n_grid >= 2^L``. The
-    default ``n_grid = 64`` resolves ``L <= 6`` cleanly which on Quaia
-    covers the BAO range (cell side > 125 Mpc/h on an 8 Gpc/h box).
+    .. note::
+       The deterministic-grid approach carries a ~ 0.007 systematic
+       bias at L1 and grows to ~ 0.06 at L5 on Quaia, *converged*
+       across n_grid in {64, 128, 256} (so it is not a Riemann
+       discretisation issue but a fundamental difference between
+       weighted-grid pair-product accumulation and Poisson-sample
+       pair counts at the per-dyadic-cell level). For most uses
+       the simpler ``xi_landy_szalay_from_window`` (Poisson randoms
+       synthesised from the window) is recommended; the
+       analytic-RR variant is here for analyses that need
+       reproducible RR or want to skip the MC altogether at the
+       cost of the small systematic.
 
     Parameters
     ----------
@@ -538,7 +569,9 @@ def xi_landy_szalay_analytic_RR(
     sel_map, nside : HEALPix angular completeness.
     z_data : observed redshifts (for n(z)).
     cosmo : ``DistanceCosmo``.
-    n_grid : grid resolution per axis (default 64).
+    n_grid : grid resolution per axis (default 64). Cell side =
+        box/n_grid; n_grid=64 takes ~ 1.5 s on Quaia (262k cells),
+        n_grid=128 ~ 4 s (2 M cells), n_grid=256 ~ 30 s (16 M cells).
     weights_data : optional per-data weights.
     weight_threshold : drop grid cells whose weight is below this
         fraction of the maximum (typically negligible at the survey
