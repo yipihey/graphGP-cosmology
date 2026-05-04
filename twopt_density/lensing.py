@@ -134,6 +134,55 @@ def cl_gkappa_limber(
     return jnp.trapezoid(integrand, z, axis=1)
 
 
+def cl_gkappa_limber_nowiggle(
+    ell, z_grid, dndz, b_z, cosmo,
+    sigma8: float = 0.81, Ob: float = 0.049, ns: float = 0.965,
+    z_star: float = 1090.0,
+    k_min: float = 1e-4, k_max: float = 1e2, n_k: int = 1024,
+):
+    """No-BAO-wiggles companion to ``cl_gkappa_limber``.
+
+    Identical projection but uses ``pnl_at_z_nowiggle`` (Eisenstein-Hu
+    smooth) so the BAO contribution is absent. Subtract from
+    ``cl_gkappa_limber`` to isolate the angular BAO template in the
+    galaxy x CMB-lensing cross spectrum.
+    """
+    import jax
+    import jax.numpy as jnp
+    from .distance import C_OVER_H100_MPCH, E_of_z, comoving_distance
+    from .limber import pnl_at_z_nowiggle
+
+    ell_j = jnp.asarray(ell, dtype=jnp.float64)
+    z = jnp.asarray(z_grid, dtype=jnp.float64)
+    nz = jnp.asarray(dndz, dtype=jnp.float64)
+    b_z_j = jnp.asarray(b_z, dtype=jnp.float64)
+    nz = nz / jnp.trapezoid(nz, z)
+
+    chi = comoving_distance(z, cosmo)
+    W_kappa_z = lensing_kernel_W_kappa(z, cosmo, z_star=z_star)
+
+    k_np = np.logspace(np.log10(k_min), np.log10(k_max), n_k)
+    k_grid = jnp.asarray(k_np)
+
+    pnl_at_zi = lambda zi: pnl_at_z_nowiggle(
+        k_grid, z=zi, sigma8=sigma8, cosmo=cosmo, Ob=Ob, ns=ns,
+    )
+    P_kz = jax.vmap(pnl_at_zi)(z)
+
+    chi_safe = jnp.where(chi > 0, chi, jnp.inf)
+    weight = b_z_j * nz * W_kappa_z / chi_safe ** 2
+
+    def Pl_at(l, zi_idx):
+        k_at = (l + 0.5) / chi_safe[zi_idx]
+        return jnp.interp(k_at, k_grid, P_kz[zi_idx])
+    z_idx = jnp.arange(z.shape[0])
+    Pl_grid = jax.vmap(jax.vmap(Pl_at, in_axes=(None, 0)),
+                         in_axes=(0, None))(ell_j, z_idx)
+
+    integrand = weight[None, :] * Pl_grid
+    return jnp.trapezoid(integrand, z, axis=1)
+
+
 def planck_pr3_lensing_noise(ell, ell_pivot: float = 100.0,
                                N0: float = 8e-8):
     """Crude approximation to the Planck PR3 lensing reconstruction

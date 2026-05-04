@@ -178,6 +178,65 @@ def cl_gg_limber(
     return cl
 
 
+def cl_gg_limber_nowiggle(
+    ell,
+    z_grid,
+    dndz,
+    cosmo: DistanceCosmo,
+    bias=1.0,
+    sigma8: float = 0.8,
+    Ob: float = 0.049,
+    ns: float = 0.965,
+    k_min: float = 1e-4,
+    k_max: float = 1e2,
+    n_k: int = 1024,
+):
+    """No-BAO-wiggles companion to ``cl_gg_limber``.
+
+    Identical Limber projection but feeds the Eisenstein-Hu zero-baryon
+    P_NL (``pnl_at_z_nowiggle``) so the BAO ringing in C_ell^gg at
+    ell ~ k_BAO chi(z_eff) is absent. Subtract from ``cl_gg_limber`` to
+    isolate the angular BAO template for matched-filter detection.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    ell_j = jnp.asarray(ell, dtype=jnp.float64)
+    z = jnp.asarray(z_grid, dtype=jnp.float64)
+    nz = jnp.asarray(dndz, dtype=jnp.float64)
+    nz = nz / jnp.trapezoid(nz, z)
+
+    chi = comoving_distance(z, cosmo)
+    E = E_of_z(z, cosmo)
+    dchi_dz = C_OVER_H100_MPCH / E
+
+    k_np = np.logspace(np.log10(k_min), np.log10(k_max), n_k)
+    k_grid = jnp.asarray(k_np)
+
+    pnl_at_zi = lambda zi: pnl_at_z_nowiggle(
+        k_grid, z=zi, sigma8=sigma8, cosmo=cosmo, Ob=Ob, ns=ns,
+    )
+    P_kz = jax.vmap(pnl_at_zi)(z)
+
+    chi_safe = jnp.where(chi > 0, chi, jnp.inf)
+    weight = nz ** 2 / (chi_safe ** 2 * dchi_dz)
+
+    def Pl_at(l, zi_idx):
+        k_at = (l + 0.5) / chi_safe[zi_idx]
+        return jnp.interp(k_at, k_grid, P_kz[zi_idx])
+
+    z_idx = jnp.arange(z.shape[0])
+    Pl_grid = jax.vmap(
+        jax.vmap(Pl_at, in_axes=(None, 0)),
+        in_axes=(0, None),
+    )(ell_j, z_idx)
+
+    integrand = weight[None, :] * Pl_grid
+    cl = jnp.trapezoid(integrand, z, axis=1)
+    cl = bias ** 2 * cl
+    return cl
+
+
 def xi_real_at_z(
     s: np.ndarray,
     z_eff: float,
