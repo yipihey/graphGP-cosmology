@@ -96,12 +96,137 @@ def kernel_Gauss_3d(r: np.ndarray, R: float) -> np.ndarray:
               * np.exp(-(r ** 2) / (4.0 * R ** 2)))
 
 
+def kernel_TH_derivative_3d(r: np.ndarray, R: float) -> np.ndarray:
+    """Analytic derivative ``partial K_TH(r; R) / partial R``.
+
+    Differentiating the top-hat sphere kernel with respect to ``R``
+    yields the kernel that, applied to LS pair counts, returns
+    ``d sigma^2(R) / dR`` exactly:
+
+        d K_TH(r; R) / d R
+            = -(9 / (4 pi R^4)) * [1 - r/R + (r/R)^3 / 8]
+
+    for ``r <= 2 R`` and 0 else. The boundary term vanishes because
+    ``K_TH(r = 2R; R) = 0``. Note the kernel is *bipolar*: positive
+    at intermediate ``r`` (where shrinking ``R`` removes partners)
+    and negative at small ``r`` (where shrinking ``R`` retains the
+    same partners but renormalises the volume). The integral
+    ``int dK/dR dV = 0`` by definition of the normalised
+    parent kernel.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    x = r / R
+    g = 1.0 - x + (x ** 3) / 8.0
+    K = np.where(x <= 2.0, -9.0 / (4.0 * np.pi * R ** 4) * g, 0.0)
+    return K
+
+
+def _two_sphere_overlap_volume(r: np.ndarray, R_a: float,
+                                  R_b: float) -> np.ndarray:
+    """Volume of intersection of two solid spheres of radii ``R_a, R_b``
+    at centre-to-centre separation ``r``. Three cases:
+
+        r >= R_a + R_b               -> 0 (no intersection)
+        r <= |R_a - R_b|             -> (4/3) pi min(R_a, R_b)^3
+        |R_a - R_b| < r < R_a + R_b  -> standard lens formula
+
+    The lens formula (e.g. https://mathworld.wolfram.com/Sphere-
+    SphereIntersection.html) for the overlap volume is
+
+        V = pi (R_a + R_b - r)^2 [r^2 + 2 r (R_a + R_b)
+                                    - 3 (R_a - R_b)^2] / (12 r).
+    """
+    r = np.asarray(r, dtype=np.float64)
+    sum_R = float(R_a) + float(R_b)
+    diff_R = abs(float(R_a) - float(R_b))
+    out = np.zeros_like(r)
+    inside = r <= diff_R
+    out = np.where(inside,
+                     (4.0 * np.pi / 3.0) * (min(R_a, R_b) ** 3),
+                     out)
+    overlap = (r > diff_R) & (r < sum_R)
+    rr = np.where(overlap, r, 1.0)         # avoid div0; masked below
+    lens = (np.pi * (sum_R - rr) ** 2
+              * (rr ** 2 + 2.0 * rr * sum_R - 3.0 * diff_R ** 2)
+              / (12.0 * rr))
+    out = np.where(overlap, lens, out)
+    return out
+
+
+def kernel_shell_3d(r: np.ndarray, R_inner: float,
+                     R_outer: float) -> np.ndarray:
+    """Thick-spherical-shell overlap kernel, normalised so
+    ``int K_shell(r; R_in, R_out) dV = 1``.
+
+    A thick shell of inner radius ``R_in`` and outer radius ``R_out``
+    is the set difference of two top-hat spheres, with volume
+    ``V_shell = (4 pi / 3) (R_out^3 - R_in^3)``. The kernel is the
+    auto-correlation of the indicator function of the shell, divided
+    by ``V_shell^2``::
+
+        K_shell(r) = (V_oo(r) - 2 V_io(r) + V_ii(r)) / V_shell^2
+
+    where ``V_ab(r)`` is the overlap volume of two solid spheres of
+    radii ``R_a, R_b`` at separation ``r``. Always non-negative, and
+    in the thin-shell limit (``R_out - R_in << R``) the kernel
+    approaches a delta function at ``r = 0`` -- the natural
+    "variance of count in a shell" probe.
+
+    Apply this kernel to LS pair counts to recover the
+    spherical-shell two-point variance ``sigma^2_shell``, the
+    physical analogue of ``d sigma^2 / dR``. With normalisation
+    ``1 / (R_out - R_in)`` and ``R_out - R_in -> 0`` it converges to
+    a derivative-kernel-based estimator of ``d sigma^2 / dR``.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    R1 = float(R_inner); R2 = float(R_outer)
+    if R2 <= R1:
+        raise ValueError("R_outer must be > R_inner")
+    V_shell = (4.0 * np.pi / 3.0) * (R2 ** 3 - R1 ** 3)
+    V22 = _two_sphere_overlap_volume(r, R2, R2)
+    V12 = _two_sphere_overlap_volume(r, R1, R2)
+    V11 = _two_sphere_overlap_volume(r, R1, R1)
+    return (V22 - 2.0 * V12 + V11) / (V_shell ** 2)
+
+
 def _kernel_for(kernel: str):
     if kernel == "tophat":
         return kernel_TH_3d
     if kernel in {"gauss", "gaussian"}:
         return kernel_Gauss_3d
+    if kernel in {"derivative", "dkdr"}:
+        return kernel_TH_derivative_3d
     raise ValueError(f"unknown kernel {kernel!r}")
+
+
+def dsigma2_dR_from_xi(
+    r_grid: np.ndarray, xi: np.ndarray, R_grid: np.ndarray,
+) -> np.ndarray:
+    """``d sigma^2(R) / d R`` by analytic-derivative-kernel projection
+    of an existing ``xi(r)`` curve. Uses ``kernel_TH_derivative_3d``
+    so the result is the *exact* derivative of ``sigma2_from_xi`` --
+    no finite-difference noise.
+    """
+    r = np.asarray(r_grid, dtype=np.float64)
+    xi = np.asarray(xi, dtype=np.float64)
+    R_grid = np.asarray(R_grid, dtype=np.float64).ravel()
+    out = np.zeros_like(R_grid)
+    for i, R in enumerate(R_grid):
+        K = kernel_TH_derivative_3d(r, float(R))
+        out[i] = np.trapezoid(4.0 * np.pi * r ** 2 * xi * K, r)
+    return out
+
+
+def sigma2_shell_from_xi(
+    r_grid: np.ndarray, xi: np.ndarray, R_inner: float, R_outer: float,
+) -> float:
+    """``sigma^2_shell(R_in, R_out)`` -- variance of count in a thick
+    spherical shell, by ``kernel_shell_3d`` projection of ``xi(r)``.
+    Always non-negative when ``xi >= 0``."""
+    r = np.asarray(r_grid, dtype=np.float64)
+    xi = np.asarray(xi, dtype=np.float64)
+    K = kernel_shell_3d(r, float(R_inner), float(R_outer))
+    return float(np.trapezoid(4.0 * np.pi * r ** 2 * xi * K, r))
 
 
 def sigma2_from_xi(
