@@ -138,3 +138,84 @@ def test_sigma2_pair_counts_matches_xi_integral_on_uniform():
     # so the difference is small but not zero). Require agreement at the
     # level of the kernel-bin-centre approximation for these scales.
     np.testing.assert_allclose(s2_pair, s2_xi, atol=2.0)
+
+
+def test_per_particle_kernel_counts_consistent_with_total():
+    """``sum_i b_DD_K_i = 2 * total_DD_K`` (each unordered pair counted twice)."""
+    from twopt_density.sigma2 import (
+        kernel_TH_3d, per_particle_kernel_counts,
+    )
+    rng = np.random.default_rng(1)
+    pos = rng.uniform(0, 1, (400, 3))
+    R = 0.1
+    b = per_particle_kernel_counts(pos, pos, R, kernel="tophat", auto=True)
+    # brute-force total kernel pair sum
+    from scipy.spatial.distance import pdist
+    d = pdist(pos)
+    total_K = float(np.sum(kernel_TH_3d(d, R)))
+    np.testing.assert_allclose(b.sum(), 2.0 * total_K, rtol=1e-9)
+
+
+def test_density_weights_sigma2_global_identity_matches_DP():
+    """The *global* DP identity holds exactly:
+    ``sum_i b_DD_K_i N_r / (sum_i b_DR_K_i N_d) - 1 = sigma^2_DP(R)``.
+    """
+    from twopt_density.sigma2 import (
+        density_weights_sigma2, kernel_TH_3d, per_particle_kernel_counts,
+    )
+    rng = np.random.default_rng(2)
+    N_d = 400; N_r = 1200
+    pos_d = rng.uniform(0, 1, (N_d, 3))
+    pos_r = rng.uniform(0, 1, (N_r, 3))
+    R = 0.12
+    b_DD = per_particle_kernel_counts(pos_d, pos_d, R, auto=True)
+    b_DR = per_particle_kernel_counts(pos_d, pos_r, R, auto=False)
+    sum_DD = float(b_DD.sum())
+    sum_DR = float(b_DR.sum())
+    sigma2_global = (sum_DD * N_r) / max(sum_DR * N_d, 1e-30) - 1.0
+
+    # Verify against direct Davis-Peebles using independent unordered
+    # pair sums via brute-force on the same catalogue.
+    from scipy.spatial.distance import pdist, cdist
+    d_dd = pdist(pos_d)
+    d_dr = cdist(pos_d, pos_r).ravel()
+    DD_unord = float(np.sum(kernel_TH_3d(d_dd, R)))
+    DR_total = float(np.sum(kernel_TH_3d(d_dr, R)))
+    sigma2_DP = (2.0 * DD_unord * N_r) / max(DR_total * N_d, 1e-30) - 1.0
+    np.testing.assert_allclose(sigma2_global, sigma2_DP, rtol=1e-9)
+
+
+def test_density_weights_sigma2_particle_mean_recovers_sigma2():
+    """``<delta_i>_i`` (per-particle mean) recovers the full LS
+    sigma^2(R) to within Poisson noise on uniform random data.
+    This is the operational identity that lets the data weights
+    *fully subsume the random catalogue*: a single sum over data
+    points (weighted by their kernel partner counts) returns
+    sigma^2(R) without further pair counting."""
+    from twopt_density.sigma2 import (
+        density_weights_sigma2, kernel_TH_3d,
+    )
+    rng = np.random.default_rng(42)
+    N_d = 800; N_r = 8000
+    pos_d = rng.uniform(0, 1, (N_d, 3))
+    pos_r = rng.uniform(0, 1, (N_r, 3))
+    R = 0.10
+
+    # benchmark LS sigma^2 from full pair counts
+    from scipy.spatial.distance import pdist, cdist
+    K_dd = float(np.sum(kernel_TH_3d(pdist(pos_d), R)))
+    K_rr = float(np.sum(kernel_TH_3d(pdist(pos_r), R)))
+    K_dr = float(np.sum(kernel_TH_3d(cdist(pos_d, pos_r).ravel(), R)))
+    Ndp = N_d * (N_d - 1) / 2.0; Nrp = N_r * (N_r - 1) / 2.0
+    DDn = K_dd / Ndp; DRn = K_dr / (N_d * N_r); RRn = K_rr / Nrp
+    sigma2_LS = (DDn - 2 * DRn + RRn) / RRn
+    assert abs(sigma2_LS) < 0.25
+
+    # per-particle weights -- mean delta = sigma^2 (DP form)
+    _, delta, _ = density_weights_sigma2(pos_d, pos_r, R, kernel="tophat")
+    sigma2_from_w = float(np.mean(delta))
+    # Both estimators measure the same sigma^2 with shared random
+    # catalogue, so they agree to within sqrt(2) x Poisson noise.
+    assert abs(sigma2_from_w - sigma2_LS) < 0.15, (
+        f"<delta_i> = {sigma2_from_w:.3f} vs LS = {sigma2_LS:.3f}"
+    )

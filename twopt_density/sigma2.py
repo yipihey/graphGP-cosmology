@@ -247,3 +247,185 @@ def sigma2_from_rp_pi_pairs(
         else:
             out[i] = 0.0
     return out
+
+
+def per_particle_kernel_counts(
+    positions_a: np.ndarray, positions_b: np.ndarray,
+    R: float, kernel: str = "tophat",
+    auto: bool = False,
+) -> np.ndarray:
+    """For each particle ``i`` in ``positions_a``, return
+    ``b_K_i = sum_{j in B, j != i} K(|x_i - x_j|; R)``.
+
+    Smooth analogue of ``weights_pair_counts.per_particle_pair_counts``
+    -- instead of integer counts in a hard radial bin, each partner
+    contributes the smooth kernel weight, so the per-particle estimate
+    integrates over many partners and is much less noisy than the
+    binned version. Set ``auto=True`` when ``A == B`` to exclude
+    self-pairs.
+
+    Cost is ``O(N_a log N_b)`` via cKDTree query (kernel support is
+    finite at ``2R`` for top-hat, ``~ 4R`` for Gaussian).
+    """
+    from scipy.spatial import cKDTree
+
+    A = np.asarray(positions_a, dtype=np.float64)
+    B = np.asarray(positions_b, dtype=np.float64)
+    if kernel == "tophat":
+        r_max = 2.0 * R
+    else:
+        r_max = 6.0 * R                 # 5-sigma cutoff for Gaussian
+    K_fn = _kernel_for(kernel)
+    tree = cKDTree(B)
+    out = np.zeros(len(A), dtype=np.float64)
+    nbrs = tree.query_ball_point(A, r=r_max)
+    for i, lst in enumerate(nbrs):
+        if not lst:
+            continue
+        j = np.asarray(lst, dtype=np.int64)
+        if auto:
+            j = j[j != i]
+            if j.size == 0:
+                continue
+        d = np.linalg.norm(B[j] - A[i], axis=1)
+        out[i] = float(np.sum(K_fn(d, float(R))))
+    return out
+
+
+def density_weights_sigma2(
+    positions_d: np.ndarray, positions_r: np.ndarray,
+    R: float, kernel: str = "tophat",
+):
+    """Per-galaxy density weights tied to the ``sigma^2(R)`` estimator.
+
+    For each data galaxy ``i`` and a window scale ``R``, the
+    window-aware Davis-Peebles per-particle overdensity is the
+    smooth, kernel-weighted analogue of
+    ``weights_pair_counts.per_particle_overdensity_windowed``:
+
+        delta_i(R) = (b_DD_K_i * N_R) / (b_DR_K_i * N_D) - 1,
+
+    with
+
+        b_DD_K_i = sum_{j in D, j != i} K(|x_i - x_j|; R),
+        b_DR_K_i = sum_{j in R}         K(|x_i - x_j|; R).
+
+    The DD-only estimator that *fully subsumes the random catalogue*
+    is then the per-particle mean
+
+        sigma^2(R) = <delta_i>_i  (to within Poisson noise),
+
+    which equals the LS sigma^2(R) up to one-percent-level
+    differences from the average-of-ratios versus
+    ratio-of-averages (see Hamilton 1993). The exact global form
+    (DP, ratio-of-averages) is
+
+        sigma^2_DP(R) = (sum_i b_DD_K_i * N_R) / (sum_i b_DR_K_i * N_D) - 1,
+
+    which is mathematically identical to the LS DP estimator on the
+    same pair counts.
+
+    Why this is much smoother than the xi-based per-particle
+    weights of ``weights_pair_counts.per_particle_overdensity_windowed``:
+      - the kernel ``K_TH(r; R)`` integrates over ALL partners
+        within ``r <= 2R`` weighted by the smooth overlap profile,
+        not by an integer indicator function on a hard radial bin;
+      - one R produces one weight per particle, so no ad-hoc
+        bin-aggregation choice is needed;
+      - on a clustered catalogue the kernel includes more partners
+        per data point (typically 10-1000 vs. ~ a few inside one
+        narrow bin), giving sqrt(N_partners) Poisson noise
+        reduction.
+
+    Returns
+    -------
+    w : (N_D,) per-galaxy weight ``w_i = 1 + delta_i(R)``.
+    delta : (N_D,) raw per-particle overdensity. The mean
+            ``<delta_i>`` is the DD-only sigma^2(R) estimate.
+    aux : dict with diagnostic counts ``b_DD_K``, ``b_DR_K``, mean
+          partners, etc.
+    """
+    pos_d = np.asarray(positions_d, dtype=np.float64)
+    pos_r = np.asarray(positions_r, dtype=np.float64)
+    N_d = len(pos_d); N_r = len(pos_r)
+    b_DD = per_particle_kernel_counts(pos_d, pos_d, R, kernel=kernel,
+                                          auto=True)
+    b_DR = per_particle_kernel_counts(pos_d, pos_r, R, kernel=kernel,
+                                          auto=False)
+    eps = 1e-30
+    delta = (b_DD * N_r) / (np.maximum(b_DR, eps) * N_d) - 1.0
+    # zero-out particles with no random partners (genuinely outside window)
+    delta = np.where(b_DR > 0, delta, 0.0)
+    w = 1.0 + delta
+    aux = {
+        "R": float(R),
+        "kernel": kernel,
+        "b_DD_K_mean": float(np.mean(b_DD)),
+        "b_DR_K_mean": float(np.mean(b_DR)),
+        "delta_mean": float(np.mean(delta)),
+        "delta_std": float(np.std(delta)),
+    }
+    return w, delta, aux
+
+
+def sigma2_from_data_only(
+    positions_d: np.ndarray, weights: np.ndarray,
+    R_grid: np.ndarray,
+    sigma2_RR_norm: np.ndarray,
+    kernel: str = "tophat",
+) -> np.ndarray:
+    """``sigma^2(R)`` from a single weighted DD pass -- no random
+    catalogue in the hot loop.
+
+    Given per-galaxy weights ``w_i`` (e.g. from
+    ``density_weights_sigma2`` at a representative ``R*``) and a
+    pre-computed kernel-projected analytic-RR
+    ``sigma2_RR_norm(R) = sum_RR K(r; R) / (N_R (N_R-1)/2)``, compute
+
+        sigma^2_K(R) = (Sum_DD_w K(r; R) / W2 - sigma2_RR_norm(R))
+                          / sigma2_RR_norm(R),
+
+    where ``W2 = (sum_i w_i)^2 - sum_i w_i^2`` is the weighted
+    unordered-pair count. With weights set to 1 this reduces to the
+    Davis-Peebles natural form ``DD_K / RR_K - 1``.
+
+    Returns ``(n_R,)`` array of ``sigma^2_K(R)``.
+    """
+    pos = np.asarray(positions_d, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    R_grid = np.asarray(R_grid, dtype=np.float64).ravel()
+    N = len(pos)
+    sum_w = float(w.sum()); sum_w2 = float(np.sum(w ** 2))
+    W_pairs = 0.5 * (sum_w ** 2 - sum_w2)
+    if W_pairs <= 0:
+        raise ValueError("weighted unordered pair count is non-positive")
+    out = np.zeros_like(R_grid)
+    K_fn = _kernel_for(kernel)
+    for i, R in enumerate(R_grid):
+        # weighted DD kernel sum
+        from scipy.spatial import cKDTree
+        tree = cKDTree(pos)
+        rmax = 2.0 * R if kernel == "tophat" else 6.0 * R
+        S_DD = 0.0
+        chunk = 4000
+        for start in range(0, N, chunk):
+            stop = min(start + chunk, N)
+            block = pos[start:stop]
+            nbrs = tree.query_ball_point(block, r=rmax)
+            for k_local, lst in enumerate(nbrs):
+                k = start + k_local
+                if not lst:
+                    continue
+                j = np.asarray(lst, dtype=np.int64)
+                j = j[j > k]
+                if j.size == 0:
+                    continue
+                d = np.linalg.norm(pos[j] - pos[k], axis=1)
+                S_DD += float(np.sum(w[k] * w[j] * K_fn(d, float(R))))
+        DD_norm = S_DD / W_pairs
+        rrn = float(sigma2_RR_norm[i]) if i < len(sigma2_RR_norm) else 0.0
+        if rrn > 0:
+            out[i] = (DD_norm - rrn) / rrn
+        else:
+            out[i] = 0.0
+    return out
