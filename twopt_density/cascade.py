@@ -294,6 +294,115 @@ def anisotropy(
         return _read_csv(os.path.join(out_dir, "field_anisotropy.csv"))
 
 
+def pairs(
+    positions: np.ndarray, box_size: float,
+    dim: Optional[int] = None, periodic: bool = True,
+    max_depth: Optional[int] = None,
+    crossover_threshold: Optional[int] = None,
+) -> np.ndarray:
+    """Per-shell DD pair counts at every dyadic scale, no randoms
+    needed. Returns a structured array with columns
+    ``level, cell_side_trimmed, cell_side_phys, r_inner_phys,
+    r_outer_phys, n_pairs, cumulative_pairs``.
+
+    The headline observable for combining with our
+    ``twopt_density.analytic_rr`` machinery: the cascade gives DD in
+    one ``O(N log N)`` pass and the analytic-window RR/DR fill in
+    the random side without instantiating an MC random catalogue.
+    """
+    pos = np.asarray(positions)
+    D = int(dim) if dim is not None else pos.shape[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "pts.bin")
+        out_dir = os.path.join(tmp, "out")
+        os.makedirs(out_dir, exist_ok=True)
+        _write_points_bin(pos, in_path)
+        args = _common_args(in_path, out_dir, D, box_size,
+                              periodic=periodic)
+        if max_depth is not None:
+            args += ["--max-depth", str(int(max_depth))]
+        if crossover_threshold is not None:
+            args += ["--crossover-threshold",
+                       str(int(crossover_threshold))]
+        _run("pairs", args)
+        return _read_csv(os.path.join(out_dir, "pairs.csv"))
+
+
+def xi_landy_szalay_from_window(
+    positions: np.ndarray,
+    ra_deg: np.ndarray, dec_deg: np.ndarray, z_data: np.ndarray,
+    sel_map: np.ndarray, nside: int, cosmo,
+    box_size: Optional[float] = None,
+    n_random_factor: int = 10,
+    rng_seed: int = 0,
+    weights_data: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Landy-Szalay xi(r) per dyadic shell, with the random catalogue
+    generated **internally** from the survey window (mask + n(z)). The
+    user never instantiates randoms.
+
+    Pipeline:
+      1. Sample ``n_random_factor * N_d`` random points in (RA, Dec, z)
+         from the separable window ``W(Omega, z) = sel_map(Omega)
+         n(z)`` via ``twopt_density.quaia.make_random_from_selection_function``.
+      2. Convert to comoving xyz under ``cosmo`` and shift both data
+         and random to non-negative coords (cKDTree requirement).
+      3. Run the morton_cascade ``xi`` subcommand. Returns full LS
+         output at every dyadic shell.
+
+    For surveys whose selection function is angular-only at NSIDE
+    (Quaia, DESI footprint), this is the natural way to combine the
+    cascade's O(N log N) pair-count machinery with our analytic-window
+    ``2D randoms``: the synthesised random encodes the same ``M(Omega)
+    n(z)`` factorisation that ``analytic_rr`` uses, so LS is consistent
+    with the existing wp(rp) / sigma^2(R) pipelines.
+
+    Parameters
+    ----------
+    positions : (N_d, 3) data comoving positions [Mpc/h].
+    ra_deg, dec_deg, z_data : data sky coordinates and redshifts;
+        used to build the random-side n(z) and to anchor the survey
+        footprint sampling.
+    sel_map : (NPIX,) HEALPix angular completeness map (Storey-Fisher
+        style), in [0, 1].
+    nside : HEALPix NSIDE of ``sel_map``.
+    cosmo : ``DistanceCosmo`` for comoving conversions.
+    box_size : optional bounding-box side (Mpc/h); inferred from the
+        union of (data, random) positions if not given.
+
+    Returns
+    -------
+    structured array as ``xi_landy_szalay`` (per-shell DD/RR/DR/xi_LS).
+    """
+    from .distance import radec_z_to_cartesian
+    from .quaia import make_random_from_selection_function
+
+    pos_d = np.asarray(positions, dtype=np.float64)
+    if pos_d.shape[1] != 3:
+        raise ValueError("positions must be (N_d, 3) comoving xyz")
+    n_d = len(pos_d)
+    n_r = max(int(n_random_factor) * n_d, 1)
+
+    rng = np.random.default_rng(rng_seed)
+    ra_r, dec_r, z_r = make_random_from_selection_function(
+        sel_map=sel_map, n_random=n_r, z_data=np.asarray(z_data),
+        nside=nside, rng=rng,
+    )
+    pos_r = radec_z_to_cartesian(ra_r, dec_r, z_r, cosmo)
+
+    all_xyz = np.vstack([pos_d, pos_r])
+    shift = -all_xyz.min(axis=0) + 100.0
+    pos_d_s = pos_d + shift
+    pos_r_s = pos_r + shift
+    if box_size is None:
+        box_size = float(np.max(np.vstack([pos_d_s, pos_r_s])) + 100.0)
+
+    return xi_landy_szalay(
+        pos_d_s, pos_r_s, box_size=box_size, dim=3, periodic=False,
+        weights_data=weights_data,
+    )
+
+
 def gradient(
     positions: np.ndarray, box_size: float,
     target_level: int, dim: Optional[int] = None, periodic: bool = True,
