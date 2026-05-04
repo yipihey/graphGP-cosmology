@@ -77,6 +77,8 @@ def angular_corr_from_mask(
     mask: np.ndarray, nside: int, lmax: int = None,
     n_theta: int = 600, theta_max_rad: float = 0.5,
     deconvolve_pixwin: bool = False,
+    taper: str = "hann", taper_l_start_frac: float = 0.7,
+    gauss_l_smooth_frac: float = 0.5,
 ):
     """Angular auto-correlation ``xi_mask(theta)`` of a healpix mask.
 
@@ -87,12 +89,30 @@ def angular_corr_from_mask(
 
         xi(theta) = sum_l (2 l + 1) / (4 pi) * C_l * P_l(cos theta)
 
-    The pixwin deconvolution matters at angles below ~ 1/lmax (fraction
-    of a deg for NSIDE=64) -- it's exactly the regime where MC pair
-    counts at small rp see additional structure that the smooth Legendre
-    approximation otherwise misses. The pixwin file is read via
-    ``_load_pixwin`` which falls back to a local copy in
-    ``data/healpy/`` if ``hp.pixwin``'s download fails.
+    Sharp truncation at ``lmax`` produces Gibbs ringing in
+    ``xi_mask(theta)`` at angles below ``~ pi / lmax``. We default to a
+    Hann (raised-cosine) taper from ``taper_l_start_frac * lmax`` to
+    ``lmax`` which suppresses the ringing while leaving the BAO-scale
+    (low to mid-l) signal essentially unchanged. For NSIDE=64 (lmax=191)
+    the safe angular scale is ``theta > pi/lmax ~ 1 deg``, corresponding
+    to ``r_p > 60 Mpc/h`` at the Quaia median ``chi(z=1.5) ~ 3500
+    Mpc/h``; below that the analytic RR is fundamentally limited by
+    the mask resolution, not the cutoff form.
+
+    Parameters
+    ----------
+    taper : ``{"none", "hann", "gauss"}``, default ``"hann"``.
+        Smooth tapering of high-l C_l before the Legendre transform.
+        Use ``"none"`` to recover the original sharp cutoff (for
+        diagnostics).
+    taper_l_start_frac : float
+        For ``taper="hann"``, the C_l is multiplied by ``cos^2(pi/2 *
+        (l - l_start) / (lmax - l_start))`` for ``l > l_start``,
+        with ``l_start = taper_l_start_frac * lmax``. Default ``0.7``.
+    gauss_l_smooth_frac : float
+        For ``taper="gauss"``, multiplicative ``exp(-0.5
+        (l/l_smooth)^2)`` with ``l_smooth = gauss_l_smooth_frac *
+        lmax``. Default ``0.5``.
 
     Returns
     -------
@@ -106,14 +126,25 @@ def angular_corr_from_mask(
     cl = hp.anafast(mask, lmax=lmax)
     if deconvolve_pixwin:
         wpix = _load_pixwin(nside, lmax=lmax)
-        # avoid divide-by-zero at high l where pixwin -> 0
         wpix2 = np.maximum(wpix ** 2, 1e-6)
         cl = cl / wpix2
+    if taper != "none":
+        ell = np.arange(lmax + 1, dtype=np.float64)
+        if taper == "hann":
+            l_start = taper_l_start_frac * lmax
+            t = np.ones_like(ell)
+            in_band = (ell >= l_start) & (ell <= lmax)
+            x = (ell[in_band] - l_start) / max(lmax - l_start, 1.0)
+            t[in_band] = np.cos(0.5 * np.pi * x) ** 2
+            cl = cl * t
+        elif taper == "gauss":
+            l_smooth = max(gauss_l_smooth_frac * lmax, 1.0)
+            cl = cl * np.exp(-0.5 * (ell / l_smooth) ** 2)
+        else:
+            raise ValueError(f"unknown taper: {taper!r}")
     theta = np.linspace(1e-6, theta_max_rad, n_theta)
     cos_theta = np.cos(theta)
     xi = np.zeros_like(theta)
-    # Stable Legendre recurrence: P_0=1, P_1=cos, P_l = ((2l-1) cos P_{l-1}
-    # - (l-1) P_{l-2}) / l.
     P_prev = np.ones_like(cos_theta)
     xi += (2 * 0 + 1) / (4 * np.pi) * cl[0] * P_prev
     if len(cl) > 1:
@@ -177,6 +208,7 @@ def rr_analytic(
     kde_bandwidth: float = 0.05,
     lmax: int = None,
     theta_max_rad: float = 0.5,
+    taper: str = "hann",
 ) -> AnalyticRRResult:
     """Analytic RR(rp, pi) under a separable W = mask(Omega) * n(z).
 
@@ -185,6 +217,12 @@ def rr_analytic(
     times the per-pair density returned by this routine. We return
     ``RR`` un-normalised by N_r^2 (i.e. the pair-density form ready
     for the LS estimator).
+
+    The ``taper`` argument controls how the high-l mask C_l is
+    suppressed before the Legendre transform; default ``"hann"``
+    eliminates Gibbs ringing in xi_mask(theta) without measurably
+    biasing the BAO-scale signal. See ``angular_corr_from_mask`` for
+    the full menu (none / hann / gauss).
     """
     rp_edges = np.asarray(rp_edges, dtype=np.float64)
     pi_edges = np.asarray(pi_edges, dtype=np.float64)
@@ -195,6 +233,7 @@ def rr_analytic(
 
     theta_grid, xi_mask = angular_corr_from_mask(
         mask, nside, lmax=lmax, theta_max_rad=theta_max_rad,
+        taper=taper,
     )
     chi_grid, n_chi = radial_pair_density_from_z(
         z_data, cosmo, n_chi_bins=n_chi_bins, kde_bandwidth=kde_bandwidth,
