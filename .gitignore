@@ -11,3 +11,9 @@ data/quaia/
 data/planck/PR4_variations/
 data/planck/planck_pr4_kappa_*.fits
 data/desi/*.fits
+
+# LaTeX intermediates
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.toc
