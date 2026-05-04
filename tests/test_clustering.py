@@ -589,6 +589,85 @@ def test_dr_analytic_simple_scaling():
     np.testing.assert_allclose(out, RR * (2.0 * 100 / 300))
 
 
+def test_pair_z_distribution_returns_normalised_pdf():
+    """``pair_z_distribution`` must return a PDF normalised to 1."""
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.evolution import pair_z_distribution
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    rng = np.random.default_rng(0)
+    z = rng.uniform(0.5, 2.5, size=5000)
+    z_g, pdf, n_kept = pair_z_distribution(z, cosmo, pi_max=200.0,
+                                              n_pairs=10000, n_bins=40,
+                                              rng=rng)
+    assert n_kept > 0
+    np.testing.assert_allclose(np.trapezoid(pdf, z_g), 1.0, rtol=1e-10)
+
+
+def test_wp_pair_evolved_reduces_to_wp_observed_at_delta_pdf():
+    """A delta-function pair-z PDF (all pairs at one z) and a constant
+    b(z) must reproduce ``wp_observed`` at that z."""
+    import jax.numpy as jnp
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.evolution import wp_pair_evolved
+    from twopt_density.limber import wp_observed
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    z_g = np.linspace(1.4, 1.6, 40)
+    pdf = np.exp(-0.5 * ((z_g - 1.5) / 0.005) ** 2)
+    pdf = pdf / np.trapezoid(pdf, z_g)
+    b_z = np.full_like(z_g, 2.6)
+    sigma_chi_z = np.full_like(z_g, 160.0)
+    rp = jnp.array([10.0, 30.0, 60.0])
+    wp_evol = np.asarray(wp_pair_evolved(
+        rp, z_g, pdf, b_z, sigma_chi_z, cosmo, pi_max=200.0,
+    ))
+    wp_obs = np.asarray(wp_observed(
+        rp, z_eff=1.5, sigma_chi_eff=160.0, cosmo=cosmo, bias=2.6,
+        pi_max=200.0,
+    ))
+    np.testing.assert_allclose(wp_evol, wp_obs, rtol=2e-3)
+
+
+def test_effective_amplitude_is_unity_for_constant_b_and_z():
+    """Constant b(z) at z_eff = mean of pair-z PDF must give A_eff = 1
+    only after scaling out the single-z normalisation: with b constant
+    the ratio sqrt(<b^2 D^2>) / [b(z_eff) D(z_eff)] = sqrt(<D^2>/D^2(z_eff)),
+    not exactly 1 for a non-delta pair-z PDF. So we test that the value
+    is finite and within ~ 5% of 1."""
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.evolution import (
+        effective_amplitude_under_evolution,
+    )
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    z_g = np.linspace(1.0, 2.0, 80)
+    pdf = np.exp(-0.5 * ((z_g - 1.5) / 0.2) ** 2)
+    pdf = pdf / np.trapezoid(pdf, z_g)
+    b_z = np.full_like(z_g, 2.5)
+    A = effective_amplitude_under_evolution(z_g, pdf, b_z, cosmo,
+                                              z_eff=1.5)
+    assert 0.95 < A < 1.05
+
+
+def test_optimal_clustering_weights_normalised_and_positive():
+    """``optimal_clustering_weights`` returns a positive weight vector
+    with mean exactly 1, smaller variance than uniform unless b(z)
+    is highly non-monotonic."""
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.evolution import optimal_clustering_weights
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    rng = np.random.default_rng(0)
+    z_data = rng.uniform(0.5, 2.5, size=10000)
+    z_grid_b = np.linspace(0.5, 2.5, 80)
+    b_z = 2.0 * ((1 + z_grid_b) / 2.5) ** 1.0
+    w = optimal_clustering_weights(z_data, b_z, z_grid_b, cosmo)
+    assert (w > 0).all()
+    np.testing.assert_allclose(w.mean(), 1.0, rtol=1e-12)
+    assert w.std() > 0
+
+
 def test_coordinate_templates_have_correct_shape():
     """``coordinate_templates`` returns the right number of healpix
     maps with values in expected ranges."""
