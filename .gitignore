@@ -10,3 +10,4 @@ data/quaia/
 # (the rest of data/ is checked in: pixel-window FITS for analytic RR, etc.)
 data/planck/PR4_variations/
 data/planck/planck_pr4_kappa_*.fits
+data/desi/*.fits
