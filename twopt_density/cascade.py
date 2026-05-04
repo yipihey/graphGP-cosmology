@@ -403,6 +403,188 @@ def xi_landy_szalay_from_window(
     )
 
 
+def analytic_window_grid(
+    sel_map: np.ndarray, nside: int,
+    z_data: np.ndarray, cosmo,
+    n_grid: int = 64,
+    z_min: Optional[float] = None,
+    z_max: Optional[float] = None,
+    chi_pad: float = 100.0,
+    z_kde_bandwidth: float = 0.05,
+):
+    """Deterministic 'analytic random' on a Cartesian grid: tile the
+    bounding cube of the survey at resolution ``n_grid^3`` and assign
+    each cell centre a weight proportional to the integrated survey
+    window ``W(Omega, z) = sel_map(Omega) * n(z)`` over that cell.
+
+    Returns ``(positions, weights, box_size)`` where ``positions`` is
+    ``(n_grid^3, 3)`` Cartesian (Mpc/h, shifted into the non-negative
+    octant) and ``weights[i] = M(Omega_i) * n(z_i) / (chi_i^2
+    dchi/dz_i) * V_cell`` (proportional to the expected count of
+    randoms in cell ``i`` for any uniformly-window-sampled random
+    catalogue). Cells outside the survey radial range have weight 0.
+
+    Used by ``xi_landy_szalay_analytic_RR`` as the cascade's
+    "random catalogue": running cascade ``xi`` with these
+    weights returns LS xi(r) per dyadic shell with **MC-noise-free
+    analytic RR**.
+
+    Parameters
+    ----------
+    sel_map : (NPIX,) HEALPix angular completeness in [0, 1].
+    nside : HEALPix NSIDE of ``sel_map``.
+    z_data : observed redshifts (used to build the n(z) PDF).
+    cosmo : ``DistanceCosmo``.
+    n_grid : grid resolution per axis. Cell side = box_side / n_grid.
+        Defaults to 64; for the cascade to faithfully sample dyadic
+        levels down to L, ``n_grid`` should be ``>= 2^L``.
+    z_min, z_max : radial bounds; default to the data redshift range.
+    chi_pad : padding in Mpc/h around chi(z_max).
+    z_kde_bandwidth : Gaussian KDE bandwidth in z, used to smooth the
+        n(z) histogram.
+    """
+    import healpy as hp
+    import jax.numpy as jnp
+
+    from .distance import (
+        cartesian_to_radec_z, comoving_distance,
+    )
+
+    if z_min is None:
+        z_min = float(np.min(z_data))
+    if z_max is None:
+        z_max = float(np.max(z_data))
+
+    chi_at_z = np.asarray(comoving_distance(
+        jnp.asarray([z_min, z_max], dtype=jnp.float64), cosmo))
+    chi_min, chi_max = float(chi_at_z[0]), float(chi_at_z[1])
+
+    half = chi_max + chi_pad
+    edges = np.linspace(-half, half, n_grid + 1)
+    centres = 0.5 * (edges[1:] + edges[:-1])
+    cell_side = float(edges[1] - edges[0])
+    dV = cell_side ** 3
+
+    XX, YY, ZZ = np.meshgrid(centres, centres, centres, indexing="ij")
+    pos = np.column_stack([XX.ravel(), YY.ravel(), ZZ.ravel()])
+    chi = np.linalg.norm(pos, axis=1)
+    in_radial = (chi >= chi_min) & (chi <= chi_max)
+
+    # smooth n(z) PDF
+    z_arr = np.asarray(z_data)
+    z_pdf_grid = np.linspace(z_min - 0.05, z_max + 0.05, 200)
+    delta_z = z_pdf_grid[:, None] - z_arr[None, :]
+    nz_pdf = np.exp(-0.5 * (delta_z / z_kde_bandwidth) ** 2).sum(axis=1)
+    nz_pdf = nz_pdf / max(np.trapezoid(nz_pdf, z_pdf_grid), 1e-30)
+
+    # convert all grid points to (ra, dec, z); weight = M * n(z) / chi^2 dchi/dz
+    ra_g, dec_g, z_g = cartesian_to_radec_z(
+        jnp.asarray(pos, dtype=jnp.float64), cosmo)
+    ra_g = np.asarray(ra_g); dec_g = np.asarray(dec_g)
+    z_g = np.asarray(z_g)
+    pix = hp.ang2pix(nside, np.deg2rad(90.0 - dec_g), np.deg2rad(ra_g))
+    M_at = np.asarray(sel_map)[pix]
+    n_at = np.interp(z_g, z_pdf_grid, nz_pdf, left=0.0, right=0.0)
+
+    # dchi/dz at z_g via numerical derivative on a dense grid
+    z_dense = np.linspace(0.0, z_max + 0.5, 4000)
+    chi_dense = np.asarray(comoving_distance(
+        jnp.asarray(z_dense, dtype=jnp.float64), cosmo))
+    dchi_dz_dense = np.gradient(chi_dense, z_dense)
+    dchi_dz_g = np.interp(z_g, z_dense, dchi_dz_dense)
+
+    chi_safe = np.where(chi > 0, chi, 1.0)
+    weights = np.where(in_radial,
+                          M_at * n_at / (chi_safe ** 2 * np.maximum(
+                              dchi_dz_g, 1e-12)) * dV,
+                          0.0)
+    weights = np.where(weights > 0, weights, 0.0)
+
+    # shift positions into the non-negative octant for cKDTree
+    shift = -pos.min(axis=0) + 100.0
+    pos_s = pos + shift
+    box_size = float(np.max(pos_s) + 100.0)
+
+    return pos_s, weights, box_size
+
+
+def xi_landy_szalay_analytic_RR(
+    positions: np.ndarray,
+    sel_map: np.ndarray, nside: int,
+    z_data: np.ndarray, cosmo,
+    n_grid: int = 64,
+    weights_data: Optional[np.ndarray] = None,
+    weight_threshold: float = 1e-12,
+    z_min: Optional[float] = None,
+    z_max: Optional[float] = None,
+):
+    """Cascade Landy-Szalay xi(r) with **deterministic analytic RR**:
+    no MC random catalogue.
+
+    The "random catalogue" is replaced by a regular Cartesian grid
+    of ``n_grid^3`` cell centres, each carrying a weight proportional
+    to the survey window ``M(Omega) n(z) / chi^2 dchi/dz`` integrated
+    over the cell. Running cascade ``xi`` with these weighted-grid
+    randoms produces the analytic RR with zero Monte-Carlo noise --
+    only Riemann-sum discretisation set by ``n_grid``.
+
+    For the cascade to resolve dyadic level L, ``n_grid >= 2^L``. The
+    default ``n_grid = 64`` resolves ``L <= 6`` cleanly which on Quaia
+    covers the BAO range (cell side > 125 Mpc/h on an 8 Gpc/h box).
+
+    Parameters
+    ----------
+    positions : (N_d, 3) data comoving xyz.
+    sel_map, nside : HEALPix angular completeness.
+    z_data : observed redshifts (for n(z)).
+    cosmo : ``DistanceCosmo``.
+    n_grid : grid resolution per axis (default 64).
+    weights_data : optional per-data weights.
+    weight_threshold : drop grid cells whose weight is below this
+        fraction of the maximum (typically negligible at the survey
+        edge / outside the footprint).
+
+    Returns
+    -------
+    structured array as ``xi_landy_szalay``.
+    """
+    pos_d = np.asarray(positions, dtype=np.float64)
+    if pos_d.shape[1] != 3:
+        raise ValueError("positions must be (N_d, 3)")
+    grid_pos, grid_w, grid_box = analytic_window_grid(
+        sel_map, nside, z_data, cosmo, n_grid=n_grid,
+        z_min=z_min, z_max=z_max,
+    )
+
+    # shift the data into the same coordinate frame as the grid
+    # (positions are typically already in the survey frame; we shift to
+    # match the grid box)
+    shift = -np.minimum(pos_d.min(axis=0), 0.0) + 100.0
+    pos_d_s = pos_d + shift
+    box_size = max(grid_box, float(np.max(pos_d_s) + 100.0))
+
+    # filter grid cells with negligible weight to keep the random
+    # catalogue compact (the cascade still scales O(N log N) but
+    # smaller N is faster)
+    keep = grid_w > weight_threshold * grid_w.max()
+    grid_pos_k = grid_pos[keep]
+    grid_w_k = grid_w[keep]
+    # Rescale weights so ``sum(w_k) = N_kept``. The cascade normalises
+    # weighted-RR by ``N_r_points (N_r_points - 1) / 2`` (count-of-points,
+    # not weighted-pair-norm), so unit-mean weights make the LS xi
+    # consistent with an unweighted N_kept-point uniform random in the
+    # survey window. The relative shape of grid_w (which encodes the
+    # angular mask + n(z)) is preserved.
+    s_w = float(grid_w_k.sum())
+    if s_w > 0:
+        grid_w_k = grid_w_k * (len(grid_w_k) / s_w)
+
+    return xi_landy_szalay(
+        pos_d_s, grid_pos_k, box_size=box_size, dim=3, periodic=False,
+        weights_data=weights_data, weights_randoms=grid_w_k,
+    )
+
+
 def gradient(
     positions: np.ndarray, box_size: float,
     target_level: int, dim: Optional[int] = None, periodic: bool = True,

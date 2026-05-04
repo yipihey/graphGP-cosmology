@@ -190,6 +190,39 @@ def test_xi_landy_szalay_from_window_smoke(tmp_path):
         assert abs(xi_med) < 0.5, f"unexpectedly large xi_med = {xi_med}"
 
 
+def test_xi_landy_szalay_analytic_RR_smoke(tmp_path):
+    """``xi_landy_szalay_analytic_RR`` produces an LS xi(r) per dyadic
+    shell using a deterministic weighted-grid (no MC randoms)."""
+    if not _have_cascade():
+        pytest.skip("morton_cascade binary not available")
+    pytest.importorskip("healpy")
+    from twopt_density.cascade import xi_landy_szalay_analytic_RR
+    from twopt_density.distance import DistanceCosmo, radec_z_to_cartesian
+
+    fid = DistanceCosmo(Om=0.31, h=0.68)
+    nside = 16
+    sel = np.ones(12 * nside ** 2)
+    rng = np.random.default_rng(0)
+    n_d = 1500
+    theta = np.arccos(rng.uniform(-1, 1, n_d))
+    phi = rng.uniform(0, 2 * np.pi, n_d)
+    ra = np.degrees(phi); dec = 90.0 - np.degrees(theta)
+    z = rng.uniform(0.5, 1.5, n_d)
+    xyz = radec_z_to_cartesian(ra, dec, z, fid)
+    arr = xi_landy_szalay_analytic_RR(
+        xyz, sel, nside, z, fid, n_grid=32,
+    )
+    assert "xi_ls" in arr.dtype.names
+    # uniform random data on a full-sky window: xi at large scales ~ 0
+    use = (arr["dd"] > 100) & (arr["rr"] > 1e-3) & np.isfinite(arr["xi_ls"])
+    if use.any():
+        # at the top dyadic levels (where the grid resolves the pair scale)
+        # xi should be close to zero
+        top_use = use & (arr["level"] <= 3)
+        if top_use.any():
+            assert (np.abs(arr["xi_ls"][top_use]) < 1.0).all()
+
+
 def test_anisotropy_rejects_non_3d(uniform_2d):
     if not _have_cascade():
         pytest.skip("morton_cascade binary not available")
