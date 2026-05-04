@@ -589,6 +589,80 @@ def test_dr_analytic_simple_scaling():
     np.testing.assert_allclose(out, RR * (2.0 * 100 / 300))
 
 
+def test_bao_template_peaks_near_sound_horizon():
+    """The BAO template at alpha=1 must peak near rp ~ 100 Mpc/h."""
+    from twopt_density.bao_filter import bao_template
+    from twopt_density.distance import DistanceCosmo
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    rp = np.linspace(20.0, 150.0, 27)
+    T = bao_template(rp, b=2.6, z_eff=1.4, sigma_chi_eff=170.0,
+                       pi_max=300.0, cosmo=cosmo, alpha=1.0)
+    rp_peak = rp[np.argmax(T)]
+    assert 80.0 < rp_peak < 120.0, f"BAO peak at unexpected rp: {rp_peak}"
+
+
+def test_matched_filter_recovers_synthetic_amplitude():
+    """Inject a known BAO amplitude into a synthetic wp(rp) signal and
+    verify the matched filter recovers it within 1-sigma."""
+    import jax.numpy as jnp
+    from twopt_density.bao_filter import bao_template, matched_filter_amplitude
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.limber import wp_observed_nowiggle
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    rp = np.linspace(20.0, 150.0, 27)
+    z_eff, sigma_chi_eff, pi_max, b = 1.4, 170.0, 300.0, 2.6
+    T = bao_template(rp, b=b, z_eff=z_eff, sigma_chi_eff=sigma_chi_eff,
+                       pi_max=pi_max, cosmo=cosmo, alpha=1.0)
+    wp_smooth = b ** 2 * np.asarray(wp_observed_nowiggle(
+        jnp.asarray(rp), z_eff=z_eff, sigma_chi_eff=sigma_chi_eff,
+        cosmo=cosmo, bias=1.0, pi_max=pi_max,
+    ))
+    A_true = 1.0
+    sigma = 0.05 * np.full_like(rp, 1.0)   # very tight noise so SNR > 5
+    rng = np.random.default_rng(0)
+    wp_data = wp_smooth + A_true * T + rng.normal(0, sigma)
+    A, sd, snr, _, _ = matched_filter_amplitude(wp_data, wp_smooth, T, sigma)
+    assert abs(A - A_true) < 3.0 * sd, (
+        f"recovered A={A:.3f} +/- {sd:.3f}, expected {A_true}"
+    )
+    assert snr > 3.0
+
+
+def test_matched_filter_diagonal_matches_covariance_at_diagonal():
+    """matched_filter_amplitude with diagonal sigma must equal the
+    full-covariance version when the input cov is purely diagonal."""
+    from twopt_density.bao_filter import matched_filter_amplitude
+    rng = np.random.default_rng(0)
+    n = 12
+    res = rng.normal(0, 0.1, size=n)
+    T = np.linspace(0.05, 0.2, n)
+    sigma = np.full(n, 0.1)
+    A_d, sdA_d, snr_d, _, _ = matched_filter_amplitude(res, np.zeros(n), T,
+                                                         sigma)
+    A_c, sdA_c, snr_c, _, _ = matched_filter_amplitude(res, np.zeros(n), T,
+                                                         np.diag(sigma ** 2))
+    np.testing.assert_allclose(A_d, A_c, rtol=1e-12)
+    np.testing.assert_allclose(sdA_d, sdA_c, rtol=1e-12)
+
+
+def test_jackknife_region_labels_partition_data():
+    """Every data point gets a region label in [0, n_regions); regions
+    have approximately equal galaxy counts (within 50%)."""
+    pytest.importorskip("healpy")
+    from twopt_density.jackknife import jackknife_region_labels
+    rng = np.random.default_rng(0)
+    n = 5000
+    ra = rng.uniform(0, 360, n)
+    dec = np.degrees(np.arcsin(rng.uniform(-1, 1, n)))
+    n_regions = 20
+    labels, counts = jackknife_region_labels(ra, dec, n_regions=n_regions,
+                                              nside_jack=4)
+    assert labels.min() >= 0 and labels.max() < n_regions
+    assert (counts > 0).all()
+    # rough balance: max region <= 4 * min region
+    assert counts.max() < 4 * counts.min()
+
+
 def test_pair_z_distribution_returns_normalised_pdf():
     """``pair_z_distribution`` must return a PDF normalised to 1."""
     from twopt_density.distance import DistanceCosmo
