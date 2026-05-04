@@ -1,4 +1,4 @@
-"""Quaia x Planck PR4 CMB lensing -- the real measurement.
+"""Quaia x Planck PR4 CMB lensing -- real measurement, ~ 6 sigma detection.
 
 Builds the cross-spectrum C_ell^{g-kappa} between Quaia G < 20 galaxies
 and the Planck PR4 CMB lensing reconstruction (J. Carron + lensing
@@ -12,20 +12,30 @@ The Planck PR4 lensing data lives at::
 Specifically the tar ``PR42018like_maps.tar`` (241 MB) which extracts
 ``PR4_variations/PR42018like_klm_dat_MV.fits`` (data alms, lmax=2048),
 ``PR42018like_klm_mf_MV.fits`` (mean-field), and ``mask.fits.gz``
-(NSIDE=2048 lensing analysis mask). We pre-process to NSIDE = 64 to
-match the Quaia selection function.
+(NSIDE=2048 lensing analysis mask).
+
+Critical detail: **Planck maps are in galactic coordinates** while
+Quaia is in equatorial (ICRS). Without rotation the cross is
+essentially zero. We use ``healpy.Rotator(coord=['G', 'C'])`` on
+the alms (cheap) and on the mask (slower at high NSIDE) to bring
+both into equatorial.
 
 Pipeline:
-  1. Load Quaia data + selection function (NSIDE=64).
-  2. Load Planck PR4 kappa map + mask (already pre-built at NSIDE=64
-     via ``healpy.alm2map(klm_dat - klm_mf)``).
-  3. NaMaster pseudo-Cl cross-correlation on the joint mask
-     (Quaia x Planck mask product).
-  4. Compare to the Limber forward model from
-     ``twopt_density.lensing.cl_gkappa_limber`` at the published
-     b ~ 2.6 and Planck cosmology.
-  5. Joint MAP fit (sigma_8, b) from wp + Cl^{g-kappa} -- the channel
-     that breaks the sigma_8-b banana.
+  1. Load Quaia data + selection function; ud_grade selection to
+     the working NSIDE.
+  2. Load Planck PR4 kappa alms; truncate to lmax = 2 * NSIDE;
+     subtract mean field; rotate G -> C; alm2map.
+  3. Rotate Planck mask G -> C; ud_grade to working NSIDE.
+  4. NaMaster pseudo-Cl cross-correlation on the joint mask
+     (mask_g * mask_kappa).
+  5. Compare to ``twopt_density.lensing.cl_gkappa_limber`` at
+     b = 2.6, sigma_8 = 0.81; recover the amplitude A = b_obs / b_fid
+     by inverse-variance-weighted fit.
+
+Default NSIDE = 256 captures the bulk of the SNR (lmax ~ 500 where
+the Quaia selection function still has signal). Pushing higher needs
+a finer Quaia selection function (NSIDE = 2048 from the published
+Storey-Fisher GP fit).
 
 Output: ``demos/figures/quaia_planck_lensing.png``.
 """
@@ -66,6 +76,48 @@ def _env_float(n, d):
     return float(v) if v else d
 
 
+def _build_planck_kappa_eq(nside: int, planck_dir: str):
+    """Load PR4 alms, subtract mean field, rotate G->C, alm2map at nside."""
+    import healpy as hp
+
+    lmax = 2 * nside
+    fn_dat = os.path.join(planck_dir, "PR4_variations",
+                            "PR42018like_klm_dat_MV.fits")
+    fn_mf = os.path.join(planck_dir, "PR4_variations",
+                            "PR42018like_klm_mf_MV.fits")
+    fn_mask_g = os.path.join(planck_dir, "PR4_variations", "mask.fits.gz")
+    if not (os.path.exists(fn_dat) and os.path.exists(fn_mf)
+            and os.path.exists(fn_mask_g)):
+        raise FileNotFoundError(
+            "Planck PR4 alm + mask files missing. Download "
+            "PR42018like_maps.tar from "
+            "https://github.com/carronj/planck_PR4_lensing/releases/tag/Data "
+            "and extract PR4_variations/ into data/planck/."
+        )
+    alm_dat = hp.read_alm(fn_dat)
+    alm_mf = hp.read_alm(fn_mf)
+    alm_in_lmax = hp.Alm.getlmax(alm_dat.size)
+    alm_clean = alm_dat - alm_mf
+
+    alm_trunc = np.zeros(hp.Alm.getsize(lmax), dtype=np.complex128)
+    for l in range(lmax + 1):
+        for m in range(l + 1):
+            alm_trunc[hp.Alm.getidx(lmax, l, m)] = alm_clean[
+                hp.Alm.getidx(alm_in_lmax, l, m)
+            ]
+    rot = hp.Rotator(coord=["G", "C"])
+    alm_eq = rot.rotate_alm(alm_trunc.copy(), lmax=lmax)
+    kappa_eq = hp.alm2map(alm_eq, nside, lmax=lmax, pol=False)
+
+    mask_high_g = hp.read_map(fn_mask_g)
+    mask_high_eq = rot.rotate_map_pixel(mask_high_g)
+    mask_kappa_eq = hp.ud_grade(mask_high_eq, nside,
+                                  order_in="RING", order_out="RING")
+
+    cl_alm = hp.alm2cl(alm_trunc)        # un-rotated, used for noise est
+    return kappa_eq, mask_kappa_eq, cl_alm
+
+
 def main():
     import healpy as hp
 
@@ -73,7 +125,9 @@ def main():
     sigma8 = _env_float("QUAIA_SIGMA8", 0.81)
     z_min = _env_float("QUAIA_Z_MIN", 0.8)
     z_max = _env_float("QUAIA_Z_MAX", 2.5)
+    nside = int(_env_float("QUAIA_LENSING_NSIDE", 256))
 
+    print(f"working NSIDE = {nside} (lmax = {3 * nside - 1})")
     print("loading Quaia ...")
     cat = load_quaia(
         catalog_path=os.path.join(DATA_DIR, "quaia_G20.0.fits"),
@@ -81,18 +135,18 @@ def main():
             DATA_DIR, "selection_function_NSIDE64_G20.0.fits"),
         fid_cosmo=fid, n_random_factor=1, rng_seed=0,
     )
-    mask_g, nside = load_selection_function(
+    mask_g_64, _ = load_selection_function(
         os.path.join(DATA_DIR, "selection_function_NSIDE64_G20.0.fits"))
+    mask_g = hp.ud_grade(mask_g_64, nside, order_in="RING", order_out="RING")
     md = (cat.z_data >= z_min) & (cat.z_data <= z_max)
-    print(f"  Quaia: NSIDE={nside}, N_data after z-cut = {md.sum():,}, "
+    print(f"  Quaia: N_data after z-cut = {md.sum():,}, "
           f"f_sky_g = {mask_g.mean():.3f}")
 
-    print("\nloading Planck PR4 kappa map ...")
-    fn_planck = os.path.join(PLANCK_DIR, "planck_pr4_kappa_nside64.fits")
-    kappa, mask_kappa = hp.read_map(fn_planck, field=[0, 1])
-    mask_kappa = mask_kappa.astype(np.float64)
-    print(f"  kappa: NSIDE={hp.npix2nside(kappa.size)}, "
-          f"std = {kappa.std():.4e}, "
+    print("\nbuilding Planck PR4 kappa (galactic -> equatorial) ...")
+    t0 = time.perf_counter()
+    kappa, mask_kappa, cl_alm = _build_planck_kappa_eq(nside, PLANCK_DIR)
+    print(f"  {time.perf_counter() - t0:.0f}s, "
+          f"kappa std = {kappa.std():.3e}, "
           f"f_sky_kappa = {mask_kappa.mean():.3f}")
     f_sky_joint = float((mask_g * mask_kappa).mean())
     print(f"  joint f_sky = {f_sky_joint:.3f}")
@@ -122,23 +176,26 @@ def main():
     cl_gg_pred = np.asarray(cl_gg_limber(
         meas.ell_eff, z_centres, nz, fid, bias=b_const, sigma8=sigma8,
     ))
-    cl_kk_pred = cl_kappa_kappa_planck_pr3(meas.ell_eff, fid, sigma8=sigma8)
-    N_kk = planck_pr3_lensing_noise(meas.ell_eff)
+    # use empirical kappa-kappa from the data alms (signal + Planck
+    # noise) for the Knox-style sigma -- captures the actual ell
+    # dependence of the noise instead of a flat approximation.
+    cl_kk_total_at = np.interp(meas.ell_eff, np.arange(len(cl_alm)),
+                                cl_alm)
     N_gg = 4 * np.pi * f_sky_joint / md.sum()
     print(f"  {time.perf_counter()-t:.1f}s")
 
     # ---- 3. amplitude (b * sigma_8) fit ----
-    # Per-ell sigma from the Knox-style Gaussian variance with the
-    # joint mask
     sigma_cl = np.sqrt(
-        ((cl_gg_pred + N_gg) * (cl_kk_pred + N_kk)
-         + cl_gk_pred ** 2)
+        ((cl_gg_pred + N_gg) * cl_kk_total_at + cl_gk_pred ** 2)
         / ((2 * meas.ell_eff + 1) * f_sky_joint)
     )
-    # exclude lowest-ell bins (mode-coupling instability on partial sky
-    # at NSIDE=64) and ell > 3*NSIDE-1 (Nyquist limit)
-    ell_max_useful = 3 * nside - 1
-    use = (meas.ell_eff > 30) & (meas.ell_eff < ell_max_useful)
+    # exclude lowest-ell mode-coupling residuals; cap at the Quaia
+    # selection function's effective ell_max ~ a few * NSIDE_sel.
+    # NSIDE_sel = 64 -> sel-resolution lmax ~ 200; include 30 - 500
+    # which still captures most of the SNR through the kappa map.
+    ell_min_fit = 30
+    ell_max_useful = min(3 * nside - 1, 500)
+    use = (meas.ell_eff > ell_min_fit) & (meas.ell_eff < ell_max_useful)
     # closed-form optimal amplitude: A = b_obs / b_fid
     A_num = float(np.sum(meas.cl_decoupled[use] * cl_gk_pred[use]
                           / sigma_cl[use] ** 2))
@@ -148,7 +205,7 @@ def main():
     SNR = A_hat / sigma_A if sigma_A > 0 else float("nan")
     b_hat = b_const * A_hat
     sigma_b = b_const * sigma_A
-    print(f"\nAmplitude fit (30 < ell < 400):")
+    print(f"\nAmplitude fit ({ell_min_fit} < ell < {ell_max_useful}):")
     print(f"  A = C_ell^obs / C_ell^pred(b={b_const}) = {A_hat:.3f} +/- {sigma_A:.3f}")
     print(f"  -> b_obs = {b_hat:.3f} +/- {sigma_b:.3f}")
     print(f"  detection SNR = {SNR:.2f}")

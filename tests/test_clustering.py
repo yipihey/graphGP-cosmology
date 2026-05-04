@@ -723,6 +723,87 @@ def test_cl_gkappa_limber_jax_grad_in_cosmo_and_bias():
     assert np.isfinite(g_s8) and g_s8 != 0.0
 
 
+def test_galactic_to_equatorial_rotation_recovers_cross_correlation():
+    """Regression test for the coordinate-rotation fix in
+    ``demos/demo_quaia_planck_lensing.py``: Planck lensing maps live in
+    galactic coordinates, while Quaia is in equatorial. Skipping the
+    G->C rotation roughly *kills* the cross-correlation; with the
+    rotation, the input correlation must be recovered.
+
+    Build a smooth random scalar field in galactic coordinates,
+    sprinkle galaxies in equatorial coordinates that trace the same
+    physical sky pattern, and verify that
+    ``compute_cl_gkappa(... kappa_no_rot)`` is much smaller than
+    ``compute_cl_gkappa(... kappa_rotated_to_C)``.
+    """
+    pytest.importorskip("healpy")
+    pytest.importorskip("pymaster")
+    import healpy as hp
+    from twopt_density.angular import compute_cl_gkappa
+
+    nside = 32
+    npix = 12 * nside ** 2
+    rng = np.random.default_rng(42)
+
+    # synthetic kappa: smooth low-ell-only field in *galactic*
+    # coordinates (only ell <= 16 to keep the signal coherent at the
+    # low NSIDE we use).
+    lmax = 2 * nside
+    cl_in = np.zeros(lmax + 1)
+    ell = np.arange(lmax + 1)
+    ell_signal = 16
+    cl_in[2:ell_signal + 1] = 1.0 / (ell[2:ell_signal + 1] *
+                                       (ell[2:ell_signal + 1] + 1))
+    alm_g = hp.synalm(cl_in, lmax=lmax)
+    kappa_galactic = hp.alm2map(alm_g, nside, pol=False)
+
+    # rotate G -> C
+    rot = hp.Rotator(coord=["G", "C"])
+    alm_eq = rot.rotate_alm(alm_g.copy(), lmax=lmax)
+    kappa_equatorial = hp.alm2map(alm_eq, nside, pol=False)
+
+    # galaxies sampled in *equatorial* sky from a probability
+    # proportional to (1 + delta) where delta is a re-scaled
+    # kappa_equatorial. high amplitude so the cross is unambiguous.
+    delta_field = 8.0 * (kappa_equatorial - kappa_equatorial.mean()) / \
+        kappa_equatorial.std()
+    p = np.clip(1.0 + delta_field, 0.0, None)
+    p = p / p.sum()
+    n_obj = 500_000
+    pix = rng.choice(npix, size=n_obj, p=p)
+    theta, phi = hp.pix2ang(nside, pix)
+    # jitter inside the pixel for a Poisson-like sample
+    theta += (rng.uniform(-1, 1, n_obj) * hp.nside2resol(nside) * 0.5)
+    phi += (rng.uniform(-1, 1, n_obj) * hp.nside2resol(nside) * 0.5)
+    ra_deg = np.rad2deg(phi) % 360.0
+    dec_deg = 90.0 - np.rad2deg(theta)
+    dec_deg = np.clip(dec_deg, -89.999, 89.999)
+
+    mask_g = np.ones(npix)
+    mask_kappa = np.ones(npix)
+
+    # rotated (correct) -> nontrivial signal
+    meas_rot = compute_cl_gkappa(
+        ra_deg, dec_deg, mask_g, kappa_equatorial, mask_kappa, nside,
+        n_per_bin=8,
+    )
+    # NOT rotated (the bug we fixed) -> essentially zero correlation
+    meas_norot = compute_cl_gkappa(
+        ra_deg, dec_deg, mask_g, kappa_galactic, mask_kappa, nside,
+        n_per_bin=8,
+    )
+    # use only the bins where the input has signal power
+    use = (meas_rot.ell_eff > 2) & (meas_rot.ell_eff < ell_signal)
+    s_rot = float(np.sqrt(np.mean(meas_rot.cl_decoupled[use] ** 2)))
+    s_norot = float(np.sqrt(np.mean(meas_norot.cl_decoupled[use] ** 2)))
+    # rotated cross is the true correlation; unrotated should be a
+    # statistical fluctuation around zero. require at least a 3x ratio.
+    assert s_rot > 3 * s_norot, (
+        f"rotated cross rms = {s_rot:.3e}, unrotated rms = {s_norot:.3e}; "
+        "rotation should produce a much larger amplitude than no rotation"
+    )
+
+
 def test_pair_z_distribution_returns_normalised_pdf():
     """``pair_z_distribution`` must return a PDF normalised to 1."""
     from twopt_density.distance import DistanceCosmo
