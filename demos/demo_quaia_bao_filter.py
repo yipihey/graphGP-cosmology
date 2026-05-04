@@ -193,13 +193,19 @@ def main():
           f"SNR = {snr_d:.2f}")
     print(f"    chi2_null = {c2null_d:.1f}, chi2_best = {c2best_d:.1f}, "
           f"delta_chi2 = {c2null_d - c2best_d:.2f}")
+    n_bins = len(rp_centres)
     A_c, sdA_c, snr_c, c2null_c, c2best_c = matched_filter_amplitude(
-        wp_full, wp_smooth_at_meas, T, wp_cov,
+        wp_full, wp_smooth_at_meas, T, wp_cov, n_samples=n_jk,
     )
-    print(f"  full JK cov:     A = {A_c:.2f} +/- {sdA_c:.2f}, "
-          f"SNR = {snr_c:.2f}")
+    hartlap = max((n_jk - n_bins - 2) / (n_jk - 1), 0.0)
+    print(f"  full JK cov (Hartlap, N_jk={n_jk}, N_bins={n_bins}, "
+          f"factor={hartlap:.2f}):")
+    print(f"    A = {A_c:.2f} +/- {sdA_c:.2f}, SNR = {snr_c:.2f}")
     print(f"    chi2_null = {c2null_c:.1f}, chi2_best = {c2best_c:.1f}, "
           f"delta_chi2 = {c2null_c - c2best_c:.2f}")
+    if c2null_c / max(n_bins, 1) > 3.0:
+        print(f"  WARNING: reduced chi2_null = {c2null_c/n_bins:.1f} -- JK "
+              "covariance likely under-estimated; full-cov SNR is unreliable.")
 
     # ---- 6. alpha scan ----
     print("\nalpha scan (BAO scaling parameter) ...")
@@ -210,7 +216,8 @@ def main():
                              sigma8=sigma8)
     out_c = bao_alpha_scan(rp_centres, wp_full, wp_smooth_at_meas, b_fit,
                              z_eff, sigma_chi_eff, pi_max, fid,
-                             wp_cov, alpha_grid=alpha_grid, sigma8=sigma8)
+                             wp_cov, alpha_grid=alpha_grid, sigma8=sigma8,
+                             n_samples=n_jk)
     print(f"  diagonal: alpha_hat = {out_d['alpha_hat']:.4f} +/- "
           f"{out_d['sigma_alpha']:.4f}, SNR = {out_d['SNR_at_best']:.2f}")
     print(f"  full cov: alpha_hat = {out_c['alpha_hat']:.4f} +/- "

@@ -26,6 +26,8 @@ one extra LBFGS call away.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 
@@ -77,6 +79,7 @@ def matched_filter_amplitude(
     wp_smooth: np.ndarray,
     T: np.ndarray,
     sigma_or_cov,
+    n_samples: Optional[int] = None,
 ):
     """Maximum-likelihood BAO amplitude with either diagonal or full
     data covariance.
@@ -88,32 +91,55 @@ def matched_filter_amplitude(
                  fitted bias
     T          : (N,) BAO template evaluated at the same rp_i
     sigma_or_cov : (N,) diagonal sigmas, or (N, N) full covariance
+    n_samples  : if ``sigma_or_cov`` is a *sample* covariance estimated
+                 from ``n_samples`` realisations (e.g. jackknife or
+                 mocks), apply the Hartlap+07 correction
+                 ``C^-1_unbiased = ((N - p - 2) / (N - 1)) C^-1``
+                 (with ``p = N_bins``). Required for an unbiased
+                 ``sigma_A`` -- without it the matched-filter SNR is
+                 artificially inflated when ``N_samples`` is comparable
+                 to ``N_bins``.
 
     Returns
     -------
-    A_hat      : best-fit amplitude (1.0 = fiducial halofit BAO)
-    sigma_A    : 1-sigma uncertainty
+    A_hat      : best-fit amplitude (1.0 = fiducial halofit BAO).
+                 Invariant under cov rescaling -- Hartlap does not
+                 affect it.
+    sigma_A    : 1-sigma uncertainty (Hartlap-corrected if requested)
     SNR        : A_hat / sigma_A
-    chi2_null  : chi^2 with A=0 (no-BAO null)
-    chi2_best  : chi^2 at the best-fit A
+    chi2_null  : chi^2 with A=0 (no-BAO null), Hartlap-corrected
+    chi2_best  : chi^2 at the best-fit A, Hartlap-corrected
     """
     wp_data = np.asarray(wp_data, dtype=np.float64)
     wp_smooth = np.asarray(wp_smooth, dtype=np.float64)
     T = np.asarray(T, dtype=np.float64)
     res = wp_data - wp_smooth                            # (N,)
     sc = np.asarray(sigma_or_cov, dtype=np.float64)
+    n_bins = T.size
     if sc.ndim == 1:
         # diagonal noise
         invsig2 = 1.0 / np.maximum(sc, 1e-30) ** 2
         TtCinvT = float(np.sum(T ** 2 * invsig2))
         TtCinvr = float(np.sum(T * res * invsig2))
         rtCinvr = float(np.sum(res ** 2 * invsig2))
+        hartlap = 1.0
     else:
         # full covariance
         Cinv = np.linalg.inv(sc)
         TtCinvT = float(T @ Cinv @ T)
         TtCinvr = float(T @ Cinv @ res)
         rtCinvr = float(res @ Cinv @ res)
+        if n_samples is not None and n_samples > n_bins + 2:
+            hartlap = (n_samples - n_bins - 2) / (n_samples - 1)
+        elif n_samples is not None:
+            # singular regime -- don't pretend we have a measurement
+            return (float("nan"), float("inf"), 0.0,
+                    float("nan"), float("nan"))
+        else:
+            hartlap = 1.0
+        TtCinvT *= hartlap
+        TtCinvr *= hartlap
+        rtCinvr *= hartlap
     if TtCinvT <= 0:
         return float("nan"), float("inf"), 0.0, rtCinvr, rtCinvr
     A_hat = TtCinvr / TtCinvT
@@ -136,6 +162,7 @@ def bao_alpha_scan(
     sigma_or_cov,
     alpha_grid=None,
     sigma8: float = 0.81,
+    n_samples: Optional[int] = None,
 ):
     """Scan ``alpha`` (BAO scaling parameter) and return best-fit
     amplitude + significance.
@@ -159,7 +186,7 @@ def bao_alpha_scan(
             sigma8=sigma8,
         )
         A, sd, snr, _, c2 = matched_filter_amplitude(
-            wp_data, wp_smooth, T_a, sigma_or_cov,
+            wp_data, wp_smooth, T_a, sigma_or_cov, n_samples=n_samples,
         )
         A_arr[i] = A; sd_arr[i] = sd; SNR_arr[i] = snr; chi2_arr[i] = c2
 
