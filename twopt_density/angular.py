@@ -124,3 +124,67 @@ def compute_cl_gg(
         nside=nside,
         f_sky=f_sky,
     )
+
+
+def compute_cl_gkappa(
+    ra_deg: np.ndarray, dec_deg: np.ndarray,
+    mask_g: np.ndarray, kappa_map: np.ndarray, mask_kappa: np.ndarray,
+    nside: int,
+    ell_bins: Optional[np.ndarray] = None,
+    n_per_bin: int = 16,
+    mask_threshold: float = 1e-6,
+):
+    """Pseudo-Cl cross-correlation of galaxy density and CMB lensing kappa.
+
+    Build the Quaia overdensity map ``delta_g``, then compute the
+    NaMaster pseudo-Cl cross-correlation with the input kappa map. The
+    combined mask is the product ``mask_g * mask_kappa`` so only pixels
+    in the intersection of both surveys contribute.
+
+    Parameters
+    ----------
+    ra_deg, dec_deg : galaxy positions [deg]
+    mask_g          : Quaia angular selection function (NPIX,)
+    kappa_map       : Planck-like CMB convergence map (NPIX,)
+    mask_kappa      : Planck lensing analysis mask (NPIX,)
+    nside           : healpix NSIDE for everything; all maps must agree.
+    ell_bins        : multipole bin edges; default = linear binning
+                       n_per_bin per bin from ell = 2 to 3 * nside - 1.
+
+    Returns
+    -------
+    ``CellMeasurement`` with ``cl_decoupled`` = pseudo-Cl^{g-kappa}
+    deconvolved against the joint mask. Shot noise on the cross is
+    zero so ``n_shot = 0``.
+    """
+    import healpy as hp
+    import pymaster as nmt
+
+    if not (mask_g.size == kappa_map.size == mask_kappa.size == 12 * nside ** 2):
+        raise ValueError("all maps must have the same NSIDE")
+    delta, _ = make_overdensity_map(
+        ra_deg, dec_deg, mask_g, nside, mask_threshold=mask_threshold,
+    )
+    # joint mask -- pixels where both surveys are valid
+    mask_joint = mask_g * mask_kappa
+
+    if ell_bins is None:
+        b = nmt.NmtBin.from_nside_linear(nside, n_per_bin)
+    else:
+        ell_bins = np.asarray(ell_bins, dtype=np.int32)
+        b = nmt.NmtBin.from_edges(ell_bins[:-1], ell_bins[1:], is_Dell=False)
+    ell_eff = b.get_effective_ells()
+
+    f_g = nmt.NmtField(mask_joint, [delta], spin=0)
+    f_k = nmt.NmtField(mask_joint, [kappa_map], spin=0)
+    cl_coupled = nmt.compute_coupled_cell(f_g, f_k)
+    wsp = nmt.NmtWorkspace.from_fields(f_g, f_k, b)
+    cl_dec = np.asarray(wsp.decouple_cell(cl_coupled)[0], dtype=np.float64)
+    return CellMeasurement(
+        ell_eff=np.asarray(ell_eff, dtype=np.float64),
+        cl_decoupled=cl_dec,
+        cl_raw=cl_dec,
+        n_shot=0.0,
+        nside=nside,
+        f_sky=float(np.mean(mask_joint)),
+    )
