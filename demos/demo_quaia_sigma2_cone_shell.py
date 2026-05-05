@@ -241,6 +241,8 @@ def main():
     suffix = f"_sub{centres_subsample}" if centres_subsample > 1 else ""
     if n_data >= 200_000:
         suffix += f"_N{n_data // 1000}k"
+    if nside_centres != 64:
+        suffix += f"_nside{nside_centres}"
     out_path = os.path.join(FIG_DIR, f"quaia_sigma2_cone_shell{suffix}.png")
     plt.savefig(out_path, dpi=140)
     print(f"\nwrote {out_path}")
