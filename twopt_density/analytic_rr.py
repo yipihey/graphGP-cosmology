@@ -77,6 +77,8 @@ def angular_corr_from_mask(
     mask: np.ndarray, nside: int, lmax: int = None,
     n_theta: int = 600, theta_max_rad: float = 0.5,
     deconvolve_pixwin: bool = False,
+    taper: str = "hann", taper_l_start_frac: float = 0.7,
+    gauss_l_smooth_frac: float = 0.5,
 ):
     """Angular auto-correlation ``xi_mask(theta)`` of a healpix mask.
 
@@ -87,12 +89,30 @@ def angular_corr_from_mask(
 
         xi(theta) = sum_l (2 l + 1) / (4 pi) * C_l * P_l(cos theta)
 
-    The pixwin deconvolution matters at angles below ~ 1/lmax (fraction
-    of a deg for NSIDE=64) -- it's exactly the regime where MC pair
-    counts at small rp see additional structure that the smooth Legendre
-    approximation otherwise misses. The pixwin file is read via
-    ``_load_pixwin`` which falls back to a local copy in
-    ``data/healpy/`` if ``hp.pixwin``'s download fails.
+    Sharp truncation at ``lmax`` produces Gibbs ringing in
+    ``xi_mask(theta)`` at angles below ``~ pi / lmax``. We default to a
+    Hann (raised-cosine) taper from ``taper_l_start_frac * lmax`` to
+    ``lmax`` which suppresses the ringing while leaving the BAO-scale
+    (low to mid-l) signal essentially unchanged. For NSIDE=64 (lmax=191)
+    the safe angular scale is ``theta > pi/lmax ~ 1 deg``, corresponding
+    to ``r_p > 60 Mpc/h`` at the Quaia median ``chi(z=1.5) ~ 3500
+    Mpc/h``; below that the analytic RR is fundamentally limited by
+    the mask resolution, not the cutoff form.
+
+    Parameters
+    ----------
+    taper : ``{"none", "hann", "gauss"}``, default ``"hann"``.
+        Smooth tapering of high-l C_l before the Legendre transform.
+        Use ``"none"`` to recover the original sharp cutoff (for
+        diagnostics).
+    taper_l_start_frac : float
+        For ``taper="hann"``, the C_l is multiplied by ``cos^2(pi/2 *
+        (l - l_start) / (lmax - l_start))`` for ``l > l_start``,
+        with ``l_start = taper_l_start_frac * lmax``. Default ``0.7``.
+    gauss_l_smooth_frac : float
+        For ``taper="gauss"``, multiplicative ``exp(-0.5
+        (l/l_smooth)^2)`` with ``l_smooth = gauss_l_smooth_frac *
+        lmax``. Default ``0.5``.
 
     Returns
     -------
@@ -106,14 +126,25 @@ def angular_corr_from_mask(
     cl = hp.anafast(mask, lmax=lmax)
     if deconvolve_pixwin:
         wpix = _load_pixwin(nside, lmax=lmax)
-        # avoid divide-by-zero at high l where pixwin -> 0
         wpix2 = np.maximum(wpix ** 2, 1e-6)
         cl = cl / wpix2
+    if taper != "none":
+        ell = np.arange(lmax + 1, dtype=np.float64)
+        if taper == "hann":
+            l_start = taper_l_start_frac * lmax
+            t = np.ones_like(ell)
+            in_band = (ell >= l_start) & (ell <= lmax)
+            x = (ell[in_band] - l_start) / max(lmax - l_start, 1.0)
+            t[in_band] = np.cos(0.5 * np.pi * x) ** 2
+            cl = cl * t
+        elif taper == "gauss":
+            l_smooth = max(gauss_l_smooth_frac * lmax, 1.0)
+            cl = cl * np.exp(-0.5 * (ell / l_smooth) ** 2)
+        else:
+            raise ValueError(f"unknown taper: {taper!r}")
     theta = np.linspace(1e-6, theta_max_rad, n_theta)
     cos_theta = np.cos(theta)
     xi = np.zeros_like(theta)
-    # Stable Legendre recurrence: P_0=1, P_1=cos, P_l = ((2l-1) cos P_{l-1}
-    # - (l-1) P_{l-2}) / l.
     P_prev = np.ones_like(cos_theta)
     xi += (2 * 0 + 1) / (4 * np.pi) * cl[0] * P_prev
     if len(cl) > 1:
@@ -177,6 +208,7 @@ def rr_analytic(
     kde_bandwidth: float = 0.05,
     lmax: int = None,
     theta_max_rad: float = 0.5,
+    taper: str = "hann",
 ) -> AnalyticRRResult:
     """Analytic RR(rp, pi) under a separable W = mask(Omega) * n(z).
 
@@ -185,6 +217,12 @@ def rr_analytic(
     times the per-pair density returned by this routine. We return
     ``RR`` un-normalised by N_r^2 (i.e. the pair-density form ready
     for the LS estimator).
+
+    The ``taper`` argument controls how the high-l mask C_l is
+    suppressed before the Legendre transform; default ``"hann"``
+    eliminates Gibbs ringing in xi_mask(theta) without measurably
+    biasing the BAO-scale signal. See ``angular_corr_from_mask`` for
+    the full menu (none / hann / gauss).
     """
     rp_edges = np.asarray(rp_edges, dtype=np.float64)
     pi_edges = np.asarray(pi_edges, dtype=np.float64)
@@ -195,6 +233,7 @@ def rr_analytic(
 
     theta_grid, xi_mask = angular_corr_from_mask(
         mask, nside, lmax=lmax, theta_max_rad=theta_max_rad,
+        taper=taper,
     )
     chi_grid, n_chi = radial_pair_density_from_z(
         z_data, cosmo, n_chi_bins=n_chi_bins, kde_bandwidth=kde_bandwidth,
@@ -343,3 +382,100 @@ def wp_from_analytic_random(
     wp = 2.0 * np.sum(xi * d_pi[None, :], axis=1)
     rp_centres = 0.5 * (rp_edges[:-1] + rp_edges[1:])
     return rp_centres, wp, dict(DD=DD, RR=RR, DR=DR)
+
+
+def analytic_RR_in_shells(
+    r_inner_arr,
+    r_outer_arr,
+    mask: np.ndarray, nside: int,
+    z_data: np.ndarray, cosmo,
+    n_rp: int = 80, n_pi: int = 80,
+    pi_max: float = None,
+    n_chi_eff: int = 60,
+    n_chi_bins: int = 80,
+    kde_bandwidth: float = 0.05,
+    lmax: int = None,
+    theta_max_rad: float = 0.5,
+    taper: str = "hann",
+    N_r: int = None,
+):
+    """Analytic RR pair counts in 3D-separation shells
+    ``[r_in, r_out]`` for a separable window ``W = M(Omega) n(z)``.
+
+    Bridges our analytic-window machinery with shell-defined
+    pair-count outputs (e.g. the ``morton_cascade`` ``pairs``
+    subcommand). The same separable-window integrand
+    ``chi^2 xi_mask(rp/chi) n(chi+pi/2) n(chi-pi/2)`` is evaluated
+    on a continuous ``(rp, pi)`` grid; pair-density is then summed
+    over the bins where ``r_in <= sqrt(rp^2 + pi^2) < r_out``.
+
+    Returns a ``(n_shells,)`` array. If ``N_r`` is given, multiplies
+    by ``N_r * N_r`` to convert from the per-pair-density units of
+    ``rr_analytic`` to actual pair counts ready for Landy-Szalay
+    division.
+    """
+    r_in = np.asarray(r_inner_arr, dtype=np.float64).ravel()
+    r_out = np.asarray(r_outer_arr, dtype=np.float64).ravel()
+    if r_in.shape != r_out.shape:
+        raise ValueError("r_inner_arr and r_outer_arr must match in shape")
+    R_max = float(r_out.max())
+    if pi_max is None:
+        pi_max = R_max + 0.1
+
+    theta_grid, xi_mask = angular_corr_from_mask(
+        mask, nside, lmax=lmax, theta_max_rad=theta_max_rad, taper=taper,
+    )
+    chi_grid, n_chi = radial_pair_density_from_z(
+        z_data, cosmo, n_chi_bins=n_chi_bins, kde_bandwidth=kde_bandwidth,
+    )
+    chi_min = float(chi_grid[0]); chi_max = float(chi_grid[-1])
+    f_sky = float(np.mean(mask))
+    chi2_p = float(np.trapezoid(n_chi * chi_grid ** 2, chi_grid))
+
+    # Continuous (rp, pi) grid for the per-pair-density evaluation. We
+    # cover positive pi only; the table is doubled to account for the
+    # |pi| <-> -|pi| pair.
+    rp_grid = np.linspace(0.0, R_max, n_rp)
+    pi_grid = np.linspace(0.0, pi_max, n_pi)
+
+    rr_table = np.zeros((n_rp, n_pi), dtype=np.float64)
+    for j, pi in enumerate(pi_grid):
+        chi_lo = chi_min + pi / 2.0
+        chi_hi = chi_max - pi / 2.0
+        if chi_hi <= chi_lo:
+            continue
+        chi_eff = np.linspace(chi_lo, chi_hi, n_chi_eff)
+        for i, rp in enumerate(rp_grid):
+            if rp <= 0.0:
+                continue
+            theta_at = rp / chi_eff
+            xi_at = np.interp(theta_at, theta_grid, xi_mask,
+                               left=xi_mask[0], right=0.0)
+            n1 = np.interp(chi_eff + pi / 2.0, chi_grid, n_chi,
+                            left=0, right=0)
+            n2 = np.interp(chi_eff - pi / 2.0, chi_grid, n_chi,
+                            left=0, right=0)
+            # No 2*pi prefactor here -- the rr_analytic convention
+            # absorbs the angular azimuthal integral into the mask
+            # auto-correlation xi_mask, so rr_table is per-(rp, pi)
+            # pair density compatible with the original rr_analytic.
+            rr_table[i, j] = (
+                rp * np.trapezoid(chi_eff ** 2 * xi_at * n1 * n2, chi_eff)
+            )
+    rr_table *= 1.0 / (2.0 * f_sky ** 2 * chi2_p ** 2)
+
+    # 3D separation magnitude on the (rp, pi) grid
+    s = np.sqrt(rp_grid[:, None] ** 2 + pi_grid[None, :] ** 2)
+    out = np.zeros_like(r_in)
+    for k in range(len(r_in)):
+        in_shell = (s >= r_in[k]) & (s < r_out[k])
+        # ``pi`` in rr_analytic is |chi_1 - chi_2| (already absolute), so
+        # the (rp, pi >= 0) integration covers all unordered pairs --
+        # no factor 2 needed.
+        masked = np.where(in_shell, rr_table, 0.0)
+        out[k] = np.trapezoid(
+            np.trapezoid(masked, pi_grid, axis=1), rp_grid,
+        )
+    if N_r is not None:
+        out = out * float(N_r) * float(N_r)
+    return out
