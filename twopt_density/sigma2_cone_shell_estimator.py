@@ -17,13 +17,21 @@ Pipeline:
   4. Adjacent-shell finite differences in log(1+z) give
      ``d sigma^2 / d ln(1+z)``.
 
+The hot loop in ``cone_shell_counts`` -- per-cap angular separation,
+theta/z binning, cumulative sum -- is implemented as a
+``@numba.njit(nogil=True)`` kernel. Numba is an optional dependency;
+when unavailable we fall back to a pure-NumPy path. Multiple cap
+centres are processed in parallel via ``concurrent.futures
+.ThreadPoolExecutor`` because the kernel releases the GIL.
+
 Functions:
 
   cap_centre_grid(mask, nside_centres, theta_max_rad, edge_buffer_frac)
       -> (ra_c, dec_c) HEALPix-pixel-centre array, edge-buffered.
 
   cone_shell_counts(ra, dec, z, theta_radii, z_edges,
-                      ra_centres, dec_centres, nside_lookup=512)
+                      ra_centres, dec_centres, nside_lookup=512,
+                      n_threads=None)
       -> N[i_centre, i_theta, i_zshell], A_eff[i_centre, i_theta]
 
   sigma2_estimate_cone_shell(N) -> sigma^2_obs[i_theta, i_zshell].
@@ -38,6 +46,92 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import numpy as np
+
+
+try:
+    import numba
+
+    @numba.njit(cache=True, nogil=True)
+    def _per_cap_count_kernel(
+        theta_c, phi_c,
+        ipix_disc,
+        pix_starts,
+        theta_g_sorted, phi_g_sorted, z_g_sorted, w_g_sorted,
+        theta_radii, z_edges,
+    ):
+        """Numba-JIT per-cap kernel.
+
+        For a single cap centre ``(theta_c, phi_c)`` and the set of
+        ``ipix_disc`` pixels returned by ``hp.query_disc`` at the
+        largest theta, accumulate weighted counts into a (n_theta, n_z)
+        matrix where the (t, k) entry is the count of galaxies with
+        angular separation <= ``theta_radii[t]`` and redshift in shell
+        ``k``.
+
+        Releases the GIL (``nogil=True``) so the outer loop can run
+        across many caps in a thread pool.
+        """
+        n_theta = theta_radii.shape[0]
+        n_z = z_edges.shape[0] - 1
+        out = np.zeros((n_theta, n_z))
+        sin_tc = np.sin(theta_c)
+        cos_tc = np.cos(theta_c)
+        z_lo_total = z_edges[0]
+        z_hi_total = z_edges[n_z]
+        for ip_idx in range(ipix_disc.shape[0]):
+            ip = ipix_disc[ip_idx]
+            s = pix_starts[ip]
+            e = pix_starts[ip + 1]
+            for j in range(s, e):
+                tg = theta_g_sorted[j]
+                pg = phi_g_sorted[j]
+                cs = (sin_tc * np.sin(tg) * np.cos(phi_c - pg)
+                        + cos_tc * np.cos(tg))
+                if cs > 1.0:
+                    cs = 1.0
+                elif cs < -1.0:
+                    cs = -1.0
+                sep = np.arccos(cs)
+                # binary search for smallest t with theta_radii[t] >= sep
+                lo = 0
+                hi = n_theta
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if theta_radii[mid] < sep:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                t_bin = lo
+                if t_bin >= n_theta:
+                    continue
+                # binary search for z bin: smallest k with z_edges[k+1] > zj
+                zj = z_g_sorted[j]
+                if zj < z_lo_total or zj >= z_hi_total:
+                    continue
+                lo = 0
+                hi = n_z
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if z_edges[mid + 1] <= zj:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                z_bin = lo
+                out[t_bin, z_bin] += w_g_sorted[j]
+        # cumulative sum across the theta axis -- a galaxy at
+        # angular separation sep contributes to all caps t with
+        # theta_radii[t] >= sep, so we accumulate in-place.
+        for k in range(n_z):
+            acc = 0.0
+            for t in range(n_theta):
+                acc += out[t, k]
+                out[t, k] = acc
+        return out
+
+    _NUMBA_OK = True
+except ImportError:                                            # pragma: no cover
+    _NUMBA_OK = False
+    _per_cap_count_kernel = None
 
 
 def cap_centre_grid(
@@ -126,6 +220,7 @@ def cone_shell_counts(
     ra_centres_deg: np.ndarray, dec_centres_deg: np.ndarray,
     nside_lookup: int = 512,
     weights: Optional[np.ndarray] = None,
+    n_threads: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Count galaxies in spherical caps of half-angle ``theta`` and
     redshift slices ``[z_edges[k], z_edges[k+1]]`` for every cap centre.
@@ -133,8 +228,9 @@ def cone_shell_counts(
     Pre-builds a HEALPix pixel -> galaxy-index lookup at
     ``nside_lookup`` (RING ordering). For each centre, walks
     ``query_disc`` outward to ``max(theta_radii)``; the resulting set
-    of pixels is partitioned into the requested theta annuli (cumulative
-    counts up to each theta) and z slices in O(N_in_max_disc) per centre.
+    of pixels is then handed to a Numba kernel that bins each galaxy
+    by its exact (sep, z) and accumulates the (n_theta, n_z) count
+    matrix in a single pass.
 
     Parameters
     ----------
@@ -147,11 +243,13 @@ def cone_shell_counts(
         side is ~7 arcmin, which is finer than typical cap radii.
     weights : optional (N_gal,) per-galaxy weights (e.g.
         completeness reciprocal). Default uniform.
+    n_threads : if Numba is available, run the per-cap kernel in a
+        thread pool with this many workers. ``None`` (default)
+        auto-selects ``os.cpu_count()``; ``1`` forces single-threaded.
 
     Returns
     -------
-    N : (n_centres, n_theta, n_zshell) integer or float array of
-        weighted counts per cap.
+    N : (n_centres, n_theta, n_zshell) float array of weighted counts.
     A_cap : (n_theta,) cap solid angles ``2 pi (1 - cos theta)`` [sr].
     """
     import healpy as hp
@@ -173,19 +271,21 @@ def cone_shell_counts(
     else:
         w = np.asarray(weights, dtype=np.float64)
 
-    # 1) galaxy -> pixel lookup at nside_lookup
+    # 1) galaxy -> pixel lookup at nside_lookup; sort all per-galaxy
+    #    arrays by pixel so the kernel can iterate contiguous slices.
     theta_g = np.deg2rad(90.0 - dec_deg)
     phi_g = np.deg2rad(ra_deg)
     ipix_g = hp.ang2pix(nside_lookup, theta_g, phi_g)
-    # sort galaxies by pixel for fast contiguous slicing
     order = np.argsort(ipix_g, kind="stable")
     ipix_g_sorted = ipix_g[order]
+    theta_g_sorted = theta_g[order]
+    phi_g_sorted = phi_g[order]
     z_sorted = z[order]
     w_sorted = w[order]
-    # build a pixel -> [start, end) lookup
     npix_lookup = 12 * nside_lookup ** 2
-    pix_starts = np.searchsorted(ipix_g_sorted, np.arange(npix_lookup + 1),
-                                    side="left")
+    pix_starts = np.searchsorted(
+        ipix_g_sorted, np.arange(npix_lookup + 1), side="left",
+    ).astype(np.int64)
 
     # 2) per-centre cap walk
     theta_c_rad = np.deg2rad(90.0 - dec_c)
@@ -194,81 +294,98 @@ def cone_shell_counts(
     theta_max = float(theta_radii_rad.max())
 
     N = np.zeros((n_c, n_theta, n_z), dtype=np.float64)
-    for i in range(n_c):
-        # all pixels inside the *largest* cap (inclusive slightly to
-        # protect against boundary pixels)
-        ipix_disc = hp.query_disc(nside_lookup, vecs_c[i], theta_max,
-                                     inclusive=True)
-        if ipix_disc.size == 0:
-            continue
-        # gather all galaxies in those pixels
-        offs = []
-        for ip in ipix_disc:
-            s, e = pix_starts[ip], pix_starts[ip + 1]
-            if s < e:
-                offs.append((s, e))
-        if not offs:
-            continue
-        offs_arr = np.array(offs, dtype=np.int64)
-        # build a single concatenation slice list
-        sizes = offs_arr[:, 1] - offs_arr[:, 0]
-        n_total = int(sizes.sum())
-        if n_total == 0:
-            continue
-        # use np.fromiter / hstack of slices is slow; do indexed gather
-        idx = np.empty(n_total, dtype=np.int64)
-        cur = 0
-        for s, e in offs_arr:
-            d = e - s
-            idx[cur:cur + d] = np.arange(s, e)
-            cur += d
-        z_in = z_sorted[idx]
-        w_in = w_sorted[idx]
 
-        # exact angular separation from cap centre
-        theta_g_in = np.deg2rad(90.0 - dec_deg[order[idx]])
-        phi_g_in = np.deg2rad(ra_deg[order[idx]])
-        # cos(theta_sep) = sin(theta_c) sin(theta_g) cos(phi_diff)
-        #                  + cos(theta_c) cos(theta_g)
-        cos_sep = (
-            np.sin(theta_c_rad[i]) * np.sin(theta_g_in)
-            * np.cos(phi_c_rad[i] - phi_g_in)
-            + np.cos(theta_c_rad[i]) * np.cos(theta_g_in)
-        )
-        # numerical safety
-        cos_sep = np.clip(cos_sep, -1.0, 1.0)
-        # accumulate per-theta cap (cumulative -> any galaxy with sep
-        # <= theta_radii[t] counts in caps t..n_theta-1).
-        # For an unordered list of galaxies and increasing theta, this
-        # is faster than partitioning: do a single sort by sep.
-        sep = np.arccos(cos_sep)
-        # bin galaxies into z slices once
-        z_bin = np.searchsorted(z_edges, z_in, side="right") - 1
-        z_in_range = (z_bin >= 0) & (z_bin < n_z)
-        if not z_in_range.any():
-            continue
-        sep_e = sep[z_in_range]
-        w_e = w_in[z_in_range]
-        z_bin_e = z_bin[z_in_range]
-        # for each theta, sum w over galaxies with sep <= theta
-        # (cumulative sort approach)
-        s_order = np.argsort(sep_e, kind="stable")
-        sep_sorted = sep_e[s_order]
-        w_sorted_e = w_e[s_order]
-        z_bin_sorted = z_bin_e[s_order]
-        # cumulative weighted count by z bin
-        cum = np.zeros((n_z, sep_sorted.size + 1), dtype=np.float64)
-        for k in range(n_z):
-            mk = (z_bin_sorted == k)
-            cw = np.zeros(sep_sorted.size + 1)
-            cw[1:] = np.cumsum(w_sorted_e * mk)
-            cum[k] = cw
-        # for each theta, find idx of last galaxy with sep <= theta
-        idx_theta = np.searchsorted(sep_sorted, theta_radii_rad, side="right")
-        for t in range(n_theta):
-            it = idx_theta[t]
+    if _NUMBA_OK:
+        # Pre-fetch every cap's disc-pixel list in the main thread
+        # (healpy.query_disc isn't reliably GIL-releasing). Then the
+        # per-cap kernels run in a thread pool because they release
+        # the GIL.
+        ipix_per_cap = [
+            hp.query_disc(nside_lookup, vecs_c[i], theta_max, inclusive=True)
+                .astype(np.int64)
+            for i in range(n_c)
+        ]
+        if n_threads is None:
+            import os
+            n_threads = os.cpu_count() or 1
+
+        def _one(i):
+            ipix = ipix_per_cap[i]
+            if ipix.size == 0:
+                return i, np.zeros((n_theta, n_z), dtype=np.float64)
+            return i, _per_cap_count_kernel(
+                theta_c_rad[i], phi_c_rad[i],
+                ipix, pix_starts,
+                theta_g_sorted, phi_g_sorted, z_sorted, w_sorted,
+                theta_radii_rad, z_edges,
+            )
+
+        if n_threads > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=n_threads) as pool:
+                for i, mat in pool.map(_one, range(n_c)):
+                    N[i] = mat
+        else:
+            for i in range(n_c):
+                _, mat = _one(i)
+                N[i] = mat
+    else:                                                       # pragma: no cover
+        # Pure-NumPy fallback (slow; only triggered if numba is missing)
+        for i in range(n_c):
+            ipix_disc = hp.query_disc(
+                nside_lookup, vecs_c[i], theta_max, inclusive=True,
+            )
+            if ipix_disc.size == 0:
+                continue
+            offs = []
+            for ip in ipix_disc:
+                s, e = pix_starts[ip], pix_starts[ip + 1]
+                if s < e:
+                    offs.append((s, e))
+            if not offs:
+                continue
+            n_total = int(sum(e - s for s, e in offs))
+            if n_total == 0:
+                continue
+            idx = np.empty(n_total, dtype=np.int64)
+            cur = 0
+            for s, e in offs:
+                d = e - s
+                idx[cur:cur + d] = np.arange(s, e)
+                cur += d
+            z_in = z_sorted[idx]
+            w_in = w_sorted[idx]
+            cos_sep = (
+                np.sin(theta_c_rad[i]) * np.sin(theta_g_sorted[idx])
+                * np.cos(phi_c_rad[i] - phi_g_sorted[idx])
+                + np.cos(theta_c_rad[i]) * np.cos(theta_g_sorted[idx])
+            )
+            cos_sep = np.clip(cos_sep, -1.0, 1.0)
+            sep = np.arccos(cos_sep)
+            z_bin = np.searchsorted(z_edges, z_in, side="right") - 1
+            z_in_range = (z_bin >= 0) & (z_bin < n_z)
+            if not z_in_range.any():
+                continue
+            sep_e = sep[z_in_range]
+            w_e = w_in[z_in_range]
+            z_bin_e = z_bin[z_in_range]
+            s_order = np.argsort(sep_e, kind="stable")
+            sep_sorted = sep_e[s_order]
+            w_sorted_e = w_e[s_order]
+            z_bin_sorted = z_bin_e[s_order]
+            cum = np.zeros((n_z, sep_sorted.size + 1), dtype=np.float64)
             for k in range(n_z):
-                N[i, t, k] = cum[k, it]
+                mk = (z_bin_sorted == k)
+                cw = np.zeros(sep_sorted.size + 1)
+                cw[1:] = np.cumsum(w_sorted_e * mk)
+                cum[k] = cw
+            idx_theta = np.searchsorted(
+                sep_sorted, theta_radii_rad, side="right",
+            )
+            for t in range(n_theta):
+                it = idx_theta[t]
+                for k in range(n_z):
+                    N[i, t, k] = cum[k, it]
 
     A_cap = 2.0 * np.pi * (1.0 - np.cos(theta_radii_rad))
     return N, A_cap
