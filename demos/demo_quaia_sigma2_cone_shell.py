@@ -55,6 +55,7 @@ def main():
     n_data = int(os.environ.get("PAPER_N_DATA", 80_000))
     nside_centres = int(os.environ.get("PAPER_NSIDE_CENTRES", 64))
     do_jackknife = bool(int(os.environ.get("PAPER_JACKKNIFE", 1)))
+    centres_subsample = int(os.environ.get("PAPER_CENTRES_SUBSAMPLE", 1))
 
     fid = DistanceCosmo(Om=0.31, h=0.68)
     print("loading Quaia G < 20.0 ...")
@@ -97,6 +98,10 @@ def main():
         edge_buffer_frac=1.0,
         mask_threshold=0.5,
     )
+    if centres_subsample > 1:
+        ra_c = ra_c[::centres_subsample]
+        dec_c = dec_c[::centres_subsample]
+        print(f"  subsampling cap centres by {centres_subsample}x")
     print(f"  n_centres = {ra_c.size}")
 
     # 1) per-shell counts and sigma^2_obs
@@ -233,7 +238,8 @@ def main():
     ax.legend(fontsize=6, loc="best")
 
     plt.tight_layout()
-    out_path = os.path.join(FIG_DIR, "quaia_sigma2_cone_shell.png")
+    suffix = f"_sub{centres_subsample}" if centres_subsample > 1 else ""
+    out_path = os.path.join(FIG_DIR, f"quaia_sigma2_cone_shell{suffix}.png")
     plt.savefig(out_path, dpi=140)
     print(f"\nwrote {out_path}")
 
