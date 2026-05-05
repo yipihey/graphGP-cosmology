@@ -262,3 +262,71 @@ def test_decomposition_signs_and_finiteness():
     assert (c_g < 0).all()
     assert (c_b > 0).all()
     assert (c_geom < 0).all()
+
+
+def test_gaussian_covariance_block_diagonal_psd_and_diag_decreases_with_theta():
+    """``sigma2_cone_shell_gaussian_covariance`` must be:
+      - symmetric and positive-semidefinite,
+      - block-diagonal in the redshift-shell index (Gaussian limit),
+      - have diagonal entries that decrease with theta in the
+        information-rich range.
+    """
+    from twopt_density.distance import DistanceCosmo
+    from twopt_density.sigma2_cone_shell import (
+        sigma2_cone_shell_gaussian_covariance,
+    )
+
+    cosmo = DistanceCosmo(Om=0.31, h=0.68)
+    z_grid = np.linspace(0.01, 4.0, 200)
+    dndz = _fid_dndz(z_grid)
+    z_edges = np.array([0.5, 1.0, 1.5, 2.0])
+    theta_rad = np.deg2rad(np.array([0.3, 0.6, 1.2, 2.4]))
+
+    cov = sigma2_cone_shell_gaussian_covariance(
+        theta_rad, z_edges, z_grid, dndz, cosmo,
+        bias=2.0, sigma8=0.81, f_sky=0.7,
+        n_bar_per_steradian=1e7,            # ~Quaia-scale density
+        ell_min=2.0, ell_max=3e4, n_ell=400,
+    )
+
+    n_theta = theta_rad.size
+    n_zshell = z_edges.size - 1
+    n_total = n_theta * n_zshell
+
+    # shape, finiteness
+    assert cov.shape == (n_total, n_total)
+    assert np.isfinite(cov).all()
+
+    # symmetric
+    np.testing.assert_allclose(cov, cov.T, rtol=1e-12, atol=1e-300)
+
+    # diagonal positive
+    diag = np.diag(cov)
+    assert (diag > 0).all()
+
+    # block-diagonal in z: cov[i_theta * n_z + k_z, j_theta * n_z + l_z]
+    # is zero when k_z != l_z.
+    for k in range(n_zshell):
+        for l in range(n_zshell):
+            if k == l:
+                continue
+            for i in range(n_theta):
+                for j in range(n_theta):
+                    val = cov[i * n_zshell + k, j * n_zshell + l]
+                    assert val == 0.0, (
+                        f"non-zero cross-shell entry at "
+                        f"({i},{k}),({j},{l}): {val}"
+                    )
+
+    # diagonal SE per (theta, z) decreases with theta in each shell
+    # (more area integrated -> more independent modes -> smaller cov)
+    for k in range(n_zshell):
+        d_k = np.array([cov[i * n_zshell + k, i * n_zshell + k]
+                        for i in range(n_theta)])
+        assert np.all(np.diff(d_k) < 0), (
+            f"shell {k} cov diagonal not decreasing with theta: {d_k}"
+        )
+
+    # PSD: smallest eigenvalue >= 0 (within numerical noise)
+    eigs = np.linalg.eigvalsh(cov)
+    assert eigs[0] > -1e-15 * eigs[-1], f"non-PSD: min eig {eigs[0]}"

@@ -351,3 +351,119 @@ def sigma2_cone_shell_decomposition(
     contrib_geom = n_eff * dlnchi_dlnz[:, None]
 
     return z_centres, dlns2_dlnz, contrib_bias, contrib_growth, contrib_geom
+
+
+def sigma2_cone_shell_gaussian_covariance(
+    theta_radii_rad,
+    z_edges,
+    z_grid, dndz,
+    cosmo: DistanceCosmo,
+    bias=1.0,
+    sigma8: float = 0.81,
+    Ob: float = 0.049, ns: float = 0.965,
+    f_sky: float = 1.0,
+    n_bar_per_steradian=None,
+    ell_min: float = 1.0, ell_max: float = 5e4, n_ell: int = 800,
+):
+    """Analytic cosmic-variance + shot-noise Gaussian covariance of
+    ``sigma^2(theta; z, dz)`` across the (theta, z) grid.
+
+    Under the Gaussian-field approximation, the per-shell estimator
+    ``sigma^2(theta) = int dell ell/(2 pi) C_ell W_TH^{2D}(ell theta)^2``
+    has covariance::
+
+        Cov[sigma^2_a, sigma^2_b]
+            = (2 / (4 pi f_sky)) integral dell (2 ell + 1)
+                                          [C_ell^obs]^2 W_a^2(ell) W_b^2(ell)
+
+    where ``C_ell^obs = C_ell + 1/n_bar`` includes the shot-noise
+    contribution and ``W_a(ell) = W_TH^{2D}(ell theta_a)``. Different
+    redshift shells are uncorrelated in the Gaussian limit (they are
+    independent angular projections), so the matrix is block-diagonal
+    in the shell index.
+
+    Parameters
+    ----------
+    theta_radii_rad : (n_theta,) ascending cap half-angles [rad].
+    z_edges : (n_zshell + 1,) shell edges.
+    z_grid, dndz : full-survey ``dN/dz`` to be restricted per shell.
+    cosmo, bias, sigma8, Ob, ns : forward-model parameters; ``bias``
+        may be a scalar or a length-``n_zshell`` array.
+    f_sky : effective fractional sky coverage (in [0, 1]). Default 1.
+    n_bar_per_steradian : optional shot-noise. Either ``None`` (no
+        shot noise -- cosmic-variance-only diagonal), a scalar (same
+        for all shells), or a length-``n_zshell`` array.
+    ell_min, ell_max, n_ell : ell quadrature.
+
+    Returns
+    -------
+    cov : ``(n_theta * n_zshell, n_theta * n_zshell)`` covariance.
+        Layout: ``cov[i_theta * n_zshell + k_z, j_theta * n_zshell +
+        l_z]`` matches the ``s2.flatten()`` order used by
+        ``sigma2_estimate_cone_shell`` returns. Block-diagonal in
+        ``(k_z, l_z)``.
+    """
+    import jax.numpy as jnp
+    from .limber import cl_gg_limber
+    from .sigma2 import _W_TH_2d
+
+    theta_radii_rad = np.asarray(theta_radii_rad, dtype=np.float64)
+    z_edges = np.asarray(z_edges, dtype=np.float64)
+    n_theta = theta_radii_rad.size
+    n_zshell = z_edges.size - 1
+    n_total = n_theta * n_zshell
+
+    bias_arr = np.broadcast_to(np.asarray(bias, dtype=np.float64),
+                                  (n_zshell,))
+    if n_bar_per_steradian is None:
+        nbar_arr = np.full(n_zshell, np.inf)         # no shot noise
+    else:
+        nbar_arr = np.broadcast_to(
+            np.asarray(n_bar_per_steradian, dtype=np.float64),
+            (n_zshell,),
+        )
+
+    ell = jnp.asarray(
+        np.linspace(float(ell_min), float(ell_max), int(n_ell)),
+        dtype=jnp.float64,
+    )
+    # 2D top-hat window squared for each theta: (n_theta, n_ell)
+    W2 = np.asarray(
+        _W_TH_2d(ell[None, :] * jnp.asarray(theta_radii_rad)[:, None]) ** 2,
+        dtype=np.float64,
+    )
+
+    cov = np.zeros((n_total, n_total), dtype=np.float64)
+    ell_np = np.asarray(ell, dtype=np.float64)
+    for k in range(n_zshell):
+        nz_shell = _restrict_dndz_to_shell(
+            z_grid, dndz, float(z_edges[k]), float(z_edges[k + 1]),
+        )
+        cl = np.asarray(
+            cl_gg_limber(ell, z_grid, nz_shell, cosmo,
+                          bias=float(bias_arr[k]),
+                          sigma8=sigma8, Ob=Ob, ns=ns),
+            dtype=np.float64,
+        )
+        cl_obs = cl + 1.0 / nbar_arr[k]                 # add shot noise
+        # mode-density factor (2 ell + 1) / (4 pi f_sky)
+        prefactor = (2.0 * ell_np + 1.0) / (4.0 * np.pi * float(f_sky))
+        # Cov[a, b] within this shell:
+        #   integrate over ell of prefactor * cl_obs^2 * W_a^2 * W_b^2
+        cl_obs_sq = cl_obs ** 2
+        # block: (n_theta, n_theta)
+        block = np.zeros((n_theta, n_theta), dtype=np.float64)
+        for i in range(n_theta):
+            for j in range(i, n_theta):
+                integrand = prefactor * cl_obs_sq * W2[i] * W2[j]
+                val = 2.0 * float(np.trapezoid(integrand, ell_np))
+                block[i, j] = val
+                block[j, i] = val
+        # write block at (k, k) of the (n_theta * n_zshell)^2 matrix
+        # using the same flatten convention as sigma^2 grids:
+        # flat_index = i_theta * n_zshell + k_z (matches ndarray.ravel
+        # of (n_theta, n_zshell)).
+        for i in range(n_theta):
+            for j in range(n_theta):
+                cov[i * n_zshell + k, j * n_zshell + k] = block[i, j]
+    return cov
