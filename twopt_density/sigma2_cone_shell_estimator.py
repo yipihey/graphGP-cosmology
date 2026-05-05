@@ -128,10 +128,85 @@ try:
                 out[t, k] = acc
         return out
 
+    @numba.njit(cache=True, nogil=True)
+    def _per_cap_count_kernel_per_region(
+        theta_c, phi_c,
+        ipix_disc,
+        pix_starts,
+        theta_g_sorted, phi_g_sorted, z_g_sorted, w_g_sorted,
+        gal_region_sorted,
+        theta_radii, z_edges, n_regions,
+    ):
+        """Like ``_per_cap_count_kernel`` but accumulates counts split
+        by per-galaxy ``gal_region_sorted`` label, returning a
+        ``(n_theta, n_z, n_regions)`` cube.
+
+        Used by ``cone_shell_counts_per_region`` to enable a single-
+        pass jackknife that costs the same as one full count pass:
+        ``N_minus_k = cube.sum(-1) - cube[..., k]`` per fold.
+        """
+        n_theta = theta_radii.shape[0]
+        n_z = z_edges.shape[0] - 1
+        out = np.zeros((n_theta, n_z, n_regions))
+        sin_tc = np.sin(theta_c)
+        cos_tc = np.cos(theta_c)
+        z_lo_total = z_edges[0]
+        z_hi_total = z_edges[n_z]
+        for ip_idx in range(ipix_disc.shape[0]):
+            ip = ipix_disc[ip_idx]
+            s = pix_starts[ip]
+            e = pix_starts[ip + 1]
+            for j in range(s, e):
+                tg = theta_g_sorted[j]
+                pg = phi_g_sorted[j]
+                cs = (sin_tc * np.sin(tg) * np.cos(phi_c - pg)
+                        + cos_tc * np.cos(tg))
+                if cs > 1.0:
+                    cs = 1.0
+                elif cs < -1.0:
+                    cs = -1.0
+                sep = np.arccos(cs)
+                lo = 0
+                hi = n_theta
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if theta_radii[mid] < sep:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                t_bin = lo
+                if t_bin >= n_theta:
+                    continue
+                zj = z_g_sorted[j]
+                if zj < z_lo_total or zj >= z_hi_total:
+                    continue
+                lo = 0
+                hi = n_z
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if z_edges[mid + 1] <= zj:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                z_bin = lo
+                r = gal_region_sorted[j]
+                if r < 0 or r >= n_regions:
+                    continue
+                out[t_bin, z_bin, r] += w_g_sorted[j]
+        # cumulative sum across the theta axis -- per (z, region).
+        for k in range(n_z):
+            for r in range(n_regions):
+                acc = 0.0
+                for t in range(n_theta):
+                    acc += out[t, k, r]
+                    out[t, k, r] = acc
+        return out
+
     _NUMBA_OK = True
 except ImportError:                                            # pragma: no cover
     _NUMBA_OK = False
     _per_cap_count_kernel = None
+    _per_cap_count_kernel_per_region = None
 
 
 def cap_centre_grid(
@@ -391,6 +466,124 @@ def cone_shell_counts(
     return N, A_cap
 
 
+def cone_shell_counts_per_region(
+    ra_deg: np.ndarray, dec_deg: np.ndarray, z: np.ndarray,
+    theta_radii_rad: np.ndarray,
+    z_edges: np.ndarray,
+    ra_centres_deg: np.ndarray, dec_centres_deg: np.ndarray,
+    gal_region_label: np.ndarray, n_regions: int,
+    nside_lookup: int = 512,
+    weights: Optional[np.ndarray] = None,
+    n_threads: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Like ``cone_shell_counts`` but returns per-jackknife-region
+    partial counts, enabling a one-pass jackknife.
+
+    Each galaxy is assigned a region label in ``gal_region_label``
+    (typically from ``jackknife_region_labels``). The Numba kernel
+    accumulates each cap's count into a (n_theta, n_z, n_regions)
+    sub-cube; summing over the region axis recovers the standard
+    ``cone_shell_counts`` output.
+
+    Parameters
+    ----------
+    same as ``cone_shell_counts`` plus:
+    gal_region_label : (N_gal,) integer array of region labels in
+        ``[0, n_regions)``.
+    n_regions : int.
+
+    Returns
+    -------
+    N_partial : (n_centres, n_theta, n_zshell, n_regions) float array.
+        ``N_partial.sum(axis=-1)`` reproduces ``cone_shell_counts``'s
+        output. ``N_partial.sum(axis=-1) - N_partial[..., k]`` is the
+        leave-region-k count cube.
+    A_cap : (n_theta,) cap solid angles.
+    """
+    import healpy as hp
+
+    if not _NUMBA_OK:                                          # pragma: no cover
+        raise RuntimeError(
+            "cone_shell_counts_per_region requires numba; install it or "
+            "fall back to cone_shell_counts inside a per-fold loop."
+        )
+
+    ra_deg = np.asarray(ra_deg, dtype=np.float64)
+    dec_deg = np.asarray(dec_deg, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    theta_radii_rad = np.asarray(theta_radii_rad, dtype=np.float64)
+    z_edges = np.asarray(z_edges, dtype=np.float64)
+    ra_c = np.asarray(ra_centres_deg, dtype=np.float64)
+    dec_c = np.asarray(dec_centres_deg, dtype=np.float64)
+    gal_region_label = np.asarray(gal_region_label, dtype=np.int64)
+    n_regions = int(n_regions)
+
+    n_theta = theta_radii_rad.size
+    n_z = z_edges.size - 1
+    n_c = ra_c.size
+
+    if weights is None:
+        w = np.ones_like(z)
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+
+    theta_g = np.deg2rad(90.0 - dec_deg)
+    phi_g = np.deg2rad(ra_deg)
+    ipix_g = hp.ang2pix(nside_lookup, theta_g, phi_g)
+    order = np.argsort(ipix_g, kind="stable")
+    ipix_g_sorted = ipix_g[order]
+    theta_g_sorted = theta_g[order]
+    phi_g_sorted = phi_g[order]
+    z_sorted = z[order]
+    w_sorted = w[order]
+    region_sorted = gal_region_label[order]
+    npix_lookup = 12 * nside_lookup ** 2
+    pix_starts = np.searchsorted(
+        ipix_g_sorted, np.arange(npix_lookup + 1), side="left",
+    ).astype(np.int64)
+
+    theta_c_rad = np.deg2rad(90.0 - dec_c)
+    phi_c_rad = np.deg2rad(ra_c)
+    vecs_c = hp.ang2vec(theta_c_rad, phi_c_rad)
+    theta_max = float(theta_radii_rad.max())
+
+    ipix_per_cap = [
+        hp.query_disc(nside_lookup, vecs_c[i], theta_max, inclusive=True)
+            .astype(np.int64)
+        for i in range(n_c)
+    ]
+    if n_threads is None:
+        import os
+        n_threads = os.cpu_count() or 1
+
+    N_partial = np.zeros((n_c, n_theta, n_z, n_regions), dtype=np.float64)
+
+    def _one(i):
+        ipix = ipix_per_cap[i]
+        if ipix.size == 0:
+            return i, np.zeros((n_theta, n_z, n_regions), dtype=np.float64)
+        return i, _per_cap_count_kernel_per_region(
+            theta_c_rad[i], phi_c_rad[i],
+            ipix, pix_starts,
+            theta_g_sorted, phi_g_sorted, z_sorted, w_sorted,
+            region_sorted,
+            theta_radii_rad, z_edges, n_regions,
+        )
+
+    if n_threads > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            for i, mat in pool.map(_one, range(n_c)):
+                N_partial[i] = mat
+    else:
+        for i in range(n_c):
+            _, mat = _one(i)
+            N_partial[i] = mat
+
+    A_cap = 2.0 * np.pi * (1.0 - np.cos(theta_radii_rad))
+    return N_partial, A_cap
+
+
 def sigma2_estimate_cone_shell(N: np.ndarray) -> np.ndarray:
     """Estimate ``sigma^2_obs(theta, z) = Var(N) / <N>^2 - 1 / <N>``
     across the centre axis (axis 0).
@@ -452,6 +645,7 @@ def sigma2_cone_shell_jackknife(
     n_regions: int = 25, nside_jack: int = 4,
     nside_lookup: int = 512,
     weights: Optional[np.ndarray] = None,
+    fast: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Jackknife mean and covariance of ``sigma^2(theta, z)``.
 
@@ -466,6 +660,16 @@ def sigma2_cone_shell_jackknife(
     standard jackknife covariance::
 
         C = ((N - 1) / N) sum_k (s_k - <s>) (s_k - <s>)^T
+
+    The default ``fast=True`` path performs **one** call to
+    ``cone_shell_counts_per_region`` to build the (n_centres, n_theta,
+    n_z, n_regions) partial-count cube, then derives every leave-one-
+    region-out sample as a cheap NumPy reduction on that cube. The
+    resulting per-fold sigma^2 samples are numerically identical to
+    the slow ``fast=False`` path (modulo floating-point summation
+    order) but the full jackknife costs only one count pass instead
+    of ``n_regions`` passes -- typically a 10-25x speedup at fixed
+    catalog and grid.
 
     Parameters / returns
     --------------------
@@ -484,20 +688,39 @@ def sigma2_cone_shell_jackknife(
     n_zshell = z_edges.size - 1
 
     samples = np.zeros((n_regions, n_theta, n_zshell), dtype=np.float64)
-    for k in range(n_regions):
-        keep_g = labels_g != k
-        keep_c = labels_c != k
-        if keep_c.sum() == 0:
-            samples[k] = np.nan
-            continue
-        N_k, _ = cone_shell_counts(
-            ra_deg[keep_g], dec_deg[keep_g], z[keep_g],
-            theta_radii_rad, z_edges,
-            ra_centres_deg[keep_c], dec_centres_deg[keep_c],
-            nside_lookup=nside_lookup,
-            weights=None if weights is None else weights[keep_g],
+
+    if fast and _NUMBA_OK:
+        N_partial, _ = cone_shell_counts_per_region(
+            ra_deg, dec_deg, z, theta_radii_rad, z_edges,
+            ra_centres_deg, dec_centres_deg,
+            gal_region_label=labels_g, n_regions=n_regions,
+            nside_lookup=nside_lookup, weights=weights,
         )
-        samples[k] = sigma2_estimate_cone_shell(N_k)
+        # full count cube via region-axis sum, then leave-one-region-out
+        # is one tensor subtract per fold.
+        N_full = N_partial.sum(axis=-1)
+        for k in range(n_regions):
+            keep_c = labels_c != k
+            if not keep_c.any():
+                samples[k] = np.nan
+                continue
+            N_minus_k = N_full[keep_c] - N_partial[keep_c, ..., k]
+            samples[k] = sigma2_estimate_cone_shell(N_minus_k)
+    else:                                                       # slow fallback
+        for k in range(n_regions):
+            keep_g = labels_g != k
+            keep_c = labels_c != k
+            if not keep_c.any():
+                samples[k] = np.nan
+                continue
+            N_k, _ = cone_shell_counts(
+                ra_deg[keep_g], dec_deg[keep_g], z[keep_g],
+                theta_radii_rad, z_edges,
+                ra_centres_deg[keep_c], dec_centres_deg[keep_c],
+                nside_lookup=nside_lookup,
+                weights=None if weights is None else weights[keep_g],
+            )
+            samples[k] = sigma2_estimate_cone_shell(N_k)
 
     mean = np.nanmean(samples, axis=0)
     diff = samples - mean[None]

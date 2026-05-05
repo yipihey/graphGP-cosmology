@@ -132,6 +132,63 @@ def test_clustered_mock_gives_positive_sigma2_above_poisson_noise():
     assert s2[0, 1] > s2[0, 2]
 
 
+def test_fast_jackknife_matches_slow_on_clustered_mock():
+    """The default ``fast=True`` jackknife (one count pass + cube
+    reductions) must produce the same per-fold samples and covariance
+    as the slow ``fast=False`` path that re-runs ``cone_shell_counts``
+    per fold. On the same mock the two should agree to at most a
+    few-eps floating-point summation-order difference."""
+    import healpy as hp
+    from twopt_density.sigma2_cone_shell_estimator import (
+        cap_centre_grid, sigma2_cone_shell_jackknife,
+    )
+
+    rng = np.random.default_rng(11)
+    n_p = 8000
+    phi_p = rng.uniform(0, 2 * np.pi, n_p)
+    sin_dec_p = rng.uniform(-1, 1, n_p)
+    ra = np.degrees(phi_p)
+    dec = np.degrees(np.arcsin(sin_dec_p))
+    z = rng.uniform(0.5, 2.0, n_p)
+
+    # inject a cluster in one z slice so cosmic variance is non-trivial
+    n_c_pts = 1500
+    cluster_centres = rng.uniform([0, -45], [360, 45], (40, 2))
+    assign = rng.integers(0, 40, n_c_pts)
+    ra_c = (cluster_centres[assign, 0]
+              + 2.0 * rng.standard_normal(n_c_pts)) % 360
+    dec_c = np.clip(cluster_centres[assign, 1]
+                       + 2.0 * rng.standard_normal(n_c_pts), -89, 89)
+    z_c = rng.uniform(1.0, 1.5, n_c_pts)
+    ra = np.concatenate([ra, ra_c])
+    dec = np.concatenate([dec, dec_c])
+    z = np.concatenate([z, z_c])
+
+    nside = 16
+    mask = np.ones(12 * nside ** 2, dtype=np.float64)
+    theta_max = np.deg2rad(3.0)
+    ra_centres, dec_centres, _ = cap_centre_grid(
+        mask, nside_centres=nside, theta_max_rad=theta_max,
+        edge_buffer_frac=1.0,
+    )
+
+    theta_radii = np.deg2rad(np.array([1.5, 2.5, 3.0]))
+    z_edges = np.array([0.5, 1.0, 1.5, 2.0])
+
+    common = dict(
+        ra_deg=ra, dec_deg=dec, z=z,
+        theta_radii_rad=theta_radii, z_edges=z_edges,
+        ra_centres_deg=ra_centres, dec_centres_deg=dec_centres,
+        n_regions=8, nside_jack=4, nside_lookup=128,
+    )
+    mean_f, samp_f, cov_f = sigma2_cone_shell_jackknife(**common, fast=True)
+    mean_s, samp_s, cov_s = sigma2_cone_shell_jackknife(**common, fast=False)
+
+    np.testing.assert_allclose(samp_f, samp_s, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(mean_f, mean_s, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(cov_f, cov_s, rtol=1e-10, atol=1e-12)
+
+
 def test_cap_centre_grid_edge_buffer_drops_boundary():
     """A non-trivial mask: keep only the northern hemisphere. With
     sufficient edge buffer, no kept centre's cap should cross into
