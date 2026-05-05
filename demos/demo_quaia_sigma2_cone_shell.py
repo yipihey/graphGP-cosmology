@@ -41,6 +41,7 @@ from twopt_density.sigma2_cone_shell_estimator import (
     cone_shell_counts,
     dsigma2_dz_estimate,
     sigma2_cone_shell_jackknife,
+    sigma2_cone_shell_with_jackknife,
     sigma2_estimate_cone_shell,
 )
 
@@ -104,33 +105,35 @@ def main():
         print(f"  subsampling cap centres by {centres_subsample}x")
     print(f"  n_centres = {ra_c.size}")
 
-    # 1) per-shell counts and sigma^2_obs
-    print("\ncap counts + per-shell sigma^2 ...")
-    t0 = time.perf_counter()
-    N, A_cap = cone_shell_counts(
-        ra_d, dec_d, z_d, theta_rad, z_edges, ra_c, dec_c,
-        nside_lookup=512,
-    )
-    s2_obs = sigma2_estimate_cone_shell(N)
-    t_est = time.perf_counter() - t0
-    print(f"  done in {t_est:.1f}s; mean N range "
-            f"{N.mean(axis=0).min():.2g} ... {N.mean(axis=0).max():.2g}")
-
-    # 2) jackknife covariance (optional)
+    # 1) one-pass measurement + jackknife (when jackknife is on),
+    #    else just the headline measurement. Both share the same
+    #    Numba kernel work.
     s2_jk_err = None
     if do_jackknife:
-        print("\njackknife covariance ...")
+        print("\nsingle-pass cap counts + sigma^2 + 25-region jackknife ...")
         t0 = time.perf_counter()
-        s2_jk_mean, s2_jk_samples, s2_jk_cov = sigma2_cone_shell_jackknife(
-            ra_d, dec_d, z_d, theta_rad, z_edges, ra_c, dec_c,
-            n_regions=25, nside_jack=4, nside_lookup=512,
+        s2_obs, A_cap, s2_jk_mean, s2_jk_samples, s2_jk_cov = (
+            sigma2_cone_shell_with_jackknife(
+                ra_d, dec_d, z_d, theta_rad, z_edges, ra_c, dec_c,
+                n_regions=25, nside_jack=4, nside_lookup=512,
+            )
         )
-        t_jk = time.perf_counter() - t0
-        # diagonal -> standard errors per (theta, z)
+        t_est = time.perf_counter() - t0
         diag = np.diag(s2_jk_cov).reshape(s2_obs.shape)
         s2_jk_err = np.sqrt(np.maximum(diag, 0.0))
-        print(f"  done in {t_jk:.1f}s; max relative error "
+        print(f"  done in {t_est:.1f}s; max relative error "
                 f"{np.nanmax(s2_jk_err / np.abs(s2_obs + 1e-30)):.2g}")
+    else:
+        print("\ncap counts + per-shell sigma^2 (no jackknife) ...")
+        t0 = time.perf_counter()
+        N, A_cap = cone_shell_counts(
+            ra_d, dec_d, z_d, theta_rad, z_edges, ra_c, dec_c,
+            nside_lookup=512,
+        )
+        s2_obs = sigma2_estimate_cone_shell(N)
+        t_est = time.perf_counter() - t0
+        print(f"  done in {t_est:.1f}s; mean N range "
+                f"{N.mean(axis=0).min():.2g} ... {N.mean(axis=0).max():.2g}")
 
     # 3) predicted forward model with a fiducial Quaia b(z)
     #    (Storey-Fisher+24 power-law approximation: b ~ 0.55 (1+z))

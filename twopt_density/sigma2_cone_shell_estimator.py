@@ -638,6 +638,91 @@ def dsigma2_dz_estimate(
     return zc[1:-1], ds
 
 
+def sigma2_cone_shell_with_jackknife(
+    ra_deg: np.ndarray, dec_deg: np.ndarray, z: np.ndarray,
+    theta_radii_rad: np.ndarray, z_edges: np.ndarray,
+    ra_centres_deg: np.ndarray, dec_centres_deg: np.ndarray,
+    n_regions: int = 25, nside_jack: int = 4,
+    nside_lookup: int = 512,
+    weights: Optional[np.ndarray] = None,
+    n_threads: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """One-pass full estimator: returns the headline ``sigma^2_obs``
+    measurement *and* the jackknife covariance from a **single**
+    ``cone_shell_counts_per_region`` pass. The earlier two-stage path
+    (``cone_shell_counts`` + ``sigma2_cone_shell_jackknife``) does the
+    Numba kernel work twice -- once for the headline, once for the
+    cube. This function does it once.
+
+    Pipeline:
+      1. Compute galaxy + centre jackknife region labels.
+      2. Build the (n_centres, n_theta, n_z, n_regions) partial-count
+         cube via ``cone_shell_counts_per_region``.
+      3. ``N = cube.sum(-1)``  ->  ``sigma2_obs = Var(N)/<N>^2 - 1/<N>``.
+      4. Per fold k: ``N_minus_k = N - cube[..., k]`` (with the
+         centres in region k masked out)  ->  fold-k sigma^2 sample.
+      5. Standard ``((n_used-1)/n_used) (S - <S>)^T (S - <S>)``
+         covariance.
+
+    Parameters / returns
+    --------------------
+    same naming as ``sigma2_cone_shell_jackknife`` but now also
+    returns ``sigma2_obs`` and the cap solid-angle vector.
+
+    Returns
+    -------
+    sigma2_obs : (n_theta, n_zshell) headline measurement.
+    A_cap : (n_theta,) cap solid angles.
+    jk_mean : (n_theta, n_zshell) jackknife mean.
+    jk_samples : (n_regions, n_theta, n_zshell) per-fold samples.
+    jk_cov : (n_theta * n_zshell, n_theta * n_zshell) covariance.
+    """
+    from .jackknife import jackknife_region_labels
+
+    if not _NUMBA_OK:                                          # pragma: no cover
+        raise RuntimeError(
+            "sigma2_cone_shell_with_jackknife requires numba; install "
+            "it or call the slower two-stage path "
+            "(cone_shell_counts + sigma2_cone_shell_jackknife)."
+        )
+
+    labels_g, _ = jackknife_region_labels(ra_deg, dec_deg,
+                                              n_regions=n_regions,
+                                              nside_jack=nside_jack)
+    labels_c, _ = jackknife_region_labels(ra_centres_deg, dec_centres_deg,
+                                              n_regions=n_regions,
+                                              nside_jack=nside_jack)
+    n_theta = theta_radii_rad.size
+    n_zshell = z_edges.size - 1
+
+    N_partial, A_cap = cone_shell_counts_per_region(
+        ra_deg, dec_deg, z, theta_radii_rad, z_edges,
+        ra_centres_deg, dec_centres_deg,
+        gal_region_label=labels_g, n_regions=n_regions,
+        nside_lookup=nside_lookup, weights=weights, n_threads=n_threads,
+    )
+    N_full = N_partial.sum(axis=-1)
+
+    sigma2_obs = sigma2_estimate_cone_shell(N_full)
+
+    samples = np.zeros((n_regions, n_theta, n_zshell), dtype=np.float64)
+    for k in range(n_regions):
+        keep_c = labels_c != k
+        if not keep_c.any():
+            samples[k] = np.nan
+            continue
+        N_minus_k = N_full[keep_c] - N_partial[keep_c, ..., k]
+        samples[k] = sigma2_estimate_cone_shell(N_minus_k)
+
+    mean = np.nanmean(samples, axis=0)
+    diff = samples - mean[None]
+    n_used = np.isfinite(samples[:, 0, 0]).sum()
+    flat = diff.reshape(samples.shape[0], -1)
+    flat = np.nan_to_num(flat, nan=0.0)
+    cov = ((n_used - 1) / n_used) * (flat.T @ flat)
+    return sigma2_obs, A_cap, mean, samples, cov
+
+
 def sigma2_cone_shell_jackknife(
     ra_deg: np.ndarray, dec_deg: np.ndarray, z: np.ndarray,
     theta_radii_rad: np.ndarray, z_edges: np.ndarray,
