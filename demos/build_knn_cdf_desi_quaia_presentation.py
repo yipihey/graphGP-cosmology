@@ -2184,16 +2184,15 @@ def main():
 
         if n_z_q > N_Z_PLOT:
             fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), squeeze=False)
-            for ax, arr2d, label in zip(
-                axes[0],
-                (_full_diag_2d(s3_q), _full_diag_2d(s3_d)),
+            for ax, cube, lbl in zip(
+                axes[0], (s3_q, s3_d),
                 ("Quaia G<20", "DESI Y1 QSO"),
             ):
-                _heatmap_panel_diag(
-                    ax, arr2d, theta_deg, quaia["z_q_edges"],
-                    cmap="RdBu_r", vsymmetric=2.0,
-                    cbar_label=r"$S_3$",
-                    title=f"{label}  S₃(θ; z)")
+                pc = _heatmap_panel_diag(
+                    ax, cube, theta_deg, quaia["z_q_edges"],
+                    cmap="RdBu_r", vmin=-2.0, vmax=2.0,
+                    label="z", title=f"{lbl}  S₃(θ; z)")
+                fig.colorbar(pc, ax=ax, label=r"$S_3$")
             fig.suptitle("Skewness heatmaps (full z range)", y=0.995)
             fig.tight_layout()
             figs["s3_skew_heat"] = fig_to_b64(fig)
@@ -2234,16 +2233,15 @@ def main():
 
         if n_z_q > N_Z_PLOT:
             fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), squeeze=False)
-            for ax, arr2d, label in zip(
-                axes[0],
-                (_full_diag_2d(s4_q), _full_diag_2d(s4_d)),
+            for ax, cube, lbl in zip(
+                axes[0], (s4_q, s4_d),
                 ("Quaia G<20", "DESI Y1 QSO"),
             ):
-                _heatmap_panel_diag(
-                    ax, arr2d, theta_deg, quaia["z_q_edges"],
-                    cmap="RdBu_r", vsymmetric=5.0,
-                    cbar_label=r"$S_4-3$",
-                    title=f"{label}  kurt(θ; z)")
+                pc = _heatmap_panel_diag(
+                    ax, cube, theta_deg, quaia["z_q_edges"],
+                    cmap="RdBu_r", vmin=-5.0, vmax=5.0,
+                    label="z", title=f"{lbl}  kurt(θ; z)")
+                fig.colorbar(pc, ax=ax, label=r"$S_4-3$")
             fig.suptitle("Kurtosis heatmaps (full z range)", y=0.995)
             fig.tight_layout()
             figs["s4_kurt_heat"] = fig_to_b64(fig)
@@ -2352,22 +2350,20 @@ def main():
     # ---- Redshift derivative ∂ln σ² / ∂ln(1+z) heatmap -------------
     if n_z_q >= 3:
         print("rendering ∂lnσ²/∂ln(1+z) panel ...")
-        s2_q_diag2d = _full_diag_2d(s2_q)  # (n_z, n_theta)
-        s2_d_diag2d = _full_diag_2d(s2_d)
-        # transpose to (n_theta, n_z) for the helper
-        deriv_q = dlnsigma2_dlogz(s2_q_diag2d.T, z_q_mid)
-        deriv_d = dlnsigma2_dlogz(s2_d_diag2d.T, z_q_mid)
+        # s2 is already (n_theta, n_z) on a diagonal cube; pass as-is.
+        deriv_q = dlnsigma2_dlogz(s2_q, z_q_mid)
+        deriv_d = dlnsigma2_dlogz(s2_d, z_q_mid)
         fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), squeeze=False)
-        for ax, arr2d, label in zip(
-            axes[0],
-            (deriv_q.T, deriv_d.T),  # back to (n_z, n_theta)
+        for ax, cube, lbl in zip(
+            axes[0], (deriv_q, deriv_d),
             ("Quaia G<20", "DESI Y1 QSO"),
         ):
-            _heatmap_panel_diag(
-                ax, arr2d, theta_deg, quaia["z_q_edges"],
-                cmap="RdBu_r", vsymmetric=4.0,
-                cbar_label=r"$\partial\ln\sigma^2/\partial\ln(1+z)$",
-                title=f"{label}  redshift derivative")
+            pc = _heatmap_panel_diag(
+                ax, cube, theta_deg, quaia["z_q_edges"],
+                cmap="RdBu_r", vmin=-4.0, vmax=4.0,
+                label="z", title=f"{lbl}  ∂lnσ²/∂ln(1+z)")
+            fig.colorbar(pc, ax=ax,
+                         label=r"$\partial\ln\sigma^2/\partial\ln(1+z)$")
         fig.suptitle(
             "Logarithmic redshift derivative ∂lnσ²/∂ln(1+z) "
             "(note v4_1 Eq. 20: 2p_bias + growth + geometry decomposition)",
