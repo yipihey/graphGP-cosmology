@@ -16,8 +16,13 @@ def _make_synthetic_desi_fits(path: str, n: int, ra_centre: float = 180.0,
                                 dec_centre: float = 0.0, ra_span: float = 30.0,
                                 dec_span: float = 30.0, z_min: float = 0.8,
                                 z_max: float = 2.1, seed: int = 0,
-                                with_full_weights: bool = True):
-    """Write a tiny DESI-style clustering FITS at ``path``."""
+                                with_full_weights: bool = True,
+                                with_photsys: bool = False):
+    """Write a tiny DESI-style clustering FITS at ``path``.
+
+    If ``with_photsys=True``, adds a PHOTSYS column with values 'N' for
+    Dec > 32.375 and 'S' otherwise (matches DR1 convention).
+    """
     fits = pytest.importorskip("astropy.io.fits")
     rng = np.random.default_rng(seed)
 
@@ -43,6 +48,9 @@ def _make_synthetic_desi_fits(path: str, n: int, ra_centre: float = 180.0,
     else:
         cols.append(fits.Column(name="WEIGHT", format="D",
                                   array=np.ones(n)))
+    if with_photsys:
+        photsys = np.where(dec > 32.375, "N", "S").astype("U1")
+        cols.append(fits.Column(name="PHOTSYS", format="1A", array=photsys))
     hdu = fits.BinTableHDU.from_columns(cols)
     hdu.writeto(path, overwrite=True)
 
@@ -150,3 +158,29 @@ def test_desi_loader_with_randoms_roundtrip(tmp_path):
                                                nside=64)
     # coarse sanity: footprint covers ~ (30 deg)^2 / 41253 deg^2 ~ 0.022
     assert 0.005 < mask.mean() < 0.05
+
+
+def test_desi_loader_round_trips_photsys(tmp_path):
+    """Loader extracts the PHOTSYS column and the values survive the
+    z mask + concatenation. Synthetic catalog has Dec span straddling
+    the +32.375 deg boundary so both 'N' and 'S' are present."""
+    pytest.importorskip("astropy.io.fits")
+    from twopt_density.desi import load_desi_qso
+    from twopt_density.distance import DistanceCosmo
+
+    fid = DistanceCosmo(Om=0.31, h=0.68)
+    p = str(tmp_path / "QSO_NGC_clustering.dat.fits")
+    # Dec span 0..60 → roughly half N, half S
+    _make_synthetic_desi_fits(
+        p, n=4000, dec_centre=30.0, dec_span=60.0,
+        seed=42, with_photsys=True,
+    )
+    cat = load_desi_qso(catalog_paths=[p], fid_cosmo=fid,
+                          z_min=0.8, z_max=2.1, with_photsys=True)
+    assert cat.photsys_data.shape == cat.ra_data.shape
+    # 'N' rows must have Dec > 32.375; 'S' must have Dec ≤ 32.375
+    assert (cat.dec_data[cat.photsys_data == "N"] > 32.375).all()
+    assert (cat.dec_data[cat.photsys_data == "S"] <= 32.375).all()
+    # both regions present (Dec span 0..60 guarantees this)
+    vals = set(cat.photsys_data.tolist())
+    assert vals == {"N", "S"}

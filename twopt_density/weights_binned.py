@@ -129,7 +129,7 @@ def compute_binned_weights(
     V_kernel = (4.0 / 3.0) * np.pi * r_kernel ** 3
     noise_var = 1.0 / (nbar * V_kernel)  # Poisson noise on the KDE estimate
 
-    r = squareform(pdist(positions))
+    r = _pairwise_distances(positions, box_size=box_size)
     C = _xi_lookup(r.ravel(), r_centers, xi_j).reshape(N, N)
     sigma2 = float(max(xi_j[0], 1.0))
     np.fill_diagonal(C, sigma2)
@@ -169,3 +169,12 @@ def _project_psd(M: np.ndarray) -> np.ndarray:
     w, V = np.linalg.eigh(M)
     w = np.maximum(w, 0.0)
     return (V * w) @ V.T
+
+
+def _pairwise_distances(positions: np.ndarray, box_size: float | None) -> np.ndarray:
+    """Full N x N distance matrix, with minimum-image wrap when periodic."""
+    if box_size is None:
+        return squareform(pdist(positions))
+    diff = positions[:, None, :] - positions[None, :, :]
+    diff -= box_size * np.round(diff / box_size)
+    return np.sqrt(np.einsum("ijk,ijk->ij", diff, diff))

@@ -46,7 +46,7 @@ This module exposes::
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 import numpy as np
@@ -61,6 +61,13 @@ class DESICatalog:
     Mirrors ``QuaiaCatalog`` with two additions: per-object
     multiplicative weights ``w_data`` (combined WEIGHT * WEIGHT_FKP)
     and the radial counterpart ``w_random`` for the randoms.
+
+    ``photsys_data`` carries the per-object photometric region tag
+    ('N' = BASS/MzLS, 'S' = DECaLS) when the loader is asked for it.
+    DESI builds randoms per region (independent target selection,
+    independent imaging-systematics weights, independent z-shuffling
+    pool); preserving PHOTSYS lets downstream random generators
+    factorise the same way.
     """
     ra_data: np.ndarray              # (N_d,) deg
     dec_data: np.ndarray             # (N_d,) deg
@@ -76,6 +83,12 @@ class DESICatalog:
 
     fid_cosmo: DistanceCosmo
 
+    photsys_data: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype="U1"))
+    photsys_random: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype="U1"))
+    nx_data: Optional[np.ndarray] = None
+
     @property
     def N_data(self) -> int:
         return len(self.ra_data)
@@ -85,13 +98,25 @@ class DESICatalog:
         return len(self.ra_random)
 
 
-def _read_clustering_fits(path: str, with_weight_fkp: bool = True):
+def _read_clustering_fits(
+    path: str,
+    with_weight_fkp: bool = True,
+    with_photsys: bool = True,
+    with_nx: bool = False,
+):
     """Read RA/DEC/Z and combined weight from a DESI clustering FITS.
 
     Tries the canonical column names in order:
       WEIGHT * WEIGHT_FKP (preferred)
       WEIGHT_SYS * WEIGHT_NOZ * WEIGHT_COMP_TILE * WEIGHT_FKP
       fall back to 1.0
+
+    Returns
+    -------
+    ra, dec, z, w, photsys, nx
+        photsys is a length-N ``'<U1'`` array of 'N'/'S' chars (empty
+        if PHOTSYS column absent or with_photsys=False). nx is None
+        unless ``with_nx`` is set and the column exists.
     """
     from astropy.io import fits
 
@@ -119,7 +144,21 @@ def _read_clustering_fits(path: str, with_weight_fkp: bool = True):
             w_fkp = col("WEIGHT_FKP")
             if w_fkp is not None:
                 w = w * w_fkp
-        return ra, dec, z, np.asarray(w, dtype=np.float64)
+
+        if with_photsys and "PHOTSYS" in cols:
+            raw = np.asarray(t["PHOTSYS"])
+            # FITS char columns may come back as bytes ('|S1') or str
+            # depending on astropy version; normalise to '<U1'.
+            if raw.dtype.kind == "S":
+                photsys = np.char.decode(raw, "ascii").astype("U1")
+            else:
+                photsys = raw.astype("U1")
+        else:
+            photsys = np.empty(0, dtype="U1")
+
+        nx = col("NX") if with_nx else None
+
+        return ra, dec, z, np.asarray(w, dtype=np.float64), photsys, nx
 
 
 def load_desi_qso(
@@ -131,6 +170,8 @@ def load_desi_qso(
     n_random_max: Optional[int] = None,
     rng_seed: int = 0,
     with_weight_fkp: bool = True,
+    with_photsys: bool = True,
+    with_nx: bool = False,
 ) -> DESICatalog:
     """Read DESI DR1 QSO clustering catalogs (combined N+S galactic caps).
 
@@ -152,34 +193,56 @@ def load_desi_qso(
     rng = np.random.default_rng(rng_seed)
 
     ra_d_l = []; dec_d_l = []; z_d_l = []; w_d_l = []
+    photsys_d_l = []; nx_d_l = []
     for p in catalog_paths:
-        ra, dec, z, w = _read_clustering_fits(p, with_weight_fkp=with_weight_fkp)
+        ra, dec, z, w, photsys, nx = _read_clustering_fits(
+            p, with_weight_fkp=with_weight_fkp,
+            with_photsys=with_photsys, with_nx=with_nx,
+        )
         m = (z >= z_min) & (z <= z_max) & np.isfinite(w) & (w > 0)
         ra_d_l.append(ra[m]); dec_d_l.append(dec[m])
         z_d_l.append(z[m]); w_d_l.append(w[m])
+        if photsys.size > 0:
+            photsys_d_l.append(photsys[m])
+        if nx is not None:
+            nx_d_l.append(nx[m])
     ra_data = np.concatenate(ra_d_l); dec_data = np.concatenate(dec_d_l)
     z_data = np.concatenate(z_d_l); w_data = np.concatenate(w_d_l)
+    photsys_data = (np.concatenate(photsys_d_l) if photsys_d_l
+                    else np.empty(0, dtype="U1"))
+    nx_data = np.concatenate(nx_d_l) if nx_d_l else None
 
     xyz_data = radec_z_to_cartesian(ra_data, dec_data, z_data, fid_cosmo)
 
     if randoms_paths is not None:
         ra_r_l = []; dec_r_l = []; z_r_l = []; w_r_l = []
+        photsys_r_l = []
         for p in randoms_paths:
-            ra, dec, z, w = _read_clustering_fits(p, with_weight_fkp=with_weight_fkp)
+            ra, dec, z, w, photsys, _ = _read_clustering_fits(
+                p, with_weight_fkp=with_weight_fkp,
+                with_photsys=with_photsys, with_nx=False,
+            )
             m = (z >= z_min) & (z <= z_max) & np.isfinite(w) & (w > 0)
             ra_r_l.append(ra[m]); dec_r_l.append(dec[m])
             z_r_l.append(z[m]); w_r_l.append(w[m])
+            if photsys.size > 0:
+                photsys_r_l.append(photsys[m])
         ra_random = np.concatenate(ra_r_l); dec_random = np.concatenate(dec_r_l)
         z_random = np.concatenate(z_r_l); w_random = np.concatenate(w_r_l)
+        photsys_random = (np.concatenate(photsys_r_l) if photsys_r_l
+                          else np.empty(0, dtype="U1"))
         if n_random_max is not None and len(ra_random) > n_random_max:
             idx = rng.choice(len(ra_random), n_random_max, replace=False)
             ra_random = ra_random[idx]; dec_random = dec_random[idx]
             z_random = z_random[idx]; w_random = w_random[idx]
+            if photsys_random.size > 0:
+                photsys_random = photsys_random[idx]
         xyz_random = radec_z_to_cartesian(ra_random, dec_random, z_random, fid_cosmo)
     else:
         ra_random = np.zeros(0); dec_random = np.zeros(0)
         z_random = np.zeros(0); xyz_random = np.zeros((0, 3))
         w_random = np.zeros(0)
+        photsys_random = np.empty(0, dtype="U1")
 
     return DESICatalog(
         ra_data=ra_data, dec_data=dec_data, z_data=z_data,
@@ -187,6 +250,97 @@ def load_desi_qso(
         ra_random=ra_random, dec_random=dec_random, z_random=z_random,
         xyz_random=xyz_random, w_random=w_random,
         fid_cosmo=fid_cosmo,
+        photsys_data=photsys_data,
+        photsys_random=photsys_random,
+        nx_data=nx_data,
+    )
+
+
+def split_n_random_by_data_fraction(
+    n_random_total: int,
+    photsys_data: np.ndarray,
+    regions: Iterable[str] = ("N", "S"),
+) -> dict:
+    """Distribute ``n_random_total`` across photometric regions in
+    proportion to the per-region data count.
+
+    Integer-floor per region; rounding remainder is assigned to the
+    largest region so the per-region sum equals ``n_random_total``.
+    """
+    n_total = int(photsys_data.size)
+    if n_total == 0:
+        raise ValueError("photsys_data is empty; cannot split.")
+    counts = {r: int((photsys_data == r).sum()) for r in regions}
+    if sum(counts.values()) == 0:
+        raise ValueError(
+            f"none of {tuple(regions)} appear in photsys_data; got "
+            f"unique values {tuple(np.unique(photsys_data))}"
+        )
+    n_per = {r: int(np.floor(n_random_total * counts[r] / n_total))
+             for r in regions}
+    remainder = n_random_total - sum(n_per.values())
+    if remainder > 0:
+        # add the leftover to the largest region
+        biggest = max(counts, key=counts.get)
+        n_per[biggest] += remainder
+    return n_per
+
+
+def random_queries_desi_per_region(
+    region_sel_maps: dict,         # {'N': sel_N, 'S': sel_S}
+    region_z_pools: dict,          # {'N': z_data_N, 'S': z_data_S}
+    n_random_per_region: dict,     # {'N': N_R_N, 'S': N_R_S}
+    nside: int,
+    rng: np.random.Generator,
+):
+    """Draw a DESI random catalog as a sum of per-region factorised
+    random catalogs.
+
+    Each region ``R`` contributes a random of size
+    ``n_random_per_region[R]`` drawn from
+    ``region_sel_maps[R](Omega) * n_R(z)`` where ``n_R(z)`` is the
+    empirical histogram of ``region_z_pools[R]`` (this matches DESI's
+    official redshift-shuffling-within-region recipe). Outputs from
+    each region are concatenated and a parallel ``photsys_label``
+    array of single-char tags is returned so downstream code can
+    propagate the per-row region.
+
+    The same ``Generator`` is threaded through both regional draws,
+    so the per-call seed determines both — the second region picks up
+    the stream state left by the first.
+
+    Returns
+    -------
+    ra, dec, z, photsys_label
+        Concatenated random catalog. Order is ``regions`` iteration
+        order over the dict (typically insertion order: ``N`` then
+        ``S``).
+    """
+    from .knn_analytic_rr import random_queries_from_selection_function
+
+    ra_l = []; dec_l = []; z_l = []; lbl_l = []
+    for region in region_sel_maps.keys():
+        n_r = int(n_random_per_region[region])
+        if n_r <= 0:
+            continue
+        sel = region_sel_maps[region]
+        zpool = region_z_pools[region]
+        if zpool.size == 0:
+            raise ValueError(
+                f"region {region!r}: empty z pool — cannot draw randoms."
+            )
+        ra, dec, z = random_queries_from_selection_function(
+            sel_map=sel, z_data=zpool, n_random=n_r,
+            nside=nside, rng=rng,
+        )
+        ra_l.append(ra); dec_l.append(dec); z_l.append(z)
+        lbl_l.append(np.full(n_r, region, dtype="U1"))
+    if not ra_l:
+        return (np.zeros(0), np.zeros(0), np.zeros(0),
+                np.empty(0, dtype="U1"))
+    return (
+        np.concatenate(ra_l), np.concatenate(dec_l),
+        np.concatenate(z_l), np.concatenate(lbl_l),
     )
 
 

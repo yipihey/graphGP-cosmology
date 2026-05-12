@@ -149,6 +149,31 @@ enum Subcommand {
         xi_fit_weighting: String,
         xi_fit_eval_n: usize,
     },
+    AngularKnnCdf(AngularKnnCdfArgs),
+}
+
+/// Arguments for the `angular-knn-cdf` subcommand. All array inputs
+/// are little-endian f64 / i64 binary files. Output is a directory
+/// of binary cubes plus `meta.json`.
+#[derive(Debug)]
+struct AngularKnnCdfArgs {
+    query_data: PathBuf,
+    query_z: PathBuf,
+    neigh_data: PathBuf,
+    neigh_z: PathBuf,
+    weights_neigh: Option<PathBuf>,
+    chord_radii: PathBuf,
+    z_q_edges: PathBuf,
+    z_n_edges: PathBuf,
+    region_labels: Option<PathBuf>,
+    n_regions: usize,
+    k_max: usize,
+    self_exclude: bool,
+    query_targetid: Option<PathBuf>,
+    neigh_targetid: Option<PathBuf>,
+    output: PathBuf,
+    quiet: bool,
+    diagonal_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +453,13 @@ fn parse_args() -> Result<Subcommand, String> {
 
     let sub = argv[1].clone();
     let rest = &argv[2..];
+
+    // Early-dispatch for `angular-knn-cdf` because it has a custom
+    // argument set that does NOT share the global CommonArgs flags
+    // (no -L, -d, -i; multiple binary inputs instead).
+    if sub == "angular-knn-cdf" {
+        return parse_angular_knn_cdf_args(rest);
+    }
 
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
@@ -713,6 +745,261 @@ fn parse_args() -> Result<Subcommand, String> {
         }
         _ => Err(format!("unknown subcommand: {}. Try --help.", sub)),
     }
+}
+
+// ============================================================================
+// angular-knn-cdf: argument parsing and execution
+// ============================================================================
+
+fn parse_angular_knn_cdf_args(rest: &[String]) -> Result<Subcommand, String> {
+    let mut query_data: Option<PathBuf> = None;
+    let mut query_z: Option<PathBuf> = None;
+    let mut neigh_data: Option<PathBuf> = None;
+    let mut neigh_z: Option<PathBuf> = None;
+    let mut weights_neigh: Option<PathBuf> = None;
+    let mut chord_radii: Option<PathBuf> = None;
+    let mut z_q_edges: Option<PathBuf> = None;
+    let mut z_n_edges: Option<PathBuf> = None;
+    let mut region_labels: Option<PathBuf> = None;
+    let mut n_regions: usize = 0;
+    let mut k_max: usize = 0;
+    let mut self_exclude = false;
+    let mut query_targetid: Option<PathBuf> = None;
+    let mut neigh_targetid: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut quiet = false;
+    let mut diagonal_only = false;
+
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        let need_val = |idx: usize, key: &str| -> Result<String, String> {
+            if idx + 1 >= rest.len() {
+                Err(format!("`{}` requires a value", key))
+            } else { Ok(rest[idx + 1].clone()) }
+        };
+        match a {
+            "--query-data" => { query_data = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--query-z"    => { query_z    = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--neigh-data" => { neigh_data = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--neigh-z"    => { neigh_z    = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--weights-neigh" => { weights_neigh = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--chord-radii"   => { chord_radii   = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--z-q-edges"     => { z_q_edges     = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--z-n-edges"     => { z_n_edges     = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--region-labels" => { region_labels = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--n-regions"     => { n_regions = need_val(i, a)?.parse()
+                .map_err(|e| format!("--n-regions: {}", e))?; i += 2; }
+            "--k-max"         => { k_max     = need_val(i, a)?.parse()
+                .map_err(|e| format!("--k-max: {}", e))?; i += 2; }
+            "--self-exclude"  => { self_exclude = true; i += 1; }
+            "--query-targetid" => { query_targetid = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "--neigh-targetid" => { neigh_targetid = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "-o" | "--output"  => { output = Some(PathBuf::from(need_val(i, a)?)); i += 2; }
+            "-q" | "--quiet"   => { quiet = true; i += 1; }
+            "--diagonal-only"  => { diagonal_only = true; i += 1; }
+            _ => return Err(format!("unknown flag for `angular-knn-cdf`: {}", a)),
+        }
+    }
+
+    let args = AngularKnnCdfArgs {
+        query_data: query_data.ok_or("--query-data is required")?.to_path_buf(),
+        query_z: query_z.ok_or("--query-z is required")?.to_path_buf(),
+        neigh_data: neigh_data.ok_or("--neigh-data is required")?.to_path_buf(),
+        neigh_z: neigh_z.ok_or("--neigh-z is required")?.to_path_buf(),
+        weights_neigh,
+        chord_radii: chord_radii.ok_or("--chord-radii is required")?.to_path_buf(),
+        z_q_edges: z_q_edges.ok_or("--z-q-edges is required")?.to_path_buf(),
+        z_n_edges: z_n_edges.ok_or("--z-n-edges is required")?.to_path_buf(),
+        region_labels,
+        n_regions,
+        k_max,
+        self_exclude,
+        query_targetid,
+        neigh_targetid,
+        output: output.ok_or("--output is required")?.to_path_buf(),
+        quiet,
+        diagonal_only,
+    };
+    Ok(Subcommand::AngularKnnCdf(args))
+}
+
+fn read_f64_vec(path: &PathBuf) -> Result<Vec<f64>, String> {
+    let mut buf = Vec::new();
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("opening `{}`: {}", path.display(), e))?;
+    f.read_to_end(&mut buf)
+        .map_err(|e| format!("reading `{}`: {}", path.display(), e))?;
+    if buf.len() % 8 != 0 {
+        return Err(format!("`{}` size ({}) not a multiple of 8", path.display(), buf.len()));
+    }
+    let n = buf.len() / 8;
+    let mut out = vec![0f64; n];
+    for i in 0..n {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&buf[i * 8..(i + 1) * 8]);
+        out[i] = f64::from_le_bytes(bytes);
+    }
+    Ok(out)
+}
+
+fn read_i64_vec(path: &PathBuf) -> Result<Vec<i64>, String> {
+    let mut buf = Vec::new();
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("opening `{}`: {}", path.display(), e))?;
+    f.read_to_end(&mut buf)
+        .map_err(|e| format!("reading `{}`: {}", path.display(), e))?;
+    if buf.len() % 8 != 0 {
+        return Err(format!("`{}` size ({}) not a multiple of 8", path.display(), buf.len()));
+    }
+    let n = buf.len() / 8;
+    let mut out = vec![0i64; n];
+    for i in 0..n {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&buf[i * 8..(i + 1) * 8]);
+        out[i] = i64::from_le_bytes(bytes);
+    }
+    Ok(out)
+}
+
+fn write_f64_vec(path: &PathBuf, data: &[f64]) -> Result<(), String> {
+    let mut buf = Vec::with_capacity(data.len() * 8);
+    for v in data { buf.extend_from_slice(&v.to_le_bytes()); }
+    std::fs::write(path, &buf)
+        .map_err(|e| format!("writing `{}`: {}", path.display(), e))
+}
+
+fn write_i64_vec(path: &PathBuf, data: &[i64]) -> Result<(), String> {
+    let mut buf = Vec::with_capacity(data.len() * 8);
+    for v in data { buf.extend_from_slice(&v.to_le_bytes()); }
+    std::fs::write(path, &buf)
+        .map_err(|e| format!("writing `{}`: {}", path.display(), e))
+}
+
+fn run_angular_knn_cdf(args: AngularKnnCdfArgs) -> Result<(), String> {
+    use morton_cascade::angular_knn_cdf::angular_knn_cdf_3d;
+
+    if !args.quiet { eprintln!("loading inputs ..."); }
+    let q_flat = read_f64_vec(&args.query_data)?;
+    if q_flat.len() % 3 != 0 {
+        return Err(format!("query-data length {} not divisible by 3", q_flat.len()));
+    }
+    let n_q = q_flat.len() / 3;
+    let mut query_pts: Vec<[f64; 3]> = Vec::with_capacity(n_q);
+    for i in 0..n_q {
+        query_pts.push([q_flat[i*3], q_flat[i*3+1], q_flat[i*3+2]]);
+    }
+    let query_z = read_f64_vec(&args.query_z)?;
+    if query_z.len() != n_q {
+        return Err(format!("query-z length {} != n_q {}", query_z.len(), n_q));
+    }
+
+    let n_flat = read_f64_vec(&args.neigh_data)?;
+    if n_flat.len() % 3 != 0 {
+        return Err(format!("neigh-data length {} not divisible by 3", n_flat.len()));
+    }
+    let n_n = n_flat.len() / 3;
+    let mut neigh_pts: Vec<[f64; 3]> = Vec::with_capacity(n_n);
+    for i in 0..n_n {
+        neigh_pts.push([n_flat[i*3], n_flat[i*3+1], n_flat[i*3+2]]);
+    }
+    let neigh_z = read_f64_vec(&args.neigh_z)?;
+    if neigh_z.len() != n_n {
+        return Err(format!("neigh-z length {} != n_n {}", neigh_z.len(), n_n));
+    }
+
+    let weights_neigh = match &args.weights_neigh {
+        Some(p) => Some(read_f64_vec(p)?),
+        None => None,
+    };
+    let chord_radii = read_f64_vec(&args.chord_radii)?;
+    let z_q_edges = read_f64_vec(&args.z_q_edges)?;
+    let z_n_edges = read_f64_vec(&args.z_n_edges)?;
+    let region_labels = match &args.region_labels {
+        Some(p) => Some(read_i64_vec(p)?),
+        None => None,
+    };
+    let query_tid = match &args.query_targetid {
+        Some(p) => Some(read_i64_vec(p)?),
+        None => None,
+    };
+    let neigh_tid = match &args.neigh_targetid {
+        Some(p) => Some(read_i64_vec(p)?),
+        None => None,
+    };
+
+    if !args.quiet {
+        eprintln!("  N_q={}, N_n={}, n_theta={}, n_z_q={}, n_z_n={}, k_max={}, \
+                   weighted={}, regions={}, self_exclude={}",
+                  n_q, n_n, chord_radii.len(),
+                  z_q_edges.len() - 1, z_n_edges.len() - 1, args.k_max,
+                  weights_neigh.is_some(), args.n_regions, args.self_exclude);
+        eprintln!("running angular-knn-cdf ...");
+    }
+
+    let t0 = std::time::Instant::now();
+    let cubes = angular_knn_cdf_3d(
+        &query_pts, &query_z,
+        query_tid.as_deref(),
+        &neigh_pts, &neigh_z,
+        neigh_tid.as_deref(),
+        weights_neigh.as_deref(),
+        &chord_radii, &z_q_edges, &z_n_edges,
+        region_labels.as_deref(),
+        args.n_regions,
+        args.k_max,
+        args.self_exclude,
+        args.diagonal_only,
+    );
+    let elapsed = t0.elapsed().as_secs_f64();
+    if !args.quiet {
+        eprintln!("  done in {:.2}s", elapsed);
+    }
+
+    std::fs::create_dir_all(&args.output)
+        .map_err(|e| format!("creating `{}`: {}", args.output.display(), e))?;
+
+    write_i64_vec(&args.output.join("H_geq_k.bin"), &cubes.h_geq_k)?;
+    write_f64_vec(&args.output.join("sum_n.bin"), &cubes.sum_n)?;
+    write_f64_vec(&args.output.join("sum_n2.bin"), &cubes.sum_n2)?;
+    // Higher moments p=3, p=4 (note v4_1 §6) — feeds skewness S₃ and
+    // kurtosis S₄ via Eq. (13–14, 16) in derived helpers.
+    write_f64_vec(&args.output.join("sum_n3.bin"), &cubes.sum_n3)?;
+    write_f64_vec(&args.output.join("sum_n4.bin"), &cubes.sum_n4)?;
+    write_i64_vec(&args.output.join("N_q.bin"), &cubes.n_q_per_zq)?;
+    if let Some(h_pr) = &cubes.h_geq_k_per_region {
+        write_i64_vec(&args.output.join("H_geq_k_per_region.bin"), h_pr)?;
+    }
+    if let Some(s1_pr) = &cubes.sum_n_per_region {
+        write_f64_vec(&args.output.join("sum_n_per_region.bin"), s1_pr)?;
+    }
+    if let Some(s2_pr) = &cubes.sum_n2_per_region {
+        write_f64_vec(&args.output.join("sum_n2_per_region.bin"), s2_pr)?;
+    }
+    if let Some(s3_pr) = &cubes.sum_n3_per_region {
+        write_f64_vec(&args.output.join("sum_n3_per_region.bin"), s3_pr)?;
+    }
+    if let Some(s4_pr) = &cubes.sum_n4_per_region {
+        write_f64_vec(&args.output.join("sum_n4_per_region.bin"), s4_pr)?;
+    }
+    if let Some(nq_pr) = &cubes.n_q_per_region {
+        write_i64_vec(&args.output.join("N_q_per_region.bin"), nq_pr)?;
+    }
+
+    // meta.json with shapes for the Python wrapper.
+    let meta = format!(
+        "{{\
+\"n_theta\":{},\"n_z_q\":{},\"n_z_n\":{},\"k_max\":{},\"n_regions\":{},\
+\"has_per_region\":{},\"is_diagonal\":{},\"has_higher_moments\":true,\
+\"elapsed_s\":{}\
+}}",
+        cubes.n_theta, cubes.n_z_q, cubes.n_z_n, cubes.k_max, cubes.n_regions,
+        cubes.h_geq_k_per_region.is_some(), cubes.is_diagonal, elapsed,
+    );
+    std::fs::write(args.output.join("meta.json"), meta)
+        .map_err(|e| format!("writing meta.json: {}", e))?;
+
+    Ok(())
 }
 
 // ============================================================================
@@ -2436,6 +2723,7 @@ fn main() -> ExitCode {
                 compensated_sums,
                 xi_fit_basis, xi_fit_knots, xi_fit_r_min, xi_fit_r_max,
                 xi_fit_window, xi_fit_weighting, xi_fit_eval_n),
+        Subcommand::AngularKnnCdf(args) => run_angular_knn_cdf(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

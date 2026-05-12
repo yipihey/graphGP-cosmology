@@ -315,16 +315,63 @@ def make_random_from_selection_function(
         raise ValueError("selection map has no positive pixels")
     pix_idx = rng.choice(npix, size=n_random, p=p / p_sum)
 
-    # 2. uniform random offset within each pixel via vec2pix at perturbed
-    #    boundary tiles. Standard recipe: oversample at higher NSIDE.
+    # 2. uniform random offset within each pixel. Two-stage approach:
+    #    (a) pick a fine sub-pixel uniformly within the coarse pixel
+    #        (selects a small patch of area ~ pixel_area / 64);
+    #    (b) jitter uniformly within that fine sub-pixel using a small
+    #        random angular displacement.
+    #
+    # The earlier version stopped after (a) and snapped randoms to the
+    # fine sub-pixel CENTRES. At NSIDE=64 with nside_jitter=512 that gave
+    # ~0.066 deg pixel quantisation — fine for caps >> 0.1 deg but
+    # catastrophic for the LS estimator at sub-pixel theta, where
+    # nbar^RR is artificially low because random pairs only exist when
+    # two randoms land in the same fine pixel (Poisson collision rate
+    # << continuous limit). Adding the (b) jitter restores continuous
+    # uniformity within each pixel and unbiases the small-theta LS.
     nside_jitter = nside * 8       # ~64x oversample area within pixel
     n_jit_per_pix = (nside_jitter // nside) ** 2
     sub = rng.integers(0, n_jit_per_pix, size=n_random)
-    # nest pixel of finer grid: nest_idx = parent_nest * n_jit + sub
     parent_nest = hp.ring2nest(nside, pix_idx)
     fine_nest = parent_nest * n_jit_per_pix + sub
     fine_ring = hp.nest2ring(nside_jitter, fine_nest)
     theta, phi = hp.pix2ang(nside_jitter, fine_ring)
+    # Sub-pixel uniform jitter via rejection sampling: each random gets
+    # a candidate displacement within a square circumscribing the fine
+    # pixel; we accept iff the displaced point is still inside the same
+    # fine pixel (re-checked via ang2pix). This keeps every random
+    # strictly inside its parent coarse pixel (and hence inside the
+    # mask) while smoothing out the fine-pixel-centre quantisation that
+    # was biasing nbar^RR at sub-pixel theta.
+    pix_size_rad = np.sqrt(4.0 * np.pi / (12.0 * nside_jitter ** 2))
+    half = 0.5 * pix_size_rad
+    n_remaining = n_random
+    accepted = np.zeros(n_random, dtype=bool)
+    theta_out = theta.copy()
+    phi_out = phi.copy()
+    max_iter = 30
+    for _ in range(max_iter):
+        idx = np.flatnonzero(~accepted)
+        if idx.size == 0:
+            break
+        d_theta = rng.uniform(-half, half, size=idx.size)
+        # Avoid 1/sin(theta) singularity near poles by clipping the
+        # base theta into [half, pi-half] for the divisor only.
+        sin_t = np.sin(np.clip(theta[idx], half, np.pi - half))
+        d_phi = rng.uniform(-half, half, size=idx.size) / sin_t
+        cand_theta = np.clip(theta[idx] + d_theta, 1e-9, np.pi - 1e-9)
+        cand_phi = np.mod(phi[idx] + d_phi, 2.0 * np.pi)
+        # Accept iff candidate is still in the same fine pixel.
+        cand_pix = hp.ang2pix(nside_jitter, cand_theta, cand_phi)
+        keep = cand_pix == fine_ring[idx]
+        sel_idx = idx[keep]
+        theta_out[sel_idx] = cand_theta[keep]
+        phi_out[sel_idx] = cand_phi[keep]
+        accepted[sel_idx] = True
+    # For the rare cases (corners, poles) where rejection didn't accept
+    # in max_iter rounds, fall back to the fine-pixel centre.
+    theta = theta_out
+    phi = phi_out
     ra = np.degrees(phi)
     dec = 90.0 - np.degrees(theta)
 
@@ -347,12 +394,18 @@ def _sample_z_from_data(z_data: np.ndarray, n: int,
     z_max = float(np.max(z_data))
     edges = np.linspace(z_min, z_max, n_bins + 1)
     hist, _ = np.histogram(z_data, bins=edges)
-    centres = 0.5 * (edges[:-1] + edges[1:])
+    # Empirical CDF lives on bin EDGES, not centres: cdf[i] = fraction
+    # of data with z <= edges[i]. The previous version (cdf[i] at
+    # centres[i]) created a half-bin systematic shift in the resampled
+    # distribution and a degenerate spike at centres[0]; that biased
+    # per-shell random counts by ~1-2% at the Quaia shell widths used in
+    # the kNN-CDF pipeline (and produced negative xi_DP at low z as a
+    # downstream symptom).
     pdf = hist.astype(np.float64)
-    cdf = np.cumsum(pdf)
+    cdf = np.concatenate(([0.0], np.cumsum(pdf)))
     cdf = cdf / cdf[-1]
     u = rng.uniform(size=n)
-    return np.interp(u, cdf, centres)
+    return np.interp(u, cdf, edges)
 
 
 def load_quaia(
