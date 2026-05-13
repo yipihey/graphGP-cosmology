@@ -79,3 +79,13 @@ global propagation is opt-in.
 
 - `sigma2.vsz` :: `Set('min')` 0.03 → 0.1 *(local-warning)*
 - `sigma2.vsz` :: `Set('max')` 0.15 → 0.2 *(local-warning)*
+
+## 2026-05-13T20:19Z  (propagate_vsz_edits)
+
+- `sigma2.vsz` :: `Set('function')` <new> → 't * 61.1282' *(local-warning)*
+- `sigma2.vsz` :: `Set('linked')` <new> → True *(local-warning)*
+- `sigma2.vsz` :: `Set('linkedaxis')` <new> → 'x' *(local-warning)*
+- `sigma2.vsz` :: `Set('mint')` <new> → 0.5 *(local-warning)*
+- `sigma2.vsz` :: `Set('maxt')` <new> → 12.0 *(local-warning)*
+- `sigma2.vsz` :: `Set('otherPosition')` <new> → 1.0 *(local-warning)*
+- `sigma2.vsz` :: `Set('Text/size')` '10pt' → '12pt' *(local-warning)*
