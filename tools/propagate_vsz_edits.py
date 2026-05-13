@@ -62,6 +62,16 @@ SCOPE_RULES: list[tuple[str, str]] = [
 SET_RE = re.compile(r"^Set\(\s*[u]?['\"](?P<path>[^'\"]+)['\"]\s*,\s*"
                     r"(?P<value>.+?)\s*\)\s*$")
 
+# u'foo' vs 'foo' are semantically identical in the Veusz format; PyQt
+# drops the unicode prefix on re-save. Normalise both sides before
+# comparing so this drift doesn't pollute STYLE_LOG.md.
+_UNICODE_PREFIX = re.compile(r"u(['\"])")
+
+
+def _normalise(v: str) -> str:
+    """Canonicalise a Veusz Set() value for diff comparison."""
+    return _UNICODE_PREFIX.sub(r"\1", v).strip()
+
 
 def _scope_for(path: str) -> str:
     for pat, scope in SCOPE_RULES:
@@ -90,7 +100,12 @@ def _latest_snapshot(vsz_dir: Path) -> Path | None:
 
 
 def _diff_file(current: Path, snapshot: Path) -> list[tuple[str, str, str]]:
-    """Return list of (path, old, new) for each property change."""
+    """Return list of (path, old, new) for each property change.
+
+    Values are normalised before comparison so that the ``u'foo'`` →
+    ``'foo'`` re-serialisation drift that PyQt introduces on save
+    doesn't appear in the log.
+    """
     if not snapshot.exists():
         return []  # New file — no propagation, just log on first run.
     cur = _parse_sets(current.read_text())
@@ -98,7 +113,7 @@ def _diff_file(current: Path, snapshot: Path) -> list[tuple[str, str, str]]:
     changes: list[tuple[str, str, str]] = []
     for path, new in cur.items():
         old = snp.get(path)
-        if old is None or old != new:
+        if old is None or _normalise(old) != _normalise(new):
             changes.append((path, old or "<new>", new))
     # Properties removed from current
     for path, old in snp.items():
