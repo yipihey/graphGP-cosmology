@@ -2634,9 +2634,26 @@ def main():
         f.write(html)
     print(f"\nwrote {HTML} ({len(html)/1024:.0f} KB)")
 
-    # Optional: push the rendered HTML to the project's Google Drive
-    # results folder (Quaia inside My Drive/tmp/, see
-    # tools/UPLOAD_README.md). Triggered by PAPER_DRIVE_UPLOAD=1.
+    # Also stage the HTML for GitHub Pages publishing. The docs/
+    # folder on `main` is served at
+    # https://yipihey.github.io/graphGP-cosmology/ (Pages picks up
+    # docs/index.html as the landing page). Skip with
+    # PAPER_PAGES_PUBLISH=0 to keep the docs/ copy frozen.
+    if os.environ.get("PAPER_PAGES_PUBLISH", "1") != "0":
+        docs_dir = os.path.join(REPO_ROOT, "docs")
+        os.makedirs(docs_dir, exist_ok=True)
+        docs_html = os.path.join(docs_dir, "index.html")
+        with open(docs_html, "w") as f:
+            f.write(html)
+        # .nojekyll suppresses Jekyll processing (we serve raw HTML).
+        nojekyll = os.path.join(docs_dir, ".nojekyll")
+        if not os.path.exists(nojekyll):
+            open(nojekyll, "w").close()
+        print(f"wrote {docs_html} (commit + push docs/ to publish)")
+
+    # Optional: also push the rendered HTML to a Google Drive results
+    # folder via tools/drive_upload.sh. Triggered by
+    # PAPER_DRIVE_UPLOAD=1 (legacy, superseded by GitHub Pages).
     if os.environ.get("PAPER_DRIVE_UPLOAD") == "1":
         import subprocess
         helper = os.path.join(REPO_ROOT, "tools", "drive_upload.sh")
