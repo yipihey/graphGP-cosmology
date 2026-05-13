@@ -33,6 +33,11 @@ DOCS_DIR = REPO_ROOT / "docs"
 VSZ_DIR = REPO_ROOT / "vsz"
 BUILD_SCRIPT = REPO_ROOT / "demos" / "build_knn_cdf_desi_quaia_presentation.py"
 PYTHON = os.environ.get("PYTHON_BIN", "/Users/tabel/pyqt/bin/python")
+# Direct binary invocation — `open -a Veusz <file>` doesn't pass the
+# file argument cleanly to the PyQt Veusz build on macOS (it surfaces
+# an empty editor window). Calling the binary directly with the path
+# as argv[1] reliably opens the document.
+VEUSZ_BIN = "/Applications/Veusz.app/Contents/MacOS/veusz.exe"
 
 
 # ---------------------------------------------------------------------------
@@ -64,10 +69,22 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"file not found: {rel}".encode())
             return
         try:
-            subprocess.run(
-                ["open", "-a", "Veusz", str(target)], check=True,
+            # Detached Popen — Veusz lives independently of the helper.
+            # Send stdout/stderr to /dev/null so the noisy macOS-prefs
+            # parse warnings don't fill the helper's terminal.
+            subprocess.Popen(
+                [VEUSZ_BIN, str(target)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
-        except subprocess.CalledProcessError as e:
+        except FileNotFoundError:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(
+                f"Veusz binary not found at {VEUSZ_BIN}".encode())
+            return
+        except Exception as e:
             self.send_response(500)
             self.end_headers()
             self.wfile.write(f"open failed: {e}".encode())
