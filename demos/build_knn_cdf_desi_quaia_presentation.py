@@ -1097,6 +1097,51 @@ def main():
     fig.tight_layout()
     figs["sigma2"] = fig_to_b64(fig)
 
+    # Optional Veusz override for the σ² panel (publication-quality
+    # workflow). When PAPER_USE_VEUSZ=1, also write a Veusz panel-group
+    # at vsz/sigma2.vsz and an SVG at docs/sigma2.svg, then expose the
+    # SVG as figs["sigma2_vsz"]. The matplotlib version stays in
+    # figs["sigma2"] so the existing tab keeps working; the Veusz
+    # version drives the click-through edit-and-propagate loop. See
+    # tools/VEUSZ_README.md.
+    figs["sigma2_vsz"] = None
+    if os.environ.get("PAPER_USE_VEUSZ", "0") == "1":
+        try:
+            import sys as _sys
+            _sys.path.insert(0, REPO_ROOT)
+            from tools.build_vsz import (
+                sigma2_group as _vsz_sigma2_group,
+                export_svg as _vsz_export_svg,
+                snapshot_vsz_dir as _vsz_snapshot,
+            )
+            from tools.propagate_vsz_edits import propagate as _vsz_propagate
+            vsz_dir = os.path.join(REPO_ROOT, "vsz")
+            os.makedirs(vsz_dir, exist_ok=True)
+            # Diff hand-edited .vsz files against the latest snapshot
+            # and append entries to STYLE_LOG.md, BEFORE we create a
+            # new snapshot.
+            _vsz_propagate(vsz_dir, dry_run=False)
+            _vsz_snapshot(vsz_dir, keep=20)
+            z_mids_plot = [float(z_q_mid[i]) for i in Z_PLOT_IDX]
+            vsz_path = _vsz_sigma2_group(
+                s2_q, se_s2_q, s2_d, se_s2_d,
+                theta_deg=theta_deg, z_indices=Z_PLOT_IDX,
+                z_mids=z_mids_plot, vsz_dir=vsz_dir,
+            )
+            svg_out = os.path.join(OUTPUT_DIR, "figures", "sigma2.svg")
+            _vsz_export_svg(vsz_path, svg_out)
+            # Also drop a copy under docs/ so Pages serves it next to
+            # the HTML.
+            docs_svg = os.path.join(REPO_ROOT, "docs", "sigma2.svg")
+            os.makedirs(os.path.dirname(docs_svg), exist_ok=True)
+            import shutil as _shutil
+            _shutil.copy2(svg_out, docs_svg)
+            figs["sigma2_vsz"] = "docs/sigma2.svg"
+            print(f"  [veusz] wrote {vsz_path} and {svg_out}")
+        except Exception as _e:
+            print(f"  [veusz] sigma2 panel failed: {_e}")
+            figs["sigma2_vsz"] = None
+
     # σ²_clust heatmap (full z range, log color scale): Quaia DD,
     # Quaia RD, DESI DD, DESI RD on a common color scale.
     if n_z_q > n_z_plot:
@@ -3012,6 +3057,17 @@ Quaia and ~0.10 in DESI on this geometry.</p>
 decays cleanly with θ. The thin Poisson(W) line shows how much of the
 small-θ noise comes purely from the window function.</p>
 {img('sigma2')}
+{('<h3>Veusz publication-quality (clickable to edit)</h3>'
+  '<p>Click the panel below to open <code>vsz/sigma2.vsz</code> '
+  'in Veusz; save your edits, then POST <code>/rebuild</code> to '
+  'the local helper (see <code>tools/VEUSZ_README.md</code>). '
+  'Style edits propagate via <code>tools/propagate_vsz_edits.py</code> '
+  'and append to <code>vsz/STYLE_LOG.md</code>.</p>'
+  '<a href="http://localhost:8765/open?vsz=vsz/sigma2.vsz">'
+  '<object data="sigma2.svg" type="image/svg+xml" width="100%">'
+  '(Veusz SVG not yet generated; rebuild with PAPER_USE_VEUSZ=1)'
+  '</object></a>'
+  ) if figs.get('sigma2_vsz') else ''}
 <h3>Heatmap (full z range, log color)</h3>
 <p>Shows σ²_clust(θ; z) across all {m['n_z_q']} z-shells for both
 catalogs and both query types. Brighter ⇒ stronger clustering signal.
