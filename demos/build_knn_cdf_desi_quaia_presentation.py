@@ -2751,6 +2751,37 @@ function showTab(id) {
   document.querySelectorAll('.panel').forEach(p =>
       p.classList.toggle('active', p.id === id));
 }
+
+// Veusz rebuild button: POST /rebuild to the local helper
+// (tools/veusz_helper.py on localhost:8765), then reload the page.
+function vszRebuild(btnId, statusId) {
+  const btn = document.getElementById(btnId);
+  const st  = document.getElementById(statusId);
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '🔄 Rebuilding…';
+  if (st) { st.textContent = ''; st.style.color = '#666'; }
+  fetch('http://localhost:8765/rebuild', {method: 'POST'})
+    .then(r => {
+      if (!r.ok) return r.text().then(t => { throw new Error(t); });
+      return r.json();
+    })
+    .then(j => {
+      if (st) {
+        st.textContent = '✓ rebuild OK — reloading…';
+        st.style.color = '#2ca02c';
+      }
+      setTimeout(() => location.reload(), 400);
+    })
+    .catch(e => {
+      btn.disabled = false;
+      btn.textContent = orig;
+      if (st) {
+        st.textContent = '✗ ' + (e.message || 'fetch failed; is veusz_helper running?').split('\\n')[0];
+        st.style.color = '#d62728';
+      }
+    });
+}
 """
 
 
@@ -3058,13 +3089,25 @@ decays cleanly with θ. The thin Poisson(W) line shows how much of the
 small-θ noise comes purely from the window function.</p>
 {img('sigma2')}
 {('<h3>Veusz publication-quality (clickable to edit)</h3>'
-  '<p>Click the panel below to open <code>vsz/sigma2.vsz</code> '
-  'in Veusz; save your edits, then POST <code>/rebuild</code> to '
-  'the local helper (see <code>tools/VEUSZ_README.md</code>). '
-  'Style edits propagate via <code>tools/propagate_vsz_edits.py</code> '
-  'and append to <code>vsz/STYLE_LOG.md</code>.</p>'
-  '<a href="http://localhost:8765/open?vsz=vsz/sigma2.vsz">'
-  '<object data="sigma2.svg" type="image/svg+xml" width="100%">'
+  '<p>Click the panel to open <code>vsz/sigma2.vsz</code> in Veusz, '
+  'save your edits, then '
+  '<button id="vsz-sigma2-btn" '
+  'style="padding:5px 14px; cursor:pointer; '
+  'background:#1f77b4; color:#fff; border:none; border-radius:4px; '
+  'font-weight:600; font-size:13px;" '
+  "onclick=\"vszRebuild('vsz-sigma2-btn', 'vsz-sigma2-status')\">"
+  '🔄 Rebuild &amp; reload</button> '
+  '<span id="vsz-sigma2-status" style="margin-left:10px; '
+  'color:#666; font-size:13px;"></span> '
+  '<a href="http://localhost:8765/open?vsz=vsz/sigma2.vsz" '
+  'target="_blank" style="margin-left:14px;">[Open in Veusz]</a>'
+  '<br><small>Run <code>python tools/veusz_helper.py --watch</code> '
+  'for auto-rebuild on save (no button click needed). '
+  'Style edits get logged to <code>vsz/STYLE_LOG.md</code>.</small></p>'
+  '<a href="http://localhost:8765/open?vsz=vsz/sigma2.vsz" '
+  'target="_blank">'
+  '<object data="sigma2.svg" type="image/svg+xml" width="100%" '
+  'style="pointer-events: none; border: 1px solid #eee;">'
   '(Veusz SVG not yet generated; rebuild with PAPER_USE_VEUSZ=1)'
   '</object></a>'
   ) if figs.get('sigma2_vsz') else ''}
