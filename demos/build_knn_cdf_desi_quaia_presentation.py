@@ -2425,12 +2425,12 @@ def main():
             figs["sigma2_compare"] = fig_to_b64(fig)
             plt.close(fig)
 
-    # ---- ⟨N^p⟩^LS bias-corrected moment overlays (p=2,3,4) ---------
+    # ---- ⟨N^p⟩^LS bias-corrected moment overlays (p=1,2,3,4) -------
     if have_dr and have_higher:
-        print("rendering LS moment p=2,3,4 panel ...")
+        print("rendering LS moment p=1,2,3,4 panel ...")
         try:
             mom_p_lookup = {}
-            for p in (2, 3, 4):
+            for p in (1, 2, 3, 4):
                 mom_p_lookup[("quaia", p)] = cic_moment_ls(
                     quaia["res_dd"], quaia["res_dr"], quaia["res_rd"],
                     quaia["res_rr"], p,
@@ -2453,7 +2453,8 @@ def main():
                     ("desi",  "#ff7f0e", "DESI"),
                 )):
                     ax = axes[row, ip]
-                    for p, marker, ls in ((2, "o", "-"),
+                    for p, marker, ls in ((1, "D", "-"),
+                                           (2, "o", "-"),
                                            (3, "s", "--"),
                                            (4, "^", ":")):
                         mp = mom_p_lookup[(catname, p)]
@@ -2474,8 +2475,10 @@ def main():
                     ax.grid(alpha=0.3)
                     ax.legend(fontsize=8, loc="best")
             fig.suptitle(
-                "Landy–Szalay-corrected raw moments ⟨N^p⟩^LS for p=2,3,4 "
-                "(note v4_1 Eq. 13)", y=0.995, fontsize=11)
+                "Landy–Szalay-corrected raw moments ⟨N^p⟩^LS for p=1,2,3,4 "
+                "(note v4_1 Eq. 13). p=1 is the connected pair density "
+                "(≡ 1+ξ_LS up to normalisation).",
+                y=0.995, fontsize=11)
             fig.tight_layout()
             figs["moment_ls"] = fig_to_b64(fig)
             plt.close(fig)
@@ -3300,18 +3303,20 @@ is a direct probe of perturbative bias parameters.</p>
 </div>
 
 <div id="moment_ls" class="panel">
-<h2>⟨N^p⟩^LS — Landy–Szalay-corrected raw moments p=2,3,4</h2>
+<h2>⟨N^p⟩^LS — Landy–Szalay-corrected raw moments p=1,2,3,4</h2>
 <p><a href="lightcone_native_v4_1.pdf" target="_blank">Note v4_1 Eq.
 13</a> generalises the Landy–Szalay estimator from the
 two-point function to higher moments by applying the same
 <code>(DD − DR − RD + RR)/RR</code> combination per moment order.
 This isolates the connected (clustering-driven) contribution from
 each moment order while removing the geometric/selection-function
-bias that affects each catalog. A positive ``⟨N²⟩^LS`` measures the
-two-point clustering variance; ``⟨N³⟩^LS`` and ``⟨N⁴⟩^LS`` are
+bias that affects each catalog. <b>p=1</b> is the connected pair
+density (numerically equivalent to <i>1+ξ_LS</i> up to per-cap
+normalisation — the "two-point clustering" trace); <b>p=2</b>
+measures the clustering variance; <b>p=3</b> and <b>p=4</b> are
 direct probes of the connected three- and four-point structure of
 the field. Requires the DR pass (run pipelines with
-``PAPER_DR_PASS=1``).</p>
+<code>PAPER_DR_PASS=1</code>).</p>
 {img('moment_ls')}
 </div>
 
