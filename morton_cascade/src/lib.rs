@@ -167,6 +167,7 @@ pub mod xi_gradient;
 pub mod multi_run;
 pub mod jvp;
 pub mod cell_kernels;
+pub mod angular_knn_cdf;
 
 // ============================================================================
 // Public constants and types shared by the 2D modules
