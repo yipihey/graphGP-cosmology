@@ -2719,10 +2719,15 @@ on two QSO samples, run on a matched z-shell grid (z=0.8-2.1) and
 matched theta grid. Quaia is photo-z-based (~1.2M sources before z
 cut, large footprint, unweighted); DESI Y1 QSO is spectroscopic
 (~1.2M sources before cut, ~12k deg^2 footprint, per-object
-WEIGHT*WEIGHT_FKP).</div>
+WEIGHT*WEIGHT_FKP). Equations and definitions used throughout follow
+the unified four-flavor framework in
+<a href="lightcone_native_v4_1.pdf"
+   target="_blank">Abel (2026), <i>Survey-Native Clustering
+Statistics on the Lightcone</i> (PDF)</a>.</div>
 
 <div class="tabs">
   <div class="tab active" data-target="overview" onclick="showTab('overview')">Overview</div>
+  <div class="tab" data-target="note" onclick="showTab('note')">Note (PDF)</div>
   <div class="tab" data-target="catalog" onclick="showTab('catalog')">Catalogs</div>
   <div class="tab" data-target="jackknife" onclick="showTab('jackknife')">Jackknife regions</div>
   <div class="tab" data-target="pthetaz" onclick="showTab('pthetaz')">⟨N⟩(θ,z) heatmaps</div>
@@ -2750,6 +2755,12 @@ WEIGHT*WEIGHT_FKP).</div>
 
 <div id="overview" class="panel active">
 <h2>Comparison setup</h2>
+<p>📄 <b>Companion note (PDF):</b>
+<a href="lightcone_native_v4_1.pdf" target="_blank"><i>Survey-Native
+Clustering Statistics on the Lightcone: A Unified Four-Flavor
+Framework in (θ, z₁, z₂)</i></a> (T. Abel, May 2026) — gives every
+equation and definition referenced in the panels below. The same PDF
+is embedded in the "Note (PDF)" tab.</p>
 <div class="metric-grid">
 <div>N Quaia (raw, in z range): <b>{m['n_quaia_raw']:,}</b></div>
 <div>N Quaia (DD pass): <b>{m['n_quaia']:,}</b></div>
@@ -2777,6 +2788,19 @@ P(N=k) panels include thin solid lines = Poisson(μ=⟨N⟩) at the same
 per-cap mean count — the offset between the data markers and the
 thin line is the clustering signature.
 </div>
+</div>
+
+<div id="note" class="panel">
+<h2>Companion note (PDF)</h2>
+<p>The PDF below is shipped alongside the HTML in the repo
+(<code>docs/lightcone_native_v4_1.pdf</code>). Every "note v4_1 §X" /
+"note v4_1 Eq. X" reference in the other panels links back here.</p>
+<p><a href="lightcone_native_v4_1.pdf" target="_blank">Open in a
+new tab</a> · <a href="lightcone_native_v4_1.pdf"
+download>Download PDF</a></p>
+<embed src="lightcone_native_v4_1.pdf" type="application/pdf"
+       width="100%" height="900px"
+       style="border: 1px solid #ccc; border-radius: 4px;" />
 </div>
 
 <div id="catalog" class="panel">
@@ -3248,7 +3272,8 @@ clustering pipeline.</p>
 <h2>S₃ skewness — third standardised moment of N(θ; z)</h2>
 <p>Per-shell skewness ``S₃ = ⟨(N − ⟨N⟩)³⟩ / σ³`` of the per-cap
 counts, derived from the third raw moment ``⟨N³⟩`` accumulated by
-the kNN-CDF kernel (note v4_1 §6). For a Gaussian or Poisson field
+the kNN-CDF kernel (<a href="lightcone_native_v4_1.pdf"
+target="_blank">note v4_1 §6</a>). For a Gaussian or Poisson field
 ``S₃ → 0``; positive ``S₃`` indicates a heavier upper tail
 (clusters). The DESI sample shows characteristically larger
 skewness at small angular scales than Quaia (deeper, sparser
@@ -3276,7 +3301,8 @@ is a direct probe of perturbative bias parameters.</p>
 
 <div id="moment_ls" class="panel">
 <h2>⟨N^p⟩^LS — Landy–Szalay-corrected raw moments p=2,3,4</h2>
-<p>Note v4_1 Eq. 13 generalises the Landy–Szalay estimator from the
+<p><a href="lightcone_native_v4_1.pdf" target="_blank">Note v4_1 Eq.
+13</a> generalises the Landy–Szalay estimator from the
 two-point function to higher moments by applying the same
 <code>(DD − DR − RD + RR)/RR</code> combination per moment order.
 This isolates the connected (clustering-driven) contribution from
@@ -3291,7 +3317,8 @@ the field. Requires the DR pass (run pipelines with
 
 <div id="xi_hamilton" class="panel">
 <h2>Hamilton ξ vs Landy–Szalay ξ</h2>
-<p>Hamilton's estimator (note v4_1 Eq. 15)::
+<p>Hamilton's estimator (<a href="lightcone_native_v4_1.pdf"
+target="_blank">note v4_1 Eq. 15</a>)::
 
   ξ^Ham = (DD · RR) / (DR · RD) − 1
 
@@ -3306,9 +3333,13 @@ instability rather than a genuine signal. Requires the DR pass.</p>
 </div>
 
 <div id="sigma2_compare" class="panel">
-<h2>σ²_clust: raw DD vs Landy–Szalay-corrected (note v4_1 Eq. 14)</h2>
+<h2>σ²_clust: raw DD vs Landy–Szalay-corrected
+(<a href="lightcone_native_v4_1.pdf" target="_blank">note v4_1
+Eq. 14</a>)</h2>
 <p>``σ²_clust^LS = Var^LS / ⟨N¹⟩^LS² − 1/⟨N¹⟩^LS`` uses the LS
-combination of the second moment (Eq. 13 with p=2). Compared to the
+combination of the second moment
+(<a href="lightcone_native_v4_1.pdf" target="_blank">Eq. 13</a> with
+p=2). Compared to the
 raw-DD form (which has no random subtraction), the LS form removes
 selection-function bias to first order. The difference between the
 two curves at large θ traces the magnitude of the systematic that
@@ -3318,7 +3349,9 @@ the DD signal dominates. Requires DR.</p>
 </div>
 
 <div id="dn_dtheta" class="panel">
-<h2>Differential pair-count density θ·∂⟨N⟩/∂θ (note v4_1 Eq. 9)</h2>
+<h2>Differential pair-count density θ·∂⟨N⟩/∂θ
+(<a href="lightcone_native_v4_1.pdf" target="_blank">note v4_1
+Eq. 9</a>)</h2>
 <p>The per-cap mean count ``⟨N⟩(θ)`` is the cumulative pair count to
 separation θ. The differential pair count
 ``dn_pairs/dθ ∝ θ · ∂⟨N⟩/∂θ`` traces the underlying ξ(θ) more
@@ -3330,10 +3363,12 @@ direct measurement; LS is its bias-corrected analog.</p>
 </div>
 
 <div id="dlogsigma2_dlogz" class="panel">
-<h2>Logarithmic redshift derivative ∂lnσ² / ∂ln(1+z) (note v4_1 §4)</h2>
+<h2>Logarithmic redshift derivative ∂lnσ² / ∂ln(1+z)
+(<a href="lightcone_native_v4_1.pdf" target="_blank">note v4_1 §4</a>)</h2>
 <p>From the diagonal σ²(θ; z) cube, the redshift log-derivative at
 each angular scale is computed by central finite differences along
-the z axis. Note Eq. 20 gives the linear-bias decomposition::
+the z axis. <a href="lightcone_native_v4_1.pdf" target="_blank">Note
+Eq. 20</a> gives the linear-bias decomposition::
 
   ∂lnσ² / ∂ln(1+z) = 2·p_bias  +  2·(1+z)·dlnD/dz  +  n_eff(θ·D_M)·dlnD_M/dln(1+z)
 
