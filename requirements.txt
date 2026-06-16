@@ -6,5 +6,8 @@ matplotlib>=3.7
 # 2pt-aware density pipeline (see IMPLEMENTATION_PLAN.md)
 Corrfunc>=2.5
 graphgp
-jax
+jax[cuda12]
 optax
+h5py
+healpy
+astroquery

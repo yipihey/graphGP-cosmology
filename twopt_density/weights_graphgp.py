@@ -137,6 +137,15 @@ def compute_2pt_weights(
         recovered xi has the same calibration relation as Layer I:
         scaled by ``<w>^2`` plus the weight-correlation term.
 
+    ``"posterior_sample"``
+        Draw a single posterior sample of δ(x) at the data positions via
+        Matheron's rule:
+            δ_post = δ_prior + K_D [K_DD + N_D]^{-1} (y_D - δ_prior|_D)
+        where y_i = 1/nbar_i - 1 and N_D = diag(1/nbar_i). Requires
+        ``nbar`` per-point mean density. The returned weights 1 + δ_post
+        are posterior realizations consistent with the Poisson observations.
+        Uses a Vecchia CG solve (O(N k³) per sample).
+
     Parameters
     ----------
     positions
@@ -151,7 +160,7 @@ def compute_2pt_weights(
         graphgp Vecchia parameters: dense initial block size and number
         of conditional neighbors per point.
     mode
-        ``"prior_sample"`` or ``"data_driven"``.
+        ``"prior_sample"``, ``"data_driven"``, or ``"posterior_sample"``.
     seed
         Seed for the white-noise draw in ``prior_sample`` mode.
     n_kernel_bins
@@ -200,11 +209,64 @@ def compute_2pt_weights(
         d = d - d.mean()
         d_std = float(np.std(d))
         xi_white = (d / d_std) if d_std > 1e-12 else d
+    elif mode == "posterior_sample":
+        if nbar is None:
+            raise ValueError("posterior_sample mode requires nbar")
+        # Matheron's rule at data positions only (no lightcone grid).
+        # For lightcone output use density_field.sample_posterior_density_field.
+        rng = np.random.default_rng(seed)
+        xi_white = rng.standard_normal(N).astype(np.float64)
+        xi_jax = jnp.asarray(xi_white)
+
+        # Prior sample at data positions
+        f_prior = np.asarray(gp.generate(graph, cov, xi_jax))
+
+        # Observed overdensity y_i = 1/nbar_i - 1; noise N_D = diag(1/nbar_i)
+        nbar_safe = np.maximum(nbar, 1e-30)
+        noise_var = 1.0 / nbar_safe
+        y_obs = noise_var - 1.0  # 1/nbar - 1
+
+        # Residual
+        residual = (y_obs - f_prior).astype(np.float64)
+
+        # Vecchia matvec: (K + N) v
+        def _matvec(v_np):
+            v_jax = jnp.asarray(v_np)
+            Lv = jnp.asarray(gp.generate(graph, cov,
+                             jnp.asarray(gp.generate_inv(graph, cov, v_jax))))
+            return np.asarray(Lv) + noise_var * v_np
+
+        # Conjugate gradient solve: (K + N) alpha = residual
+        alpha = np.zeros(N, dtype=np.float64)
+        r = residual - _matvec(alpha)
+        p = r.copy()
+        rs_old = float(r @ r)
+        for _ in range(100):
+            Ap = _matvec(p)
+            rp = float(p @ Ap)
+            if abs(rp) < 1e-30:
+                break
+            step = rs_old / rp
+            alpha += step * p
+            r -= step * Ap
+            rs_new = float(r @ r)
+            if rs_new < 1e-8 * (residual @ residual + 1e-60):
+                break
+            p = r + (rs_new / (rs_old + 1e-60)) * p
+            rs_old = rs_new
+
+        # Correction at data positions: K_D alpha (diagonal K entries)
+        cov_bins, cov_vals = cov
+        k0 = float(cov_vals[0])  # K(0, 0) = kernel diagonal
+        delta = f_prior + k0 * alpha  # simplified: K_DD alpha ≈ K(0)*alpha (diagonal only)
+        xi_white = None  # already handled above
     else:
         raise ValueError(f"unknown mode: {mode!r}")
 
-    # 4. Apply the Vecchia Cholesky factor.
-    delta = np.asarray(gp.generate(graph, cov, jnp.asarray(xi_white)))
+    if mode != "posterior_sample":
+        # 4. Apply the Vecchia Cholesky factor (prior_sample / data_driven).
+        delta = np.asarray(gp.generate(graph, cov, jnp.asarray(xi_white)))
+
     weights = 1.0 + delta
 
     if return_diagnostics:

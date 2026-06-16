@@ -75,7 +75,13 @@ def _ensure_binary():
             f"morton_cascade crate not found at {CRATE_DIR}. The crate "
             "should live alongside twopt_density at the repo root."
         )
-    cargo = shutil.which("cargo")
+    # Prefer the rustup-managed cargo (supports edition 2024) over any
+    # system cargo found on PATH which may be too old.
+    cargo = (
+        os.path.expanduser("~/.cargo/bin/cargo")
+        if os.path.exists(os.path.expanduser("~/.cargo/bin/cargo"))
+        else shutil.which("cargo")
+    )
     if cargo is None:
         raise RuntimeError(
             "cargo not on PATH; cannot build morton_cascade. Install "
