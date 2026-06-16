@@ -1,0 +1,313 @@
+"""Window/weight-corrected 2D clustering kernel via Landy-Szalay pair counting.
+
+This is the measurement-first pipeline: a single, reusable, FKP×completeness
+*weighted* Landy-Szalay estimator of the observed-space correlation
+ξ(Δθ, Δz) measured against the analytic randoms (sel_map × n(z)). It is used
+**identically** to
+
+  1. measure the data kernel K_in(Δθ, Δz) from BOSS (weighted; then the survey
+     window is deconvolved to the true clustering K), which is reused directly
+     as the GraphGP generation covariance, and
+  2. re-measure K_out(Δθ, Δz) from each generated catalog,
+
+so the window, weights and estimator cancel between input and output by
+construction — the honest closure test is K_out ≈ K_in across the whole plane
+(plus the w(θ) projection). No parametric kernel fit; the measured K is the
+source of truth.
+
+Everything is in observed coordinates (Δθ in degrees, Δz) — no fiducial
+cosmology, no comoving distances.
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+import numpy as np
+
+from .observed import _radec_to_nhat
+from .quaia import make_random_from_selection_function
+
+
+def measure_K2d(
+    ra_d, dec_d, z_d, w_d,
+    ra_r, dec_r, z_r, w_r,
+    *,
+    theta_edges: np.ndarray,
+    z_edges: np.ndarray,
+    return_counts: bool = False,
+):
+    """Weighted Landy-Szalay ξ(Δθ, Δz) from one 4-D ``query_pairs``.
+
+    Points (data ∪ randoms) are embedded as (n̂, β·z) with β chosen so the Δz
+    window maps to the angular chord window; a single ``query_pairs`` over the
+    union yields the weighted DD, DR, RR pair histograms binned in (Δθ, Δz).
+
+    Pair weights are the products ``w_i · w_j``; the Landy-Szalay normalisations
+    use the weighted counts ``W=Σw`` and ``W2=Σw²`` so the estimator is unbiased
+    under the supplied (FKP×completeness) weights.
+
+    Returns ``(theta_edges, z_edges, xi)`` or, with ``return_counts``, also a
+    dict of the normalised ``dd, dr, rr`` and raw weighted ``DD, DR, RR``.
+    """
+    from scipy.spatial import cKDTree
+
+    ra_d = np.asarray(ra_d, np.float64); dec_d = np.asarray(dec_d, np.float64)
+    z_d = np.asarray(z_d, np.float64); w_d = np.asarray(w_d, np.float64)
+    ra_r = np.asarray(ra_r, np.float64); dec_r = np.asarray(dec_r, np.float64)
+    z_r = np.asarray(z_r, np.float64); w_r = np.asarray(w_r, np.float64)
+    nd, nr = len(ra_d), len(ra_r)
+
+    theta_max = float(theta_edges[-1]); dz_max = float(z_edges[-1])
+    chord_max = 2.0 * np.sin(np.radians(theta_max) / 2.0)
+    beta = chord_max / dz_max
+
+    nhat = np.vstack([_radec_to_nhat(ra_d, dec_d), _radec_to_nhat(ra_r, dec_r)])
+    zz = np.concatenate([z_d, z_r])
+    w = np.concatenate([w_d, w_r])
+    tag = np.concatenate([np.zeros(nd, bool), np.ones(nr, bool)])   # False=data
+    P = np.hstack([nhat, (beta * zz)[:, None]])
+    R = np.sqrt(chord_max ** 2 + (beta * dz_max) ** 2)
+
+    tree = cKDTree(P)
+    pairs = tree.query_pairs(R, output_type="ndarray")
+    i, j = pairs[:, 0], pairs[:, 1]
+    chord = np.linalg.norm(P[i, :3] - P[j, :3], axis=1)
+    dtheta = np.degrees(2.0 * np.arcsin(np.clip(chord / 2.0, 0.0, 1.0)))
+    dz = np.abs(P[i, 3] - P[j, 3]) / beta
+    wij = w[i] * w[j]
+    ti, tj = tag[i], tag[j]
+
+    def hist(mask):
+        return np.histogram2d(dtheta[mask], dz[mask], bins=[theta_edges, z_edges],
+                              weights=wij[mask])[0]
+
+    DD = hist((~ti) & (~tj)); RR = hist(ti & tj); DR = hist(ti ^ tj)
+
+    Wd, W2d = w_d.sum(), (w_d ** 2).sum()
+    Wr, W2r = w_r.sum(), (w_r ** 2).sum()
+    nDD = 0.5 * (Wd ** 2 - W2d)
+    nRR = 0.5 * (Wr ** 2 - W2r)
+    nDR = Wd * Wr
+    dd = DD / nDD; rr = RR / nRR; dr = DR / nDR
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xi = np.where(rr > 0, (dd - 2.0 * dr + rr) / rr, 0.0)
+
+    if return_counts:
+        return theta_edges, z_edges, xi, {
+            "dd": dd, "dr": dr, "rr": rr, "DD": DD, "DR": DR, "RR": RR}
+    return theta_edges, z_edges, xi
+
+
+def generate_catalogs_from_kernel(
+    catalog, cov, sigma2,
+    *,
+    alpha: float = 2.0,
+    n_samples: int = 5,
+    seed: int = 0,
+    w_completeness=None,
+    n_cand_factor: int = 20,
+    n0: int = 256,
+    k: int = 30,
+    chunk_size: Optional[int] = 50_000,
+    verbose: bool = False,
+):
+    """LGCP catalogs from a *prebuilt* anisotropic kernel ``cov`` (σ²=``sigma2``).
+
+    The generation path of the measurement-first pipeline: draw window
+    candidates (sel_map × n(z)), embed as (n̂, α·z), build the GraphGP graph,
+    and for each draw form the log-normal intensity exp(f − σ²/2) and
+    inhomogeneous-Poisson sample to (RA, Dec, z). The window enters through the
+    candidates, so a field with the *true* (deconvolved) covariance produces
+    catalogs whose LS re-measurement carries the window back.
+    """
+    import jax
+    import jax.numpy as jnp
+    import graphgp as gp
+
+    jax.config.update("jax_enable_x64", True)
+    nd = catalog.N_data
+    if w_completeness is None:
+        w_completeness = np.ones(nd)
+    w_sum = float(np.asarray(w_completeness).sum())
+    n_cand = int(n_cand_factor * nd)
+
+    rng0 = np.random.default_rng(seed)
+    ra_c, dec_c, z_c = make_random_from_selection_function(
+        sel_map=catalog.sel_map, n_random=n_cand,
+        z_data=np.asarray(catalog.z_data), nside=catalog.nside, rng=rng0)
+    ra_c = np.asarray(ra_c, np.float64); dec_c = np.asarray(dec_c, np.float64)
+    z_c = np.asarray(z_c, np.float64)
+    nhat_c = _radec_to_nhat(ra_c, dec_c)
+    points = jnp.asarray(np.hstack([nhat_c, (alpha * z_c)[:, None]]), dtype=jnp.float64)
+    if verbose:
+        print(f"[K2d-gen] {n_cand:,} candidates; building graph (α={alpha}) ...")
+    graph = gp.build_graph(points, n0=min(n0, n_cand // 2), k=min(k, n_cand - 1))
+    sig = np.sqrt(max(sigma2, 1e-12))
+
+    out = []
+    for s in range(n_samples):
+        eps = np.random.default_rng(seed + 1 + s).standard_normal(n_cand)
+        f = np.asarray(gp.generate(graph, cov, jnp.asarray(eps, dtype=jnp.float64),
+                                   chunk_size=chunk_size))
+        f = np.where(np.isfinite(f), f, 0.0)
+        f = np.clip(f, -8.0 * sig, 8.0 * sig)
+        opd = np.exp(f - 0.5 * sigma2)
+        opd_sum = float(opd.sum())
+        a_thin = w_sum / opd_sum if opd_sum > 0 else 0.0
+        rng = np.random.default_rng(1000 + seed + s)
+        counts = rng.poisson(a_thin * opd)
+        idx = np.repeat(np.where(counts > 0)[0], counts[counts > 0])
+        out.append({"ra": ra_c[idx].astype(np.float32),
+                    "dec": dec_c[idx].astype(np.float32),
+                    "z": z_c[idx].astype(np.float32),
+                    "N_galaxies": int(len(idx)),
+                    "multi_frac": float(np.mean(counts[counts > 0] > 1))})
+        if verbose:
+            print(f"[K2d-gen] sample {s+1}/{n_samples}: N={out[-1]['N_galaxies']:,} "
+                  f"multi_frac={out[-1]['multi_frac']:.3f}")
+    return out
+
+
+def fkp_weight_of_z(z_query, z_data, w_fkp_data, n_bins: int = 80):
+    """Smooth FKP weight as a function of redshift, learned from the data.
+
+    The FKP weight is a deterministic function of n(z); we recover w_fkp(z) by
+    binning the data's per-object ``WEIGHT_FKP`` against z and interpolating, so
+    the analytic randoms can be assigned matching FKP weights.
+    """
+    z_data = np.asarray(z_data, np.float64)
+    w_fkp_data = np.asarray(w_fkp_data, np.float64)
+    edges = np.linspace(z_data.min(), z_data.max(), n_bins + 1)
+    which = np.clip(np.digitize(z_data, edges) - 1, 0, n_bins - 1)
+    num = np.bincount(which, weights=w_fkp_data, minlength=n_bins)
+    den = np.bincount(which, minlength=n_bins)
+    centres = 0.5 * (edges[1:] + edges[:-1])
+    ok = den > 0
+    prof = np.interp(centres, centres[ok], num[ok] / den[ok])
+    return np.interp(np.asarray(z_query, np.float64), centres, prof)
+
+
+def measure_K2d_data(
+    catalog,
+    *,
+    theta_edges: np.ndarray,
+    z_edges: np.ndarray,
+    n_data: Optional[int] = None,
+    n_rand_factor: int = 4,
+    seed: int = 0,
+    return_counts: bool = False,
+):
+    """Weighted LS ξ(Δθ, Δz) of the BOSS data vs analytic randoms.
+
+    Data carry the full FKP×completeness weight (``catalog.w_data``); the
+    analytic randoms (sel_map × n(z)) are assigned FKP weights via
+    :func:`fkp_weight_of_z`. ``n_data`` optionally subsamples the data (pair
+    counts scale steeply with N — use the full set only for the final K_in).
+    Returns the same as :func:`measure_K2d`.
+    """
+    rng = np.random.default_rng(seed)
+    z_all = np.asarray(catalog.z_data)          # full n(z) and FKP(z) profile
+    ra_d = np.asarray(catalog.ra_data); dec_d = np.asarray(catalog.dec_data)
+    z_d = z_all; w_d = np.asarray(catalog.w_data)
+    if n_data is not None and n_data < len(ra_d):
+        sel = rng.choice(len(ra_d), n_data, replace=False)
+        ra_d, dec_d, z_d, w_d = ra_d[sel], dec_d[sel], z_d[sel], w_d[sel]
+    nr = n_rand_factor * len(ra_d)
+    ra_r, dec_r, z_r = make_random_from_selection_function(
+        sel_map=catalog.sel_map, n_random=nr, z_data=z_all, nside=catalog.nside, rng=rng)
+    if catalog.w_fkp_data is not None:
+        w_r = fkp_weight_of_z(z_r, z_all, catalog.w_fkp_data)
+    else:
+        w_r = np.ones(len(ra_r))
+    return measure_K2d(ra_d, dec_d, z_d, w_d, ra_r, dec_r, z_r, w_r,
+                       theta_edges=theta_edges, z_edges=z_edges,
+                       return_counts=return_counts)
+
+
+def kernel_from_K2d(
+    theta_edges, z_edges, xi_true,
+    *,
+    alpha: float = 2.0,
+    jitter: float = 0.02,
+    n_ltheta: int = 12,
+    n_lz: int = 8,
+    n_s: int = 512,
+    n_zg: int = 256,
+):
+    """PSD ``AnisotropicCovariance`` that reproduces the measured 2D K.
+
+    The target is the measured/deconvolved log-kernel K = ln(1+ξ_true) on the
+    (Δθ, Δz) grid. We represent it with a **dense** non-negative bank of
+    tensor-product Matérns fit by NNLS — PSD by the Schur product theorem (so no
+    NaN-field failure), and rich enough (``n_ltheta × n_lz`` components) to track
+    the measured K closely rather than impose a smooth parametric shape. The
+    grid is evaluated on a fine (chord, Δz) mesh for GraphGP.
+
+    ``alpha`` is only the graph embedding scale (it cancels from the kernel
+    value). Returns ``(AnisotropicCovariance, sigma2)``.
+    """
+    from scipy.optimize import nnls
+    import graphgp as gp
+
+    theta_c = np.empty(len(theta_edges) - 1)
+    theta_c[0] = 0.5 * theta_edges[1]
+    theta_c[1:] = np.sqrt(theta_edges[1:-1] * theta_edges[2:])
+    z_c = 0.5 * (z_edges[1:] + z_edges[:-1])
+    chord_c = 2.0 * np.sin(np.radians(theta_c) / 2.0)
+    KG = np.log1p(np.clip(np.asarray(xi_true, np.float64), 0.0, None))
+
+    lthetas = np.geomspace(0.5 * chord_c[0], 2.0 * chord_c[-1], n_ltheta)
+    lzs = np.geomspace(0.5 * max(z_c[0], 1e-4), 2.0 * z_c[-1], n_lz)
+    cols, scales = [], []
+    for lt in lthetas:
+        mt = _matern1(chord_c, lt)
+        for lz in lzs:
+            cols.append(np.outer(mt, _matern1(z_c, lz)).ravel())
+            scales.append((lt, lz))
+    coeffs, _ = nnls(np.stack(cols, axis=1), KG.ravel())
+
+    sb = np.concatenate([[0.0], np.geomspace(1e-5, 1.5 * chord_c[-1], n_s - 1)])
+    zb = np.concatenate([[0.0], np.geomspace(1e-5, 2.0 * z_c[-1], n_zg - 1)])
+    grid = np.zeros((len(sb), len(zb)))
+    for (lt, lz), a in zip(scales, coeffs):
+        if a > 0:
+            grid += a * np.outer(_matern1(sb, lt), _matern1(zb, lz))
+    cov = gp.build_anisotropic_covariance(sb, zb, grid, float(alpha), jitter=jitter)
+    return cov, float(grid[0, 0] * (1.0 + jitter))
+
+
+def _matern1(d, ell):
+    """Matérn ν=3/2 correlation, (1 + √3 d/ℓ) exp(−√3 d/ℓ)."""
+    u = np.sqrt(3.0) * np.asarray(d, np.float64) / ell
+    return (1.0 + u) * np.exp(-u)
+
+
+def deconvolve_window(xi, rr_norm):
+    """Integral-constraint deconvolution of the LS ξ to the true clustering.
+
+    A finite survey cannot constrain the mean density, so the Landy-Szalay
+    estimator is biased low by the integral constraint — a single constant
+    offset (window mode-coupling beyond this is negligible at θ ≲ 2°, far below
+    the footprint scale):
+
+        ξ_LS(s) = ξ_true(s) − IC,   IC = Σ_all-s RR_norm(s) ξ_true(s),
+
+    where ``RR_norm`` is the random-random count **normalised by the total
+    number of random pairs** (so it sums to 1 over the *whole* footprint, not
+    just the measured θ-range). Because ξ→0 beyond the measured range, the sum
+    is carried by the measured bins; to first order ξ_true ≈ ξ_LS there:
+
+        IC ≈ Σ_measured RR_norm(s) ξ_LS(s),    ξ_true = ξ_LS + IC.
+
+    Normalising by the *total* pairs (≈0.5·W_r²) — not by Σ over the measured
+    bins — is essential: over a ~3000 deg² footprint the true IC is ~1e-3, i.e.
+    LS already recovers the window-corrected clustering at θ ≲ 2°. (Dividing by
+    the measured-range RR instead overestimates IC by the ratio of the footprint
+    area to the measured area.) Pass the normalised ``rr`` from ``measure_K2d``.
+
+    Returns ``(xi_true, ic)``.
+    """
+    rr = np.asarray(rr_norm, np.float64); xi = np.asarray(xi, np.float64)
+    ic = float((rr * xi).sum())
+    return xi + ic, ic
