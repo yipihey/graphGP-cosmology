@@ -403,6 +403,7 @@ class DensityFieldResult:
             randoms_shifted, positions, randoms_shifted,
             alpha_dr, self.cov_bins, self.cov_vals,
             k_nni=k_nni, w_data=w_completeness,
+            drop_self_random=True,
         )
         dt_kde = time.time() - t0
 
@@ -412,7 +413,14 @@ class DensityFieldResult:
         # always accepted and the effective acceptance is clipped — a small
         # bias in the densest clusters (sub-percent for typical surveys).
         one_plus_d = np.clip(1.0 + delta_rand, 0.0, None)
-        alpha_thin = w_sum / one_plus_d.sum()
+        opd_sum = float(one_plus_d.sum())
+        if not np.isfinite(opd_sum) or opd_sum <= 0.0:
+            raise RuntimeError(
+                "GP-native thinning produced a degenerate density field "
+                "(Σ(1+δ)=0 over randoms). The FKP kernel may be too sharp "
+                "for the random sampling; check cov_vals / k_nni."
+            )
+        alpha_thin = w_sum / opd_sum
         p_accept = np.clip(alpha_thin * one_plus_d, 0.0, 1.0)
         clip_frac = float((alpha_thin * one_plus_d > 1.0).mean())
 
@@ -568,6 +576,7 @@ def _fkp_kde(
     cov_vals: np.ndarray,
     k_nni: int = 16,
     w_data: Optional[np.ndarray] = None,
+    drop_self_random: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """FKP kernel density estimate of δ(x) at query positions.
 
@@ -580,6 +589,13 @@ def _fkp_kde(
 
     The weighted numerator corrects for missed galaxies (fiber collisions,
     dust extinction, redshift failures) by upweighting their neighbours.
+
+    ``drop_self_random`` must be set when the query points ARE the random
+    catalogue (e.g. GP-native catalog thinning).  Otherwise each query's
+    nearest random is itself at distance 0, injecting the kernel peak K(0)
+    into the denominator; with a sharply-peaked kernel that self-term
+    dominates K_rand and drives 1+δ → 0 everywhere.  We then query one extra
+    random neighbour and drop the zero-distance self-match.
 
     Returns
     -------
@@ -595,7 +611,13 @@ def _fkp_kde(
     tree_r = cKDTree(xyz_random)
 
     dists_d, idx_d = tree_d.query(xyz_query, k=k_d, workers=-1)   # (M, k_d)
-    dists_r, _     = tree_r.query(xyz_query, k=k_r, workers=-1)   # (M, k_r)
+    if drop_self_random:
+        # query k_r+1 and drop the nearest (the self-match at dist≈0)
+        k_rq = min(k_r + 1, len(xyz_random))
+        dists_r_full, _ = tree_r.query(xyz_query, k=k_rq, workers=-1)
+        dists_r = dists_r_full[:, 1:]                             # (M, k_rq-1)
+    else:
+        dists_r, _ = tree_r.query(xyz_query, k=k_r, workers=-1)   # (M, k_r)
 
     K_vals = np.interp(dists_d, cov_bins, cov_vals)               # (M, k_d)
     if w_data is not None:
@@ -615,6 +637,184 @@ def _fkp_kde(
     coverage = np.clip(K_vals.sum(axis=1) / (k_d * k0), 0.0, 1.0)
 
     return delta_fkp, coverage
+
+
+def _fkp_kde_analytic(
+    xyz_query: np.ndarray,
+    radecz_query: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    xyz_data: np.ndarray,
+    window,
+    w_data: Optional[np.ndarray] = None,
+    k_bw: int = 12,
+    k_sum: int = 32,
+    h_min: float = 2.0,
+    adaptive: bool = True,
+    fixed_h: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Analytic-window FKP-KDE — no MC random catalog.
+
+    Estimates ``1 + δ(x)`` as the ratio of a kernel data-density estimate to
+    the *analytic* expected random density from the survey window:
+
+        1 + δ(x) = n̂_data(x) / [Σw · ρ̂_W(x)]
+
+    where ``ρ̂_W(x) = S_ang(n̂)·n_χ(χ) / (χ²·Ω_eff)`` is the normalised window
+    density (∫ ρ̂_W dV = 1), ``Σw`` is the total completeness-weighted data
+    count, and the data density estimate uses an **adaptive-bandwidth**
+    Gaussian kernel normalised so ∫κ = 1:
+
+        n̂_data(x) = Σ_i w_i (2πh²)^(−3/2) exp(−d_i²/2h²),
+        h(x) = max(h_min, distance to the k_bw-th nearest data point).
+
+    The adaptive bandwidth retains small-scale structure in dense regions
+    (clusters) while smoothing voids.  Because the kernel is unit-normalised
+    and the window density is analytic, the construction has no MC shot
+    noise, no self-pair singularity, and no radial data/random mismatch.
+
+    Parameters
+    ----------
+    xyz_query : (M, 3) comoving positions where δ is evaluated.
+    radecz_query : (ra_deg, dec_deg, z) of the query points — for the window.
+    xyz_data : (N_D, 3) comoving data positions (same frame as xyz_query).
+    window : SurveyWindow (from twopt_density.window).
+    w_data : (N_D,) completeness weights (w_sys·w_noz·w_cp). Default 1.
+    k_bw : neighbour rank that sets the adaptive bandwidth h(x).
+    k_sum : number of nearest data points summed in the kernel estimate.
+    h_min : floor on the bandwidth (Mpc/h) to avoid singular cells.
+    adaptive : if False, use ``fixed_h`` everywhere.
+    fixed_h : fixed bandwidth (Mpc/h) when ``adaptive`` is False.
+
+    Returns
+    -------
+    one_plus_delta : (M,) the field 1+δ at the query points (≥ 0).
+    h_used : (M,) the local bandwidth at each query point.
+    """
+    from scipy.spatial import cKDTree
+
+    ra_q, dec_q, z_q = radecz_query
+    N_D = len(xyz_data)
+    if w_data is None:
+        w_data = np.ones(N_D, dtype=np.float64)
+    else:
+        w_data = np.asarray(w_data, dtype=np.float64)
+    w_sum = float(w_data.sum())
+
+    tree_d = cKDTree(xyz_data)
+    k_s = min(k_sum, N_D)
+    dists, idx = tree_d.query(xyz_query, k=k_s, workers=-1)   # (M, k_s)
+    if dists.ndim == 1:
+        dists = dists[:, None]
+        idx = idx[:, None]
+
+    if adaptive:
+        kb = min(k_bw, k_s) - 1
+        h = np.maximum(dists[:, kb], h_min)                  # (M,)
+    else:
+        h = np.full(len(xyz_query), float(fixed_h or h_min))
+
+    # Unit-normalised 3-D Gaussian kernel density estimate
+    h3 = h ** 3
+    norm = (2.0 * np.pi) ** (-1.5) / np.maximum(h3, 1e-30)
+    arg = -0.5 * (dists / h[:, None]) ** 2
+    kvals = np.exp(arg) * w_data[idx]                        # (M, k_s)
+    n_data = norm * kvals.sum(axis=1)                        # (M,)
+
+    # Analytic normalised window density ρ̂_W(x)  (∫ ρ̂_W dV = 1).
+    # Floor against the median positive value so galaxies whose χ lands at
+    # the very edge of the n(z) support (where ρ̂_W → 0) do not produce a
+    # divergent 1+δ.  The floor only affects a thin edge shell.
+    rho_W = window.density(ra_q, dec_q, z=z_q) / max(window.omega_eff, 1e-30)
+    pos = rho_W[rho_W > 0]
+    floor = 1e-2 * (np.median(pos) if pos.size else 1.0)
+    rho_W = np.maximum(rho_W, floor)
+    den = np.maximum(w_sum * rho_W, 1e-30)
+
+    one_plus_delta = n_data / den
+    # Cap absurd values from residual edge effects (dense clusters reach a few
+    # hundred; values far above that are numerical, not physical).
+    return np.clip(one_plus_delta, 0.0, 1e3), h
+
+
+def sample_catalogs_analytic_window(
+    catalog,
+    window=None,
+    *,
+    n_samples: int = 10,
+    seed: int = 0,
+    w_completeness: Optional[np.ndarray] = None,
+    k_bw: int = 8,
+    k_sum: int = 40,
+    h_min: float = 2.0,
+    n_cand_factor: int = 8,
+    verbose: bool = False,
+) -> list:
+    """Posterior-predictive galaxy catalogs from the analytic survey window.
+
+    No MC random catalog is used for the density estimate.  For each draw:
+
+    1. Generate candidate points on the fly from the window ``W(n̂,z) =
+       S_ang·n(z)`` (angular ∝ ``sel_map``, radial ∝ ``n(z)``) — these are the
+       "analytic randoms", never stored as a fixed catalogue.
+    2. Evaluate ``1+δ(x)`` at the candidates with the adaptive-bandwidth
+       analytic-window FKP-KDE (``_fkp_kde_analytic``).
+    3. Poisson-thin: accept candidate j with probability
+       ``p_j = α (1+δ_j)``, α chosen so E[N] = Σ w_completeness.
+
+    The result is a list of dicts ``{ra, dec, z, N_galaxies, ...}`` — each a
+    realization consistent with the observed galaxy density and the survey
+    selection function, smoothed on the local data spacing (the adaptive
+    bandwidth, ~15 Mpc/h for BOSS-CMASS).
+
+    Parameters mirror ``_fkp_kde_analytic``.  ``window`` defaults to
+    ``build_survey_window(catalog)``.
+    """
+    from .window import build_survey_window
+    from .distance import radec_z_to_cartesian
+    from .quaia import make_random_from_selection_function
+
+    if window is None:
+        window = build_survey_window(catalog)
+
+    cosmo = catalog.fid_cosmo
+    xyz_d = np.ascontiguousarray(np.asarray(catalog.xyz_data), dtype=np.float64)
+    N_D = len(xyz_d)
+    if w_completeness is None:
+        w_completeness = np.ones(N_D, dtype=np.float64)
+    else:
+        w_completeness = np.asarray(w_completeness, dtype=np.float64)
+    w_sum = float(w_completeness.sum())
+    n_cand = int(n_cand_factor * N_D)
+
+    out = []
+    for s in range(n_samples):
+        rng = np.random.default_rng(seed + s)
+        ra_c, dec_c, z_c = make_random_from_selection_function(
+            sel_map=catalog.sel_map, n_random=n_cand,
+            z_data=np.asarray(catalog.z_data), nside=catalog.nside, rng=rng,
+        )
+        xyz_c = np.ascontiguousarray(
+            np.asarray(radec_z_to_cartesian(ra_c, dec_c, z_c, cosmo)),
+            dtype=np.float64)
+        opd, _ = _fkp_kde_analytic(
+            xyz_c, (ra_c, dec_c, z_c), xyz_d, window,
+            w_data=w_completeness, k_bw=k_bw, k_sum=k_sum, h_min=h_min,
+        )
+        opd_sum = float(opd.sum())
+        alpha = w_sum / opd_sum if opd_sum > 0 else 0.0
+        p = np.clip(alpha * opd, 0.0, 1.0)
+        accept = rng.uniform(size=len(p)) < p
+        out.append({
+            "ra": ra_c[accept].astype(np.float32),
+            "dec": dec_c[accept].astype(np.float32),
+            "z": z_c[accept].astype(np.float32),
+            "N_galaxies": int(accept.sum()),
+            "clip_frac": float(np.mean(alpha * opd > 1.0)),
+        })
+        if verbose:
+            print(f"  analytic sample {s+1}/{n_samples}: "
+                  f"N={out[-1]['N_galaxies']:,}  "
+                  f"clip_frac={out[-1]['clip_frac']:.4f}")
+    return out
 
 
 def _build_lightcone_grid(
@@ -747,10 +947,17 @@ def sample_posterior_density_field(
     if r_edges is None:
         r_edges = np.logspace(np.log10(1.0), np.log10(50.0), 41)
 
+    # NB: the kernel only needs the *shape* of the clustering, so we measure
+    # ξ(r) UNWEIGHTED. Do NOT pass catalog.w_data here — for BOSS that is the
+    # FKP statistical weight (mean ≈ 0.25), and ls_corrfunc's weighted path
+    # applies the pair-weight average to DD while normalising RR/DR by
+    # unweighted counts, which drives ξ(r) negative and produces a degenerate
+    # (negative-amplitude) kernel. Completeness corrections enter via the
+    # weighted FKP-KDE numerator below, not the kernel measurement.
     r_centers, xi_j, _, _, _ = xi_landy_szalay(
         positions, randoms if len(randoms) > 0 else None,
         r_edges=r_edges, box_size=None if len(randoms) > 0 else box_size,
-        nthreads=nthreads, weights=w_data,
+        nthreads=nthreads, weights=None,
     )
     if verbose:
         print(f"[density_field] ξ(r) measured over {len(r_centers)} bins")
@@ -778,7 +985,7 @@ def sample_posterior_density_field(
 
     if verbose:
         print(f"[density_field] nbar: mean={nbar.mean():.4f}  min={nbar.min():.4g}")
-        sn = float(cov_vals[0])**0.5 / float((1.0 / nbar.mean())**0.5)
+        sn = np.sqrt(max(float(cov_vals[0]), 0.0)) / np.sqrt(1.0 / nbar.mean())
         print(f"[density_field] GP S/N per galaxy: {sn:.4f}"
               f"  ({'prior-dominated' if sn < 0.1 else 'data-informed'})")
 

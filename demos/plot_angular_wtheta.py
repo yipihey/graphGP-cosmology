@@ -1,12 +1,24 @@
-"""Angular two-point function w(θ) for 10 GP-posterior catalog samples.
+"""Angular two-point function w(θ) for analytic-window posterior catalogs.
 
-Measures the 3D Landy-Szalay xi(r) via the morton_cascade Rust binary for
-each GP sample and the original BOSS CMASS catalog, then Limber-projects
-xi(r) → w(θ) and overplots all curves on one figure.
+Catalog realizations are drawn from the **analytic survey window** — no MC
+random catalog is instantiated for the density estimate; the expected random
+density is ρ̂_W ∝ S_ang·n(z)/χ² evaluated directly at each point, and the
+overdensity uses an adaptive-bandwidth FKP-KDE (twopt_density.window +
+density_field.sample_catalogs_analytic_window).
+
+w(θ) is measured with Corrfunc's ``DDtheta_mocks`` — the exact Landy-Szalay
+angular estimator from (RA, Dec) pair counts, no Limber approximation and no
+cascade cell-binning (the morton_cascade dyadic-cell ξ is a *different*
+observable; see demos/validate_cascade_vs_corrfunc.py):
+
+    w(θ) = (DD − 2 DR + RR) / RR        (Landy-Szalay)
+
+The observed catalog is completeness-weighted (w_sys·w_noz·w_cp); the
+realizations encode completeness through the analytic-window thinning.
 
 Usage::
 
-    python demos/plot_angular_wtheta.py [--n-samples 10] [--n-rand-sub 300000]
+    python demos/plot_angular_wtheta.py [--n-samples 10] [--n-rand-rr 150000]
                                         [--out output/boss_wtheta_samples.png]
 """
 import argparse
@@ -20,189 +32,165 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import jax.numpy as jnp
+
+from Corrfunc.mocks.DDtheta_mocks import DDtheta_mocks
 
 from twopt_density.boss import load_boss
-from twopt_density.density_field import sample_posterior_density_field
-from twopt_density.distance import comoving_distance, radec_z_to_cartesian
-from twopt_density.cascade import xi_landy_szalay
+from twopt_density.window import build_survey_window
+from twopt_density.density_field import sample_catalogs_analytic_window
 
 
-# ── Limber projection xi(r) → w(θ) ───────────────────────────────────────────
+# ── Landy-Szalay angular estimator via Corrfunc ──────────────────────────────
 
-def limber_wtheta(r_cen, xi_vals, theta_deg_arr, chi_bar,
-                  pi_max=300.0, n_pi=400):
-    """Project xi(r) → w(θ) via the flat-sky Limber integral.
-
-    w(θ) = 2 ∫₀^{pi_max} ξ(√(π² + (χ̄ sinθ)²)) dπ
-
-    Parameters
-    ----------
-    r_cen, xi_vals : 1-D arrays of (r [Mpc/h], xi(r)) from the cascade.
-    theta_deg_arr  : array of θ values in degrees.
-    chi_bar        : effective mean comoving distance [Mpc/h].
-    pi_max         : LOS integration limit [Mpc/h].
-    n_pi           : number of π quadrature points.
-    """
-    # Sort ascending in r (cascade outputs large→small), then log-space interpolate
-    order = np.argsort(r_cen)
-    log_r_sorted = np.log(np.clip(r_cen[order], 1e-3, None))
-    xi_sorted = xi_vals[order]
-
-    def xi_interp(r):
-        lr = np.log(np.clip(r, 1e-3, None))
-        return np.interp(lr, log_r_sorted, xi_sorted, left=0.0, right=0.0)
-
-    pi_arr = np.linspace(0.0, pi_max, n_pi)
-    w_arr = np.empty(len(theta_deg_arr))
-    for i, theta_deg in enumerate(theta_deg_arr):
-        chi_perp = chi_bar * np.sin(np.radians(theta_deg))
-        r_arr = np.sqrt(pi_arr**2 + chi_perp**2)
-        xi_arr = xi_interp(r_arr)
-        w_arr[i] = 2.0 * np.trapz(xi_arr, pi_arr)
-    return w_arr
+def _theta_counts(ra1, dec1, theta_bins, nthreads, ra2=None, dec2=None,
+                  w1=None, w2=None):
+    """Weighted angular pair counts in θ bins (degrees). Returns weighted
+    pair sums per bin (npairs × weightavg)."""
+    autocorr = 1 if ra2 is None else 0
+    # DDtheta_mocks(autocorr, nthreads, binfile, RA1, DEC1, **kwargs)
+    args = (autocorr, nthreads, theta_bins, ra1, dec1)
+    extra = {}
+    if ra2 is not None:
+        extra.update(RA2=ra2, DEC2=dec2)
+    if w1 is not None:
+        extra.update(weights1=w1, weight_type="pair_product")
+    if w2 is not None:
+        extra.update(weights2=w2, weight_type="pair_product")
+    res = DDtheta_mocks(*args, **extra)
+    npairs = res["npairs"].astype(np.float64)
+    if w1 is not None:
+        wsum = npairs * res["weightavg"].astype(np.float64)
+        return wsum
+    return npairs
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def wtheta_ls(ra_d, dec_d, ra_r, dec_r, theta_bins, nthreads=16,
+              w_d=None, RR=None, sumw_r=None):
+    """Landy-Szalay w(θ). RR (weighted-normalised) may be precomputed and
+    reused across catalogs that share the same random subsample."""
+    nd_w = float(w_d.sum()) if w_d is not None else float(len(ra_d))
+    nr_w = sumw_r if sumw_r is not None else float(len(ra_r))
+
+    DD = _theta_counts(ra_d, dec_d, theta_bins, nthreads, w1=w_d, w2=w_d)
+    DR = _theta_counts(ra_d, dec_d, theta_bins, nthreads,
+                       ra2=ra_r, dec2=dec_r, w1=w_d,
+                       w2=np.ones(len(ra_r)))
+    if RR is None:
+        RR = _theta_counts(ra_r, dec_r, theta_bins, nthreads,
+                           w1=np.ones(len(ra_r)), w2=np.ones(len(ra_r)))
+
+    dd = DD / (nd_w * nd_w)
+    dr = DR / (nd_w * nr_w)
+    rr = RR / (nr_w * nr_w)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        w = np.where(rr > 0, (dd - 2.0 * dr + rr) / rr, np.nan)
+    return w, RR
+
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data",       default="data/boss/galaxy_DR12v5_CMASS_South.fits.gz")
     p.add_argument("--randoms",    default="data/boss/random0_DR12v5_CMASS_South.fits.gz")
     p.add_argument("--n-samples",  type=int,   default=10)
-    p.add_argument("--n-rand-sub", type=int,   default=300_000,
-                   help="Randoms subsample for xi (default 300k)")
+    p.add_argument("--n-rand-rr",  type=int,   default=150_000,
+                   help="Randoms subsample for RR/DR (default 150k)")
     p.add_argument("--theta-min",  type=float, default=0.05)
     p.add_argument("--theta-max",  type=float, default=8.0)
-    p.add_argument("--n-theta",    type=int,   default=20)
-    p.add_argument("--pi-max",     type=float, default=300.0,
-                   help="LOS integration limit for Limber projection [Mpc/h]")
+    p.add_argument("--n-theta",    type=int,   default=16)
+    p.add_argument("--nthreads",   type=int,   default=16)
     p.add_argument("--out",        default="output/boss_wtheta_samples.png")
     args = p.parse_args()
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
-    theta_edges = np.logspace(np.log10(args.theta_min),
-                              np.log10(args.theta_max), args.n_theta + 1)
-    theta_cen = np.sqrt(theta_edges[:-1] * theta_edges[1:])
+    theta_bins = np.logspace(np.log10(args.theta_min),
+                             np.log10(args.theta_max), args.n_theta + 1)
+    theta_cen = np.sqrt(theta_bins[:-1] * theta_bins[1:])
 
     # ── 1. Load catalog ───────────────────────────────────────────────────
     print("Loading BOSS CMASS-SGC ...")
     cat = load_boss([args.data], [args.randoms], sample="CMASS", nside=256)
     print(f"  N_data={cat.N_data:,}  N_random={len(cat.ra_random):,}")
 
-    # Effective comoving distance for Limber projection
-    chi_vals = np.array(comoving_distance(jnp.asarray(cat.z_data), cat.fid_cosmo))
-    chi_bar  = float(np.mean(chi_vals))
-    print(f"  χ̄ = {chi_bar:.0f} Mpc/h  (z_eff = {float(np.mean(cat.z_data)):.3f})")
-
-    # ── 2. Posterior density field ────────────────────────────────────────
-    print("Running posterior sampler ...")
+    # ── 2. Analytic-window posterior-predictive catalogs ──────────────────
+    print("Building analytic survey window + drawing realizations ...")
     t0 = time.time()
-    result = sample_posterior_density_field(
-        cat, n_samples=args.n_samples, n_z_bins=32, nside=64, verbose=False,
-    )
-    print(f"  Done in {time.time()-t0:.0f}s")
-
-    # ── 3. GP catalog samples ─────────────────────────────────────────────
     w_comp = cat.w_sys_data * cat.w_noz_data * cat.w_cp_data
-    print(f"Generating {args.n_samples} GP samples ...")
-    t0 = time.time()
-    catalogs = result.sample_catalogs_gp(cat, seed=42, w_completeness=w_comp)
-    print(f"  Done in {time.time()-t0:.0f}s")
+    window = build_survey_window(cat, kde_bandwidth=0.02)
+    catalogs = sample_catalogs_analytic_window(
+        cat, window, n_samples=args.n_samples, seed=42,
+        w_completeness=w_comp, k_bw=8, k_sum=40, h_min=2.0,
+        n_cand_factor=10, verbose=True,
+    )
+    print(f"  window + {args.n_samples} realizations in {time.time()-t0:.0f}s")
 
-    # ── 4. Shared random subsample ────────────────────────────────────────
+    # ── 3. Shared random subsample for RR / DR ────────────────────────────
     rng = np.random.default_rng(999)
-    N_r_full = len(cat.ra_random)
-    n_sub    = min(args.n_rand_sub, N_r_full)
-    idx_sub  = rng.choice(N_r_full, size=n_sub, replace=False)
+    Nr = len(cat.ra_random)
+    nsub = min(args.n_rand_rr, Nr)
+    isub = rng.choice(Nr, nsub, replace=False)
+    ra_r = np.ascontiguousarray(np.asarray(cat.ra_random)[isub], dtype=np.float64)
+    dec_r = np.ascontiguousarray(np.asarray(cat.dec_random)[isub], dtype=np.float64)
+    sumw_r = float(nsub)
+    print(f"  RR/DR randoms: {nsub:,}")
 
-    xyz_r_sub = cat.xyz_random[idx_sub]
-
-    # Shift everything into non-negative coords for the cascade
-    all_xyz = np.vstack([cat.xyz_data, xyz_r_sub])
-    shift   = -all_xyz.min(axis=0) + 100.0
-    box_size = float(np.max(all_xyz + shift)) + 200.0
-    print(f"  box_size = {box_size:.0f} Mpc/h")
-
-    xyz_d_s = cat.xyz_data + shift
-    xyz_r_s = xyz_r_sub   + shift
-
-    # ── 5. xi(r) for original catalog ────────────────────────────────────
-    print("cascade xi(r) for original catalog ...")
+    # ── 4. w(θ) for observed catalog (completeness-weighted) ──────────────
+    print("Measuring w(θ): observed catalog ...")
     t0 = time.time()
-    xi_orig_arr = xi_landy_szalay(xyz_d_s, xyz_r_s, box_size=box_size,
-                                   dim=3, periodic=False)
-    print(f"  Done in {time.time()-t0:.1f}s  "
-          f"({len(xi_orig_arr)} shells)")
+    ra_d = np.ascontiguousarray(np.asarray(cat.ra_data), dtype=np.float64)
+    dec_d = np.ascontiguousarray(np.asarray(cat.dec_data), dtype=np.float64)
+    w_d = np.ascontiguousarray(np.asarray(w_comp), dtype=np.float64)
+    w_orig, RR = wtheta_ls(ra_d, dec_d, ra_r, dec_r, theta_bins,
+                           nthreads=args.nthreads, w_d=w_d, sumw_r=sumw_r)
+    print(f"    {time.time()-t0:.1f}s  (RR cached for reuse)")
 
-    # ── 6. xi(r) for each GP sample ──────────────────────────────────────
-    xi_samples = []
+    # ── 5. w(θ) for each GP sample ────────────────────────────────────────
+    w_samples = []
     for i, c in enumerate(catalogs):
-        xyz_gp = np.array(radec_z_to_cartesian(
-            c["ra"], c["dec"], c["z"], cat.fid_cosmo)) + shift
         t0 = time.time()
-        xi_i = xi_landy_szalay(xyz_gp, xyz_r_s, box_size=box_size,
-                                dim=3, periodic=False)
-        xi_samples.append(xi_i)
-        print(f"  Sample {i+1:2d}/{args.n_samples}: {time.time()-t0:.1f}s  "
+        ra_s = np.ascontiguousarray(np.asarray(c["ra"]), dtype=np.float64)
+        dec_s = np.ascontiguousarray(np.asarray(c["dec"]), dtype=np.float64)
+        w_i, _ = wtheta_ls(ra_s, dec_s, ra_r, dec_r, theta_bins,
+                           nthreads=args.nthreads, w_d=None, RR=RR,
+                           sumw_r=sumw_r)
+        w_samples.append(w_i)
+        print(f"    sample {i+1:2d}/{args.n_samples}: {time.time()-t0:.1f}s  "
               f"N_gal={c['N_galaxies']:,}")
+    w_samples = np.array(w_samples)
 
-    # ── 7. Limber projection ──────────────────────────────────────────────
-    def _to_wtheta(xi_arr):
-        """Extract finite xi shells and Limber-project to w(θ)."""
-        r_cen = 0.5 * (xi_arr["r_inner_phys"] + xi_arr["r_outer_phys"])
-        xi_v  = xi_arr["xi_ls"]
-        # keep shells with positive width and finite xi
-        ok = (xi_arr["r_outer_phys"] > xi_arr["r_inner_phys"]) & np.isfinite(xi_v)
-        return limber_wtheta(r_cen[ok], xi_v[ok], theta_cen, chi_bar,
-                             pi_max=args.pi_max)
-
-    print("Limber projecting xi(r) → w(θ) ...")
-    w_orig    = _to_wtheta(xi_orig_arr)
-    w_samples = np.array([_to_wtheta(xi_i) for xi_i in xi_samples])
-
-    # ── 8. Plot ───────────────────────────────────────────────────────────
+    # ── 6. Plot ───────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    # GP sample envelope (fill 16–84%)
     w_med = np.nanmedian(w_samples, axis=0)
     w_lo  = np.nanpercentile(w_samples, 16, axis=0)
     w_hi  = np.nanpercentile(w_samples, 84, axis=0)
+    ax.fill_between(theta_cen, w_lo, w_hi, color="#4a90d9", alpha=0.25,
+                    label="realizations 16–84%")
 
-    ax.fill_between(theta_cen, w_lo * theta_cen, w_hi * theta_cen,
-                    color="#4a90d9", alpha=0.25, label="GP samples 16–84%")
-
-    # Individual GP sample lines
     colors = plt.cm.cool(np.linspace(0.1, 0.9, args.n_samples))
     for i, (w_i, col) in enumerate(zip(w_samples, colors)):
-        label = "GP posterior samples" if i == 0 else None
-        ax.plot(theta_cen, w_i * theta_cen, color=col, lw=1.0,
-                alpha=0.7, label=label)
+        ax.plot(theta_cen, w_i, color=col, lw=1.0, alpha=0.7,
+                label="analytic-window realizations" if i == 0 else None)
 
-    # Original catalog
-    ax.plot(theta_cen, w_orig * theta_cen, color="white", lw=2.5,
-            zorder=10, label="BOSS CMASS-SGC (observed)")
-    ax.plot(theta_cen, w_orig * theta_cen, color="#f5a623", lw=1.8,
-            zorder=11)
+    ax.plot(theta_cen, w_orig, color="white", lw=2.6, zorder=10)
+    ax.plot(theta_cen, w_orig, color="#f5a623", lw=1.8, zorder=11,
+            label="BOSS CMASS-SGC (observed, LS)")
 
-    # Formatting
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel(r"$\theta$ [degrees]", fontsize=13)
-    ax.set_ylabel(r"$\theta \, w(\theta)$", fontsize=13)
-    ax.set_title(
-        "BOSS CMASS-SGC — angular two-point function\n"
-        r"10 GP posterior catalog samples  [cascade xi(r) + Limber projection]",
-        fontsize=12,
-    )
-    ax.set_xlim(theta_edges[0], theta_edges[-1])
-    ax.legend(fontsize=10, framealpha=0.3)
+    ax.set_ylabel(r"$w(\theta)$", fontsize=13)
+    ax.set_title("BOSS CMASS-SGC — Landy-Szalay angular two-point function\n"
+                 r"Corrfunc DDtheta_mocks · 10 analytic-window posterior realizations",
+                 fontsize=12)
+    ax.set_xlim(theta_bins[0], theta_bins[-1])
 
-    # BAO scale reference (~6.5° at z~0.5)
-    ax.axvline(6.5, color="gray", lw=0.8, ls="--", alpha=0.6)
-    ax.text(6.5 * 1.06, ax.get_ylim()[0] * 1.4, "BAO ≈ 6.5°",
-            color="gray", fontsize=8, va="bottom")
+    # Smoothing scale: adaptive bandwidth ~15 Mpc/h at z~0.52 (χ̄~1370) → ~0.6°
+    theta_smooth = np.degrees(15.0 / 1370.0)
+    ax.axvline(theta_smooth, color="gray", lw=0.8, ls="--", alpha=0.6)
+    ax.text(theta_smooth * 1.05, ax.get_ylim()[0] * 1.5,
+            "field resolution\n(~15 Mpc/h)", color="gray", fontsize=7,
+            va="bottom")
 
     ax.set_facecolor("#0a0a12")
     fig.patch.set_facecolor("#0a0a12")
@@ -213,21 +201,19 @@ def main():
     for spine in ax.spines.values():
         spine.set_edgecolor("#444")
     ax.grid(True, which="both", alpha=0.12, color="white")
-    ax.legend(fontsize=10, framealpha=0.2, labelcolor="white",
-              facecolor="#111")
+    ax.legend(fontsize=10, framealpha=0.2, labelcolor="white", facecolor="#111")
 
     plt.tight_layout()
     plt.savefig(args.out, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     print(f"\nSaved: {args.out}")
 
-    # Print summary statistics
-    print(f"\nw(θ) summary  [cascade + Limber, χ̄={chi_bar:.0f} Mpc/h]:")
-    print(f"  {'θ[°]':>8}  {'w_orig':>9}  {'w_med':>9}  {'σ_GP':>9}  {'σ/w':>6}")
+    # ── 7. Summary ────────────────────────────────────────────────────────
+    print(f"\nLandy-Szalay w(θ)  [Corrfunc DDtheta_mocks]:")
+    print(f"  {'θ[°]':>8}  {'w_obs':>9}  {'w_med_GP':>9}  {'GP/obs':>7}")
     for i, tc in enumerate(theta_cen):
-        rms = np.nanstd(w_samples[:, i])
-        print(f"  {tc:8.3f}  {w_orig[i]:9.5f}  {w_med[i]:9.5f}"
-              f"  {rms:9.5f}  {rms/abs(w_orig[i]+1e-6):6.2f}")
+        ratio = w_med[i] / w_orig[i] if w_orig[i] != 0 else np.nan
+        print(f"  {tc:8.3f}  {w_orig[i]:9.5f}  {w_med[i]:9.5f}  {ratio:7.3f}")
 
 
 if __name__ == "__main__":
