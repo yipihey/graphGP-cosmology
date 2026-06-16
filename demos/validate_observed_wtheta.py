@@ -50,6 +50,8 @@ def main():
     p.add_argument("--n-cand-factor", type=int, default=20)
     p.add_argument("--n-rand-rr",    type=int, default=200_000)
     p.add_argument("--nthreads",     type=int, default=16)
+    p.add_argument("--additive",     action="store_true",
+                   help="use per-band additive multi-resolution synthesis")
     p.add_argument("--out",          default="output/observed_wtheta.png")
     args = p.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -60,7 +62,8 @@ def main():
 
     cats, te, ze, xi = sample_catalogs_lgcp_observed(
         cat, n_samples=args.n_samples, seed=1, w_completeness=w_comp,
-        n_cand_factor=args.n_cand_factor, chunk_size=50_000, verbose=True)
+        n_cand_factor=args.n_cand_factor, additive=args.additive,
+        chunk_size=50_000, verbose=True)
 
     rng = np.random.default_rng(7)
     ra_r, dec_r, z_r = make_random_from_selection_function(

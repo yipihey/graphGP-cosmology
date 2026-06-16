@@ -317,6 +317,93 @@ def build_observed_kernel_2d(
     return cov, alpha
 
 
+def _nnls_bands(theta_edges, z_edges, xi_grid, n_ltheta=8, n_lz=6):
+    """Shared NNLS fit of K_G(Δθ,Δz) → (scales, coeffs, sb, zb, bin centres)."""
+    from scipy.optimize import nnls
+
+    theta_c = np.empty(len(theta_edges) - 1)
+    theta_c[0] = 0.5 * theta_edges[1]
+    theta_c[1:] = np.sqrt(theta_edges[1:-1] * theta_edges[2:])
+    z_c = 0.5 * (z_edges[1:] + z_edges[:-1])
+    chord_c = 2.0 * np.sin(np.radians(theta_c) / 2.0)
+    KG = np.log1p(np.clip(np.asarray(xi_grid, np.float64), 0.0, None))
+
+    lthetas = np.geomspace(0.7 * chord_c[0], 1.5 * chord_c[-1], n_ltheta)
+    lzs = np.geomspace(0.7 * max(z_c[0], 1e-4), 1.5 * z_c[-1], n_lz)
+    cols, scales = [], []
+    for lt in lthetas:
+        mt = _matern1(chord_c, lt)
+        for lz in lzs:
+            cols.append(np.outer(mt, _matern1(z_c, lz)).ravel())
+            scales.append((lt, lz))
+    coeffs, _ = nnls(np.stack(cols, axis=1), KG.ravel())
+    return scales, coeffs, chord_c, z_c
+
+
+def build_observed_bands(
+    theta_edges: np.ndarray,
+    z_edges: np.ndarray,
+    xi_grid: np.ndarray,
+    *,
+    n_cand: int,
+    theta_split_deg: float = 0.35,
+    alpha_fine: float = 2.0,
+    jitter: float = 0.02,
+    n_s: int = 512,
+    n_zg: int = 256,
+    coarse_ref_deg: float = 0.35,
+    coarse_min: int = 3_000,
+):
+    """Decompose K_G into additive bands for multi-resolution synthesis.
+
+    The NNLS tensor-Matérn bands are split by angular scale: all bands with
+    ℓθ ≤ ``theta_split_deg`` are summed into one *fine* band generated at full
+    candidate density (the dense graph realizes them well), while each broader
+    band becomes its own band generated on a sub-sample matched to its angular
+    scale and kriged up. Each band carries its own embedding ``alpha`` (the
+    broad bands use the isotropising α_b = ℓθ/ℓz so a point's neighbours span
+    the band in both axes; α cancels from the kernel value). The band fields are
+    independent, so their covariances sum back to the full K_G.
+
+    Returns ``(bands, sigma2)`` where ``bands`` is a list of
+    ``{"cov", "alpha", "n_coarse"}`` dicts for ``graphgp.generate_additive``.
+    """
+    import graphgp as gp
+
+    scales, coeffs, chord_c, z_c = _nnls_bands(theta_edges, z_edges, xi_grid)
+    sb = np.concatenate([[0.0], np.geomspace(1e-5, 1.5 * chord_c[-1], n_s - 1)])
+    zb = np.concatenate([[0.0], np.geomspace(1e-5, 2.0 * z_c[-1], n_zg - 1)])
+    chord_split = 2.0 * np.sin(np.radians(theta_split_deg) / 2.0)
+    chord_ref = 2.0 * np.sin(np.radians(coarse_ref_deg) / 2.0)
+
+    def grid_of(items):
+        g = np.zeros((len(sb), len(zb)))
+        for (lt, lz), a in items:
+            g += a * np.outer(_matern1(sb, lt), _matern1(zb, lz))
+        return g
+
+    active = [((lt, lz), a) for (lt, lz), a in zip(scales, coeffs) if a > 1e-3]
+    sigma2 = float(sum(a for _, a in active))
+
+    # fine band: all ℓθ ≤ split, summed, full density
+    fine = [it for it in active if it[0][0] <= chord_split]
+    bands = []
+    if fine:
+        gf = grid_of(fine)
+        bands.append({"cov": gp.build_anisotropic_covariance(sb, zb, gf, float(alpha_fine),
+                                                             jitter=jitter),
+                      "alpha": float(alpha_fine), "n_coarse": None})
+    # broad bands: one per (ℓθ, ℓz), sub-sampled to match the angular scale
+    for (lt, lz), a in [it for it in active if it[0][0] > chord_split]:
+        gb = grid_of([((lt, lz), a)])
+        alpha_b = float(lt / max(lz, 1e-9))
+        n_coarse = int(np.clip(n_cand * (chord_ref / lt) ** 2, coarse_min, n_cand))
+        bands.append({"cov": gp.build_anisotropic_covariance(sb, zb, gb, alpha_b,
+                                                             jitter=jitter),
+                      "alpha": alpha_b, "n_coarse": n_coarse})
+    return bands, sigma2
+
+
 def sample_catalogs_lgcp_observed(
     catalog,
     *,
@@ -327,6 +414,7 @@ def sample_catalogs_lgcp_observed(
     n0: int = 256,
     k: int = 30,
     embed_alpha: Optional[float] = 2.0,
+    additive: bool = False,
     chunk_size: Optional[int] = 50_000,
     measure_kwargs: Optional[dict] = None,
     verbose: bool = False,
@@ -358,19 +446,33 @@ def sample_catalogs_lgcp_observed(
     # the kernel's broad angular wings (alpha≈2 markedly outperforms the
     # correlation-isotropising alpha≈0.3 on w(θ) at θ≳0.5°).
     te, ze, xi = measure_xi_theta_z(catalog, seed=seed, **(measure_kwargs or {}))
-    cov, alpha = build_observed_kernel_2d(te, ze, xi, alpha=embed_alpha)
-    # σ² is the kernel's zero-separation amplitude: cov_vals[0] for a 1-D
-    # (cov_bins, cov_vals) kernel, or grid[0,0] for an AnisotropicCovariance.
-    sigma2 = (float(np.asarray(cov[1])[0]) if isinstance(cov, tuple)
-              else float(np.asarray(cov.grid)[0, 0]))
-    if verbose:
-        print(f"[obs-lgcp] anisotropic kernel: alpha={alpha:.3f}  σ²={sigma2:.3f}")
 
     nd = catalog.N_data
     if w_completeness is None:
         w_completeness = np.ones(nd)
     w_sum = float(np.asarray(w_completeness).sum())
     n_cand = int(n_cand_factor * nd)
+
+    # Kernel. ``additive`` decomposes K_G into independent tensor-Matérn bands
+    # generated each at its own resolution (broad/long-range bands on a coarse
+    # sub-sample, kriged up) and summed — the multi-resolution synthesis that
+    # avoids the dense graph screening out broad angular power. Otherwise a
+    # single AnisotropicCovariance is generated on one full-density graph.
+    if additive:
+        bands, sigma2 = build_observed_bands(te, ze, xi, n_cand=n_cand,
+                                             alpha_fine=embed_alpha or 2.0)
+        cov, alpha = None, embed_alpha
+        if verbose:
+            ncs = [b["n_coarse"] for b in bands]
+            print(f"[obs-lgcp] additive: {len(bands)} bands, n_coarse={ncs}  σ²={sigma2:.3f}")
+    else:
+        cov, alpha = build_observed_kernel_2d(te, ze, xi, alpha=embed_alpha)
+        # σ² is the kernel's zero-separation amplitude: cov_vals[0] for a 1-D
+        # (cov_bins, cov_vals) kernel, or grid[0,0] for an AnisotropicCovariance.
+        sigma2 = (float(np.asarray(cov[1])[0]) if isinstance(cov, tuple)
+                  else float(np.asarray(cov.grid)[0, 0]))
+        if verbose:
+            print(f"[obs-lgcp] anisotropic kernel: alpha={alpha:.3f}  σ²={sigma2:.3f}")
 
     rng0 = np.random.default_rng(seed)
     ra_c, dec_c, z_c = make_random_from_selection_function(
@@ -380,11 +482,15 @@ def sample_catalogs_lgcp_observed(
     ra_c = np.asarray(ra_c, np.float64); dec_c = np.asarray(dec_c, np.float64)
     z_c = np.asarray(z_c, np.float64)
     nhat_c = _radec_to_nhat(ra_c, dec_c)
-    points = jnp.asarray(np.hstack([nhat_c, (alpha * z_c)[:, None]]),
-                         dtype=jnp.float64)
+
+    def embed(a):
+        return jnp.asarray(np.hstack([nhat_c, (a * z_c)[:, None]]), dtype=jnp.float64)
+
     if verbose:
         print(f"[obs-lgcp] {n_cand:,} window candidates; building graph ...")
-    graph = gp.build_graph(points, n0=min(n0, n_cand // 2), k=min(k, n_cand - 1))
+    if not additive:
+        points = embed(alpha)
+        graph = gp.build_graph(points, n0=min(n0, n_cand // 2), k=min(k, n_cand - 1))
 
     # Candidates already carry continuous positions from the window sampler;
     # multiply-occupied candidates land at Δθ=Δz=0 (below the smallest measured
@@ -397,12 +503,18 @@ def sample_catalogs_lgcp_observed(
 
     out = []
     for s in range(n_samples):
-        eps = np.random.default_rng(seed + 1 + s).standard_normal(n_cand)
-        try:
-            f = np.asarray(gp.generate(graph, cov, jnp.asarray(eps, dtype=jnp.float64),
-                                       chunk_size=chunk_size))
-        except TypeError:
-            f = np.asarray(gp.generate(graph, cov, jnp.asarray(eps, dtype=jnp.float64)))
+        if additive:
+            f = np.asarray(gp.generate_additive(
+                embed(embed_alpha or 2.0), bands, k=k, n0=n0,
+                seed=seed + 1 + s, chunk_size=chunk_size, embed=embed,
+                verbose=verbose and s == 0))
+        else:
+            eps = np.random.default_rng(seed + 1 + s).standard_normal(n_cand)
+            try:
+                f = np.asarray(gp.generate(graph, cov, jnp.asarray(eps, dtype=jnp.float64),
+                                           chunk_size=chunk_size))
+            except TypeError:
+                f = np.asarray(gp.generate(graph, cov, jnp.asarray(eps, dtype=jnp.float64)))
         # guard against rare near-singular Vecchia blocks (near-coincident
         # candidates) producing field outliers: clip to ±8σ and zero any NaN.
         sig = np.sqrt(max(sigma2, 1e-12))

@@ -114,13 +114,44 @@ fixed); **wings now mildly LOW** (0.83→0.58 over 0.64–2°) instead of the ol
    Larger **α≈2** (vs correlation-isotropising ≈0.3) draws each point's k
    neighbours from nearer-same-z → wider angular span → much better wings.
    Exposed as `sample_catalogs_lgcp_observed(embed_alpha=2.0)`.
-4. **Multiscale graph (Tom's idea) implemented but does NOT help here.**
+4. **Multiscale graph (Tom's idea, v1) does NOT help here.**
    `graphgp/build_multiscale_graph` (coarse→fine random nested levels, scale-
    ladder neighbours) is correct on isotropic toys but the screening here is
    *angular*, while its far-neighbours in the 4-D embedding are far in *redshift*.
-   Next idea: **per-band additive synthesis** — generate each tensor-Matérn band
-   on a down-sample matched to its scale and SUM (literal "add to K_G"); each
-   band realized at its natural resolution. Not yet built.
+
+### BEST result — per-band additive synthesis (`additive=True`)
+
+`sample_catalogs_lgcp_observed(..., additive=True)` (5 samples). Decompose K_G
+into its NNLS tensor-Matérn bands; the fine bands (ℓθ ≤ 0.35°) are generated on
+one full-density graph, each broad band on a sub-sample sized to its angular
+scale (`build_observed_bands`) and **kriged up** (`graphgp.generate_conditional`),
+then summed (independent fields → covariances add to K_G). This realizes the
+broad angular power the single dense graph screened out.
+
+```
+ theta   w_data  LGCP/data(additive)  vs stock α=2
+ 0.061   0.3062   1.009                0.874
+ 0.090   0.2298   0.857                0.916
+ 0.133   0.1827   0.852                0.895
+ 0.197   0.1354   1.002                0.979
+ 0.291   0.0948   0.986                1.047
+ 0.430   0.0660   0.946                0.933
+ 0.636   0.0446   0.895                0.830
+ 0.940   0.0273   0.804                0.805
+ 1.390   0.0155   0.751                0.704
+ 2.056   0.0082   0.719                0.578
+```
+
+Additive lifts the wings systematically (2°: 0.58→0.72, 1.4°: 0.70→0.75) while
+holding core/mid within ~15% (most within ~5%). Reproduce:
+`python demos/validate_observed_wtheta.py --additive --n-samples 5`.
+
+**Remaining gap to percent level:** wings still ~20–28% low at 1.4–2° and core
+~15% low at 0.09–0.13°. Knobs to push next: denser broad-band sub-samples
+(`coarse_ref_deg`, larger `n_coarse`) so the kriged innovations add less
+small-scale noise; finer angular band splitting; and the broad bands' σ²
+bookkeeping. graphGP fork features for this: `generate_conditional`,
+`generate_additive`, `build_multiscale_graph` (23 tests green).
 
 ---
 
