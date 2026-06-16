@@ -735,6 +735,148 @@ def _fkp_kde_analytic(
     return np.clip(one_plus_delta, 0.0, 1e3), h
 
 
+def sample_catalogs_lgcp(
+    catalog,
+    window=None,
+    *,
+    n_samples: int = 10,
+    seed: int = 0,
+    r_edges: Optional[np.ndarray] = None,
+    n0: int = 100,
+    k: int = 30,
+    n_cand_factor: int = 8,
+    w_completeness: Optional[np.ndarray] = None,
+    nthreads: int = 16,
+    chunk_size: Optional[int] = 50_000,
+    verbose: bool = False,
+) -> list:
+    """Log-Gaussian Cox process catalogs from graphGP — clustering at all scales.
+
+    This is the graphGP generator done properly (vs the FKP-KDE smoother): a
+    Gaussian field f is drawn with covariance K_G(r) = ln(1 + ξ_measured(r)),
+    so the log-normal intensity 1+δ = exp(f − σ²/2) has galaxy two-point
+    function exp(K_G) − 1 = ξ_measured(r) **at every scale by construction**.
+    The field is realised on candidate points drawn from the analytic survey
+    window (S_ang · n(z)) and Poisson-thinned — no MC random catalogue, and
+    the small-scale clustering is the measured ξ(r), not a KDE-smoothed
+    version.
+
+    This is the *prior-predictive* LGCP (its two-point statistics match the
+    data by construction).  Matheron conditioning on the observed galaxy
+    positions — which additionally pins the realised large-scale modes to the
+    data — is the next increment (see _vecchia_matvec / _cg_solve).
+
+    Returns a list of dicts ``{ra, dec, z, N_galaxies, clip_frac}``.
+    """
+    import jax
+    import jax.numpy as jnp
+    import graphgp as gp
+
+    from .window import build_survey_window
+    from .distance import radec_z_to_cartesian, cartesian_to_radec_z
+    from .quaia import make_random_from_selection_function
+    from .ls_corrfunc import xi_landy_szalay
+    from .weights_graphgp import tabulate_kernel_direct
+
+    jax.config.update("jax_enable_x64", True)
+
+    if window is None:
+        window = build_survey_window(catalog)
+    cosmo = catalog.fid_cosmo
+
+    xyz_d = np.ascontiguousarray(np.asarray(catalog.xyz_data), dtype=np.float64)
+    N_D = len(xyz_d)
+    if w_completeness is None:
+        w_completeness = np.ones(N_D, dtype=np.float64)
+    w_sum = float(np.asarray(w_completeness).sum())
+
+    # ── ξ(r) → log-normal Gaussian kernel K_G = ln(1+ξ) ──────────────────
+    if r_edges is None:
+        r_edges = np.logspace(np.log10(0.8), np.log10(60.0), 22)
+    rc = np.sqrt(r_edges[:-1] * r_edges[1:])
+    xyz_r_meas = np.ascontiguousarray(
+        np.asarray(catalog.xyz_random), dtype=np.float64)
+    if len(xyz_r_meas) > 300000:
+        ridx = np.random.default_rng(seed).choice(len(xyz_r_meas), 300000,
+                                                   replace=False)
+        xyz_r_meas = xyz_r_meas[ridx]
+    _, xi_data, _, _, _ = xi_landy_szalay(xyz_d, xyz_r_meas, r_edges=r_edges,
+                                          nthreads=nthreads, weights=None)
+    xi_G = np.log(1.0 + np.clip(xi_data, 0.0, None))
+    cov, _ = tabulate_kernel_direct(rc, xi_G)
+    cov_vals = np.asarray(cov[1])
+    sigma2 = float(cov_vals[0])
+    if verbose:
+        print(f"[lgcp] ξ(r) measured; K_G(0)=σ²={sigma2:.3f}")
+
+    # ── Candidate points from the window (graph built once, reused) ──────
+    n_cand = int(n_cand_factor * N_D)
+    rng0 = np.random.default_rng(seed)
+    ra_c, dec_c, z_c = make_random_from_selection_function(
+        sel_map=catalog.sel_map, n_random=n_cand,
+        z_data=np.asarray(catalog.z_data), nside=catalog.nside, rng=rng0,
+    )
+    xyz_c = np.ascontiguousarray(
+        np.asarray(radec_z_to_cartesian(ra_c, dec_c, z_c, cosmo)),
+        dtype=np.float64)
+    if verbose:
+        print(f"[lgcp] {n_cand:,} window candidates; building graph ...")
+    graph = gp.build_graph(jnp.asarray(xyz_c, dtype=jnp.float64),
+                           n0=min(n0, n_cand // 2), k=min(k, n_cand - 1))
+
+    # Spatial resolution comes from the candidate density (the field is
+    # evaluated at the candidate positions).  Multiply-occupied candidates are
+    # given only a small jitter so their mutual pairs land *below* the
+    # smallest measured separation (an unresolved 1-halo) rather than being
+    # spread across the measured bins, which would inflate ξ at a few Mpc.
+    box_vol = float(np.prod(xyz_c.max(axis=0) - xyz_c.min(axis=0)))
+    mean_spacing = (box_vol / n_cand) ** (1.0 / 3.0)
+    sig_jit = min(0.15, 0.25 * mean_spacing)
+
+    out = []
+    for s in range(n_samples):
+        eps = np.random.default_rng(seed + 1 + s).standard_normal(n_cand)
+        # chunk_size bounds GPU memory for the per-point factorization so the
+        # field can be generated on millions of candidates on a single GPU
+        # (requires the chunked-refinement graphGP fork; ignored if the
+        # installed graphGP predates the chunk_size argument).
+        try:
+            f = np.asarray(gp.generate(
+                graph, cov, jnp.asarray(eps, dtype=jnp.float64),
+                chunk_size=chunk_size))
+        except TypeError:
+            f = np.asarray(gp.generate(graph, cov, jnp.asarray(eps, dtype=jnp.float64)))
+        one_plus_delta = np.exp(f - 0.5 * sigma2)          # log-normal link
+        opd_sum = float(one_plus_delta.sum())
+        alpha = w_sum / opd_sum if opd_sum > 0 else 0.0
+
+        # Inhomogeneous-Poisson sampling: count per candidate ~ Poisson(rate).
+        # Unlike Bernoulli thinning this never truncates dense peaks (no p≤1
+        # clip), so the small-scale clustering of the field is preserved.
+        rng = np.random.default_rng(1000 + seed + s)
+        rate = alpha * one_plus_delta
+        counts = rng.poisson(rate)
+        occ = counts > 0
+        idx = np.repeat(np.where(occ)[0], counts[occ])
+        xyz_g = xyz_c[idx].copy()
+        # jitter every galaxy slightly so multiply-occupied candidates do not
+        # collapse to zero separation (would spike sub-Mpc ξ).
+        xyz_g += rng.normal(0.0, sig_jit, size=xyz_g.shape)
+        ra_g, dec_g, z_g = cartesian_to_radec_z(
+            jnp.asarray(xyz_g, dtype=jnp.float64), cosmo)
+        out.append({
+            "ra": np.asarray(ra_g, dtype=np.float32),
+            "dec": np.asarray(dec_g, dtype=np.float32),
+            "z": np.asarray(z_g, dtype=np.float32),
+            "N_galaxies": int(len(idx)),
+            "multi_frac": float(np.mean(counts[occ] > 1)),
+        })
+        if verbose:
+            print(f"[lgcp] sample {s+1}/{n_samples}: N={out[-1]['N_galaxies']:,} "
+                  f"multi_frac={out[-1]['multi_frac']:.4f}")
+    return out
+
+
 def sample_catalogs_analytic_window(
     catalog,
     window=None,

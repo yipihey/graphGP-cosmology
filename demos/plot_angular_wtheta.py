@@ -37,7 +37,7 @@ from Corrfunc.mocks.DDtheta_mocks import DDtheta_mocks
 
 from twopt_density.boss import load_boss
 from twopt_density.window import build_survey_window
-from twopt_density.density_field import sample_catalogs_analytic_window
+from twopt_density.density_field import sample_catalogs_lgcp
 
 
 # ── Landy-Szalay angular estimator via Corrfunc ──────────────────────────────
@@ -112,17 +112,21 @@ def main():
     cat = load_boss([args.data], [args.randoms], sample="CMASS", nside=256)
     print(f"  N_data={cat.N_data:,}  N_random={len(cat.ra_random):,}")
 
-    # ── 2. Analytic-window posterior-predictive catalogs ──────────────────
-    print("Building analytic survey window + drawing realizations ...")
+    # ── 2. graphGP LGCP posterior-predictive catalogs ─────────────────────
+    # Log-Gaussian Cox process: Gaussian field with covariance ln(1+ξ),
+    # log-normal intensity, drawn on millions of window candidates via the
+    # chunked-refinement graphGP fork (GPU, memory-bounded), Poisson-thinned.
+    # Reproduces the observed ξ(r)/w(θ) across measured scales by construction.
+    print("Drawing graphGP-LGCP realizations ...")
     t0 = time.time()
     w_comp = cat.w_sys_data * cat.w_noz_data * cat.w_cp_data
     window = build_survey_window(cat, kde_bandwidth=0.02)
-    catalogs = sample_catalogs_analytic_window(
+    catalogs = sample_catalogs_lgcp(
         cat, window, n_samples=args.n_samples, seed=42,
-        w_completeness=w_comp, k_bw=8, k_sum=40, h_min=2.0,
-        n_cand_factor=10, verbose=True,
+        w_completeness=w_comp, n_cand_factor=20, chunk_size=50_000,
+        nthreads=args.nthreads, verbose=True,
     )
-    print(f"  window + {args.n_samples} realizations in {time.time()-t0:.0f}s")
+    print(f"  {args.n_samples} LGCP realizations in {time.time()-t0:.0f}s")
 
     # ── 3. Shared random subsample for RR / DR ────────────────────────────
     rng = np.random.default_rng(999)
@@ -170,7 +174,7 @@ def main():
     colors = plt.cm.cool(np.linspace(0.1, 0.9, args.n_samples))
     for i, (w_i, col) in enumerate(zip(w_samples, colors)):
         ax.plot(theta_cen, w_i, color=col, lw=1.0, alpha=0.7,
-                label="analytic-window realizations" if i == 0 else None)
+                label="graphGP-LGCP realizations" if i == 0 else None)
 
     ax.plot(theta_cen, w_orig, color="white", lw=2.6, zorder=10)
     ax.plot(theta_cen, w_orig, color="#f5a623", lw=1.8, zorder=11,
@@ -181,16 +185,9 @@ def main():
     ax.set_xlabel(r"$\theta$ [degrees]", fontsize=13)
     ax.set_ylabel(r"$w(\theta)$", fontsize=13)
     ax.set_title("BOSS CMASS-SGC — Landy-Szalay angular two-point function\n"
-                 r"Corrfunc DDtheta_mocks · 10 analytic-window posterior realizations",
+                 r"Corrfunc DDtheta_mocks · graphGP-LGCP posterior realizations",
                  fontsize=12)
     ax.set_xlim(theta_bins[0], theta_bins[-1])
-
-    # Smoothing scale: adaptive bandwidth ~15 Mpc/h at z~0.52 (χ̄~1370) → ~0.6°
-    theta_smooth = np.degrees(15.0 / 1370.0)
-    ax.axvline(theta_smooth, color="gray", lw=0.8, ls="--", alpha=0.6)
-    ax.text(theta_smooth * 1.05, ax.get_ylim()[0] * 1.5,
-            "field resolution\n(~15 Mpc/h)", color="gray", fontsize=7,
-            va="bottom")
 
     ax.set_facecolor("#0a0a12")
     fig.patch.set_facecolor("#0a0a12")

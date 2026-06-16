@@ -105,6 +105,101 @@ def tabulate_kernel(
     return (jnp.asarray(cov_bins_np), jnp.asarray(cov_vals_np)), (A, r0, alpha)
 
 
+def tabulate_kernel_direct(
+    r_centers: np.ndarray,
+    xi_j: np.ndarray,
+    r_min: float | None = None,
+    r_max: float | None = None,
+    n_bins: int = 300,
+    jitter: float = 0.1,
+    tail_slope: float | None = None,
+    tail_floor: float = 1e-5,
+):
+    """Build a graphgp kernel ``(cov_bins, cov_vals)`` *directly* from the
+    measured ξ(r), preserving its shape at all scales.
+
+    ``jitter`` is the **nugget**: K(0) = ξ(r_min)·(1+jitter).  Because a
+    galaxy ξ(r) is nearly flat just below its smallest measured bin, close
+    pairs (BOSS fibre-collision pairs at <1 Mpc/h) would otherwise produce
+    near-identical covariance rows and a singular Vecchia block.  The nugget
+    — physically the shot-noise / small-scale-cutoff term — regularises the
+    diagonal without touching the off-diagonal ξ(r) being reproduced.
+
+    Unlike :func:`tabulate_kernel` (which fits a single stretched
+    exponential and therefore under-fits the large-scale tail of a
+    galaxy ξ(r)), this tabulates the measured ξ(r) itself:
+
+    1. keep the positive bins and enforce a monotone non-increasing
+       profile (suppresses large-r noise wiggles that would break
+       positive-definiteness);
+    2. interpolate ξ(r) in log-log within the measured range;
+    3. extrapolate the small-r end as a flat hold to ``K(0)`` and the
+       large-r tail as a power law (slope from the outer measured
+       points, or ``tail_slope`` if given) down to ``tail_floor``;
+    4. inflate ``K(0)`` by ``jitter`` for positive-definiteness.
+
+    The result is a smooth, monotone, positive kernel whose 3-D Fourier
+    transform is (to the accuracy of the measurement) the survey P(k) —
+    so a graphGP draw reproduces the measured ξ(r) at every scale.
+
+    Returns ``((cov_bins, cov_vals), (xi0, r_knee, slope))`` where the
+    third tuple is descriptive only (peak value, knee scale, tail slope).
+    """
+    import jax.numpy as jnp
+
+    r_centers = np.asarray(r_centers, dtype=np.float64)
+    xi_j = np.asarray(xi_j, dtype=np.float64)
+
+    pos = xi_j > 0
+    if pos.sum() < 3:
+        # Degenerate ξ(r): fall back to the parametric fit.
+        return tabulate_kernel(r_centers, xi_j, r_min, r_max, n_bins, jitter)
+
+    rp = r_centers[pos]
+    xp = xi_j[pos]
+    order = np.argsort(rp)
+    rp, xp = rp[order], xp[order]
+    # enforce monotone non-increasing (smooth large-r noise upward wiggles)
+    xp_mono = np.minimum.accumulate(xp)
+
+    logr = np.log(rp)
+    logx = np.log(xp_mono)
+
+    r_min = r_min if r_min is not None else float(rp[0])
+    # extend the grid well past the measured range so the GP graph can
+    # query moderate separations; the tail is power-law-extrapolated.
+    r_max = r_max if r_max is not None else max(float(rp[-1]) * 6.0, 250.0)
+
+    # power-law tail slope from the outer ~half-decade of measured points
+    if tail_slope is None:
+        n_tail = min(len(logr), 5)
+        tail_slope = float((logx[-1] - logx[-n_tail]) /
+                           (logr[-1] - logr[-n_tail] + 1e-12))
+    tail_slope = min(tail_slope, -1.0)   # ensure a decaying tail
+
+    cov_bins_np = np.concatenate([
+        [0.0],
+        np.logspace(np.log10(r_min * 0.5), np.log10(r_max), n_bins - 1),
+    ])
+    lb = np.log(cov_bins_np[1:])
+
+    logK = np.empty_like(lb)
+    inside = (lb >= logr[0]) & (lb <= logr[-1])
+    below = lb < logr[0]
+    above = lb > logr[-1]
+    logK[inside] = np.interp(lb[inside], logr, logx)
+    logK[below] = logx[0]                                   # flat hold to K(0)
+    logK[above] = logx[-1] + tail_slope * (lb[above] - logr[-1])
+    K = np.exp(logK)
+    K = np.maximum(K, tail_floor * xp_mono[0])
+    # guarantee global monotonicity of the tabulated kernel
+    K = np.minimum.accumulate(K)
+
+    cov_vals_np = np.concatenate([[xp_mono[0] * (1.0 + jitter)], K])
+    desc = (float(xp_mono[0]), float(rp[0]), float(tail_slope))
+    return (jnp.asarray(cov_bins_np), jnp.asarray(cov_vals_np)), desc
+
+
 def compute_2pt_weights(
     positions: np.ndarray,
     r_centers: np.ndarray,
