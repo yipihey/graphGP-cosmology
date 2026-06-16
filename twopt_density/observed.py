@@ -41,10 +41,12 @@ def measure_xi_theta_z(
     catalog,
     *,
     theta_max_deg: float = 2.5,
+    theta_min_deg: float = 0.02,
     dz_max: float = 0.03,
-    n_theta: int = 12,
+    n_theta: int = 16,
     n_z: int = 10,
-    n_data: int = 40_000,
+    theta_log: bool = True,
+    n_data: int = 90_000,
     n_rand_factor: int = 4,
     seed: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -55,8 +57,13 @@ def measure_xi_theta_z(
     ``sel_map(n̂) · n(z)`` (still cosmology-free). DD, DR and RR come from one
     ``query_pairs`` over the data∪random union embedded as (n̂, β·z).
 
+    Δθ is **log-spaced** (``theta_log=True``) from ``theta_min_deg`` to
+    ``theta_max_deg`` with an extra ``[0, theta_min_deg]`` first bin: galaxy
+    angular clustering is power-law, so a linear grid (first usable bin ~0.2°)
+    leaves the steep core below 0.2° unresolved and forces the kernel to
+    *extrapolate* it — the dominant source of the old "core ~40% low" residual.
     The radial correlation is steep (most signal at Δz ≲ 0.01), so Δz is
-    binned finely near zero.
+    binned linearly but finely near zero.
 
     Returns ``(theta_edges, z_edges, xi_grid)`` with ``xi_grid`` of shape
     ``(n_theta, n_z)``.
@@ -80,9 +87,14 @@ def measure_xi_theta_z(
     ra_r = np.asarray(ra_r, np.float64); dec_r = np.asarray(dec_r, np.float64)
     z_r = np.asarray(z_r, np.float64)
 
-    # bins — Δθ and Δz linear. (A finer-near-zero Δz spacing over-resolves the
-    # first bin into a shot-noise-dominated, σ²-inflating sliver.)
-    theta_edges = np.linspace(0.0, theta_max_deg, n_theta + 1)
+    # bins — Δθ log-spaced (resolve the power-law core) with a [0, θ_min] first
+    # bin; Δz linear. (A finer-near-zero Δz spacing over-resolves the first bin
+    # into a shot-noise-dominated, σ²-inflating sliver.)
+    if theta_log:
+        theta_edges = np.concatenate(
+            [[0.0], np.geomspace(theta_min_deg, theta_max_deg, n_theta)])
+    else:
+        theta_edges = np.linspace(0.0, theta_max_deg, n_theta + 1)
     z_edges = np.linspace(0.0, dz_max, n_z + 1)
     chord_max = 2.0 * np.sin(np.radians(theta_max_deg) / 2.0)
 
@@ -205,6 +217,106 @@ def build_observed_kernel(
     return cov, alpha
 
 
+def _matern1(d, ell):
+    """Matérn ν=3/2 correlation function, (1 + √3 d/ℓ) exp(−√3 d/ℓ)."""
+    u = np.sqrt(3.0) * np.asarray(d, dtype=np.float64) / ell
+    return (1.0 + u) * np.exp(-u)
+
+
+def build_observed_kernel_2d(
+    theta_edges: np.ndarray,
+    z_edges: np.ndarray,
+    xi_grid: np.ndarray,
+    *,
+    alpha: Optional[float] = None,
+    jitter: float = 0.02,
+    n_ltheta: int = 8,
+    n_lz: int = 6,
+    n_s: int = 512,
+    n_zg: int = 256,
+):
+    """Genuine 2-D PSD anisotropic kernel fit to observed ξ(Δθ, Δz).
+
+    The old kernel was an *embedded isotropic* Matérn of d = √(chord²+(αΔz)²):
+    a single global anisotropy ratio α at all scales. Galaxy clustering in
+    observed coordinates is not elliptical — redshift-space distortions make the
+    Δθ/Δz aspect ratio scale-dependent — so a single-shape kernel cannot match
+    the power-law w(θ) (it came out core-low / wing-high simultaneously).
+
+    Here we fit the full 2-D log-kernel K_G(Δθ, Δz) = ln(1+ξ(Δθ, Δz)) with a
+    **sum of tensor-product Matérns**
+
+        K_G(Δθ, Δz) ≈ Σ_k A_k · M(chord(Δθ); ℓθ_k) · M(Δz; ℓz_k),   A_k ≥ 0,
+
+    over a fixed bank of (ℓθ_k, ℓz_k) scale pairs. Each term is a product of two
+    1-D Matérns, so its covariance matrix is the Hadamard product of two PSD
+    matrices — PSD by the Schur product theorem — and a non-negative-weighted
+    sum of PSD kernels is PSD. The weights A_k are solved by non-negative least
+    squares (convex, robust), guaranteeing positive-definiteness without the
+    NaN-field failure of a directly-tabulated 2-D kernel. The flexible bank of
+    scales captures the steep core, the broad wings, *and* a scale-dependent
+    Δθ/Δz aspect ratio simultaneously.
+
+    Returns ``(AnisotropicCovariance, alpha)`` for use with points embedded as
+    (n̂, α·z) via ``graphgp.embed_points``.
+    """
+    from scipy.optimize import nnls
+    import graphgp as gp
+
+    # bin centres (geometric for the log-θ axis, arithmetic for the [0,·] bin)
+    theta_c = np.empty(len(theta_edges) - 1)
+    theta_c[0] = 0.5 * theta_edges[1]
+    theta_c[1:] = np.sqrt(theta_edges[1:-1] * theta_edges[2:])
+    z_c = 0.5 * (z_edges[1:] + z_edges[:-1])
+    chord_c = 2.0 * np.sin(np.radians(theta_c) / 2.0)
+
+    xi = np.clip(np.asarray(xi_grid, dtype=np.float64), 0.0, None)
+    KG = np.log1p(xi)                      # (n_theta, n_z) target log-kernel
+
+    # bank of length scales spanning the measured range (and a little beyond)
+    lthetas = np.geomspace(0.7 * chord_c[0], 1.5 * chord_c[-1], n_ltheta)
+    lzs = np.geomspace(0.7 * max(z_c[0], 1e-4), 1.5 * z_c[-1], n_lz)
+
+    # design matrix: one column per (ℓθ, ℓz) tensor-Matérn basis function,
+    # evaluated on the (Δθ, Δz) measurement grid and flattened.
+    cols, scales = [], []
+    for lt in lthetas:
+        mt = _matern1(chord_c, lt)                  # (n_theta,)
+        for lz in lzs:
+            mz = _matern1(z_c, lz)                  # (n_z,)
+            cols.append(np.outer(mt, mz).ravel())
+            scales.append((lt, lz))
+    A_mat = np.stack(cols, axis=1)                  # (n_theta*n_z, n_basis)
+    coeffs, _ = nnls(A_mat, KG.ravel())
+
+    # evaluation grid for the AnisotropicCovariance (dense; covers a little
+    # beyond the measured range, where the Matérns have decayed toward 0).
+    sb = np.concatenate([[0.0], np.geomspace(1e-5, 1.5 * chord_c[-1], n_s - 1)])
+    zb = np.concatenate([[0.0], np.geomspace(1e-5, 2.0 * z_c[-1], n_zg - 1)])
+
+    # assemble the fitted kernel on the (sb, zb) evaluation grid
+    grid = np.zeros((n_s, n_zg))
+    kg_theta0 = np.zeros(n_s)   # K_G(Δθ, 0) profile, for α
+    kg_z0 = np.zeros(n_zg)      # K_G(0, Δz) profile, for α
+    for (lt, lz), a in zip(scales, coeffs):
+        if a <= 0:
+            continue
+        mt = _matern1(sb, lt)
+        mz = _matern1(zb, lz)
+        grid += a * np.outer(mt, mz)
+        kg_theta0 += a * mt * _matern1(0.0, lz)
+        kg_z0 += a * _matern1(0.0, lt) * mz
+
+    if alpha is None:
+        def half_scale(prof, coords):
+            below = np.where(prof < 0.5 * prof[0])[0]
+            return float(coords[below[0]]) if len(below) else float(coords[-1])
+        alpha = float(half_scale(kg_theta0, sb) / max(half_scale(kg_z0, zb), 1e-9))
+
+    cov = gp.build_anisotropic_covariance(sb, zb, grid, float(alpha), jitter=jitter)
+    return cov, alpha
+
+
 def sample_catalogs_lgcp_observed(
     catalog,
     *,
@@ -214,6 +326,7 @@ def sample_catalogs_lgcp_observed(
     n_cand_factor: int = 20,
     n0: int = 256,
     k: int = 30,
+    embed_alpha: Optional[float] = 2.0,
     chunk_size: Optional[int] = 50_000,
     measure_kwargs: Optional[dict] = None,
     verbose: bool = False,
@@ -235,8 +348,17 @@ def sample_catalogs_lgcp_observed(
 
     jax.config.update("jax_enable_x64", True)
 
+    # ``embed_alpha`` is the radial embedding scale used ONLY for the graph's
+    # neighbour selection — it cancels out of the AnisotropicCovariance *value*
+    # (aniso_evaluate divides Δz by alpha after the embedding multiplies by it),
+    # so the kernel is identical for any alpha. A larger alpha pushes
+    # different-redshift candidates apart in the embedded metric, so each
+    # point's k neighbours are drawn from more nearly the same redshift and span
+    # a wider *angular* range — which is what the Vecchia field needs to realize
+    # the kernel's broad angular wings (alpha≈2 markedly outperforms the
+    # correlation-isotropising alpha≈0.3 on w(θ) at θ≳0.5°).
     te, ze, xi = measure_xi_theta_z(catalog, seed=seed, **(measure_kwargs or {}))
-    cov, alpha = build_observed_kernel(te, ze, xi)
+    cov, alpha = build_observed_kernel_2d(te, ze, xi, alpha=embed_alpha)
     # σ² is the kernel's zero-separation amplitude: cov_vals[0] for a 1-D
     # (cov_bins, cov_vals) kernel, or grid[0,0] for an AnisotropicCovariance.
     sigma2 = (float(np.asarray(cov[1])[0]) if isinstance(cov, tuple)

@@ -75,26 +75,52 @@ refinement options below.
 
 ---
 
-## Current result (HEAD)
+## Current result — UPDATED 2026-06-16 (2-D kernel + α=2 embedding)
 
-`build_observed_kernel` = sum-of-two-Matérns; n_cand_factor=20 (~2.2 M cand):
+`build_observed_kernel_2d` = **sum of tensor-product Matérns** (PSD by Schur
+product, NNLS coeffs) on **log-θ binned** ξ(Δθ,Δz); `embed_alpha=2.0`;
+n_cand_factor=20 (~2.2 M cand):
 
 ```
  theta   w_data   w_LGCP  LGCP/data
- 0.061   0.3062   0.1670     0.545
- 0.090   0.2298   0.1583     0.689
- 0.133   0.1827   0.1409     0.771
- 0.197   0.1354   0.1203     0.889
- 0.291   0.0948   0.1012     1.068
- 0.430   0.0660   0.0761     1.152
- 0.636   0.0446   0.0555     1.246
- 0.940   0.0273   0.0382     1.397
- 1.390   0.0155   0.0214     1.384
- 2.056   0.0082   0.0091     1.114
+ 0.061   0.3062   0.2675     0.874
+ 0.090   0.2298   0.2106     0.916
+ 0.133   0.1827   0.1635     0.895
+ 0.197   0.1354   0.1325     0.979
+ 0.291   0.0948   0.0993     1.047
+ 0.430   0.0660   0.0616     0.933
+ 0.636   0.0446   0.0370     0.830
+ 0.940   0.0273   0.0220     0.805
+ 1.390   0.0155   0.0109     0.704
+ 2.056   0.0082   0.0047     0.578
 ```
 
-Shape: **core (≲0.2°) ~30–45% low**, **wings (0.6–1.4°) ~25–40% high**, good
-near 0.2–0.4°. multi_frac ≈ 0.10.
+Shape: **core/mid (≤0.43°) within ~2–13%** (the old 30–45% core deficit is
+fixed); **wings now mildly LOW** (0.83→0.58 over 0.64–2°) instead of the old
+25–50% high. multi_frac ≈ 0.21, σ² ≈ 4.45.
+
+### What changed and why it matters
+1. **Kernel is essentially solved.** Analytically *projecting* `build_observed_
+   kernel_2d` through the data n(z) (∫∫ p(z₁)p(z₂)[exp K_G(Δθ,|z₁−z₂|)−1]) matches
+   BOSS w(θ) to **~10 % across 0.06–2°**, wings included. The remaining w(θ)
+   error is NOT the kernel.
+2. **Bottleneck = graphGP field realization.** The field-level (opd-weighted,
+   no-Poisson) w(θ) collapses toward 0 beyond ~0.6° even though the kernel
+   projects correctly: Vecchia conditioning screens the kernel's broad ANGULAR
+   power. Diagnose with opd-weighted `DDtheta_mocks` vs the n(z) projection
+   (`/tmp/field_w.py` pattern, or fold into a demo).
+3. **α is now purely a graph knob.** With `AnisotropicCovariance` the embedding α
+   cancels out of the kernel *value*, so it only sets neighbour selection.
+   Larger **α≈2** (vs correlation-isotropising ≈0.3) draws each point's k
+   neighbours from nearer-same-z → wider angular span → much better wings.
+   Exposed as `sample_catalogs_lgcp_observed(embed_alpha=2.0)`.
+4. **Multiscale graph (Tom's idea) implemented but does NOT help here.**
+   `graphgp/build_multiscale_graph` (coarse→fine random nested levels, scale-
+   ladder neighbours) is correct on isotropic toys but the screening here is
+   *angular*, while its far-neighbours in the 4-D embedding are far in *redshift*.
+   Next idea: **per-band additive synthesis** — generate each tensor-Matérn band
+   on a down-sample matched to its scale and SUM (literal "add to K_G"); each
+   band realized at its natural resolution. Not yet built.
 
 ---
 
