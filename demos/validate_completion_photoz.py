@@ -30,6 +30,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n-real", type=int, default=6)
     p.add_argument("--n-rand-factor", type=int, default=2)
+    p.add_argument("--targets", default=None,
+                   help="fetched CMASS target FITS (real loader); default = placeholder")
     args = p.parse_args()
 
     cat = load_boss(["data/boss/galaxy_DR12v5_CMASS_South.fits.gz"],
@@ -43,10 +45,13 @@ def main():
     train = np.isfinite(feat).all(axis=1) & (cat.imatch_data == 1)
     pz = PhotoZKNN(k=100).fit(feat[train], np.asarray(cat.z_data)[train])
     dz_pool = measure_close_pair_dz(cat, COLL)
-    targets = load_cmass_targets(cat, path=None, seed=0)
-    print(f"placeholder missing targets: {targets.N:,} "
-          f"(collided {np.sum(targets.miss_kind=='collided'):,}, "
-          f"zfail {np.sum(targets.miss_kind=='zfail'):,})")
+    targets = load_cmass_targets(cat, path=args.targets, seed=0)
+    wcp = np.asarray(cat.w_cp_data); wnoz = np.asarray(cat.w_noz_data)
+    print(f"{'REAL' if args.targets else 'placeholder'} missing targets: {targets.N:,} "
+          f"(collided {np.sum(targets.miss_kind=='collided'):,} "
+          f"[w_cp implies {(wcp-1).sum():.0f}], "
+          f"zfail {np.sum(targets.miss_kind=='zfail'):,} "
+          f"[w_noz implies {(wnoz-1).sum():.0f}])")
 
     te = np.concatenate([[0.0], np.geomspace(0.01, 2.5, 18)]); ze = np.linspace(0.0, 0.03, 11)
     tcen = np.empty(len(te) - 1); tcen[0] = 0.5 * te[1]; tcen[1:] = np.sqrt(te[1:-1] * te[2:])
@@ -76,6 +81,26 @@ def main():
         print(f"{tcen[i]:8.4f}{xw0[i]:10.4f}{xm[i]:10.4f}"
               f"{xm[i]/xw0[i] if xw0[i] else np.nan:9.3f}"
               f"{100*xs[i]/xm[i] if xm[i] else np.nan:7.1f} {f}")
+
+    # --- imaging-consistency checks (one realization) ---
+    import healpy as hp
+    c = complete_catalog_photoz(cat, targets, pz, seed=0, dz_pool=dz_pool)
+    print("\nn(z): completed vs observed (fraction per z-bin)")
+    zb = np.linspace(0.43, 0.62, 8)
+    ho, _ = np.histogram(np.asarray(cat.z_data), zb, weights=w_c)  # weighted observed
+    hc, _ = np.histogram(c["z"], zb)
+    for a, b, fo, fc in zip(zb[:-1], zb[1:], ho / ho.sum(), hc / hc.sum()):
+        print(f"  z[{a:.2f},{b:.2f}): wobs={fo:.3f}  completed={fc:.3f}")
+    # angular density per HEALPix pixel: completed vs (observed+missing targets)
+    ns = 32
+    pix_c = hp.ang2pix(ns, c["ra"], c["dec"], lonlat=True)
+    dens_c = np.bincount(pix_c, minlength=12 * ns**2).astype(float)
+    occ = dens_c > 0
+    pix_t = hp.ang2pix(ns, np.r_[np.asarray(cat.ra_data), np.asarray(targets.ra)],
+                       np.r_[np.asarray(cat.dec_data), np.asarray(targets.dec)], lonlat=True)
+    dens_t = np.bincount(pix_t, minlength=12 * ns**2).astype(float)
+    r = np.corrcoef(dens_c[occ], dens_t[occ])[0, 1]
+    print(f"\nangular density per nside={ns} pixel: corr(completed, observed+targets)={r:.3f}")
 
 
 if __name__ == "__main__":
