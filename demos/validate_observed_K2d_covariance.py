@@ -58,6 +58,8 @@ def main():
     p.add_argument("--n-mock", type=int, default=32)
     p.add_argument("--nside-jk", type=int, default=8)
     p.add_argument("--alpha", type=float, default=2.0)
+    p.add_argument("--theta-cap", type=float, default=0.05)
+    p.add_argument("--sampling", default="poisson", choices=["poisson", "bernoulli"])
     p.add_argument("--out", default="output/observed_K2d_cov.png")
     args = p.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -71,11 +73,14 @@ def main():
     _, _, xi_w, cnt = measure_K2d_data(cat, theta_edges=te, z_edges=ze,
                                        n_data=80_000, n_rand_factor=3, seed=0, return_counts=True)
     xi_in, _ = deconvolve_window(xi_w, cnt["rr"])
-    cov, sigma2 = kernel_from_K2d(te, ze, xi_in, alpha=args.alpha)
+    cov, sigma2 = kernel_from_K2d(te, ze, xi_in, alpha=args.alpha,
+                                  theta_cap_deg=args.theta_cap)
+    print(f"σ²={sigma2:.3f} (θ_cap={args.theta_cap}°, sampling={args.sampling})")
 
     cats = generate_catalogs_from_kernel(cat, cov, sigma2, alpha=args.alpha,
                                          n_samples=args.n_mock, seed=1,
-                                         w_completeness=w_comp, verbose=True)
+                                         w_completeness=w_comp, sampling=args.sampling,
+                                         verbose=True)
 
     tb = np.logspace(np.log10(0.05), np.log10(2.5), 11); tc = np.sqrt(tb[1:]*tb[:-1])
 

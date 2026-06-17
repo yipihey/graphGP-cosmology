@@ -109,6 +109,7 @@ def generate_catalogs_from_kernel(
     n_cand_factor: int = 20,
     n0: int = 256,
     k: int = 30,
+    sampling: str = "poisson",
     chunk_size: Optional[int] = 50_000,
     verbose: bool = False,
 ):
@@ -156,7 +157,14 @@ def generate_catalogs_from_kernel(
         opd_sum = float(opd.sum())
         a_thin = w_sum / opd_sum if opd_sum > 0 else 0.0
         rng = np.random.default_rng(1000 + seed + s)
-        counts = rng.poisson(a_thin * opd)
+        if sampling == "bernoulli":
+            # at most one galaxy per candidate — removes the unphysical Δθ=0
+            # multi-occupancy spike. Valid when the candidate density oversamples
+            # the field (p<1); peaks above 1 are clipped (rare once σ² is capped).
+            p = np.clip(a_thin * opd, 0.0, 1.0)
+            counts = (rng.random(n_cand) < p).astype(int)
+        else:
+            counts = rng.poisson(a_thin * opd)
         idx = np.repeat(np.where(counts > 0)[0], counts[counts > 0])
         out.append({"ra": ra_c[idx].astype(np.float32),
                     "dec": dec_c[idx].astype(np.float32),
@@ -230,6 +238,7 @@ def kernel_from_K2d(
     *,
     alpha: float = 2.0,
     jitter: float = 0.02,
+    theta_cap_deg: float = 0.0,
     n_ltheta: int = 12,
     n_lz: int = 8,
     n_s: int = 512,
@@ -244,6 +253,14 @@ def kernel_from_K2d(
     the measured K closely rather than impose a smooth parametric shape. The
     grid is evaluated on a fine (chord, Δz) mesh for GraphGP.
 
+    ``theta_cap_deg`` (off by default) floors the narrowest Matérn scale in the
+    basis bank, mildly bounding σ². NOTE: it only reduces σ² modestly (the
+    zero-lag σ²=ΣA_k is forced up by the measured K≈2.8 at the smallest bins),
+    because a log-normal field fundamentally needs σ² ≥ K(smallest reproduced
+    scale). A *hard* flatten of the core would cut σ² more but is incompatible
+    with random candidates — most points have a neighbour inside the flat core,
+    making those Vecchia blocks degenerate and collapsing the field.
+
     ``alpha`` is only the graph embedding scale (it cancels from the kernel
     value). Returns ``(AnisotropicCovariance, sigma2)``.
     """
@@ -257,7 +274,10 @@ def kernel_from_K2d(
     chord_c = 2.0 * np.sin(np.radians(theta_c) / 2.0)
     KG = np.log1p(np.clip(np.asarray(xi_true, np.float64), 0.0, None))
 
-    lthetas = np.geomspace(0.5 * chord_c[0], 2.0 * chord_c[-1], n_ltheta)
+    lt_min = 0.5 * chord_c[0]
+    if theta_cap_deg:
+        lt_min = max(lt_min, 2.0 * np.sin(np.radians(theta_cap_deg) / 2.0))
+    lthetas = np.geomspace(lt_min, 2.0 * chord_c[-1], n_ltheta)
     lzs = np.geomspace(0.5 * max(z_c[0], 1e-4), 2.0 * z_c[-1], n_lz)
     cols, scales = [], []
     for lt in lthetas:
