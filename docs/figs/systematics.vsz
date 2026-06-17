@@ -1,0 +1,219 @@
+# Veusz saved document (version 4.2)
+SetCompatLevel(0)
+Set('width', '28cm')
+Set('height', '12cm')
+Set('StyleSheet/Font/font', 'Helvetica')
+Set('StyleSheet/Font/size', '11pt')
+Set('StyleSheet/axis/Line/width', '0.8pt')
+ImportString('d1x(numeric)','''
+6.080209e-02
+8.991155e-02
+1.329574e-01
+1.966118e-01
+2.907412e-01
+4.299357e-01
+6.357707e-01
+9.401508e-01
+1.390255e+00
+2.055850e+00
+''')
+ImportString('d1y(numeric),+-','''
+3.305218e-01 1.229707e-02
+2.373932e-01 9.228031e-03
+1.925334e-01 4.099514e-03
+1.280145e-01 3.967409e-03
+9.186333e-02 2.726573e-03
+6.450466e-02 2.812068e-03
+4.160614e-02 1.204328e-03
+2.498173e-02 1.233099e-03
+1.339714e-02 7.679801e-04
+6.427965e-03 7.559190e-04
+''')
+ImportString('d2x(numeric)','''
+6.080209e-02
+8.991155e-02
+1.329574e-01
+1.966118e-01
+2.907412e-01
+4.299357e-01
+6.357707e-01
+9.401508e-01
+1.390255e+00
+2.055850e+00
+''')
+ImportString('d2y(numeric),+-','''
+3.287111e-01 1.260882e-02
+2.360281e-01 7.391469e-03
+1.931805e-01 4.429015e-03
+1.286766e-01 3.703491e-03
+9.203785e-02 2.418854e-03
+6.466806e-02 2.166180e-03
+4.163962e-02 1.356589e-03
+2.487561e-02 1.265074e-03
+1.336656e-02 8.116175e-04
+6.371161e-03 6.085388e-04
+''')
+ImportString('d3x(numeric)','''
+6.080209e-02
+8.991155e-02
+1.329574e-01
+1.966118e-01
+2.907412e-01
+4.299357e-01
+6.357707e-01
+9.401508e-01
+1.390255e+00
+2.055850e+00
+''')
+ImportString('d3y(numeric)','''
+1.454043e-01
+1.642761e-01
+1.517563e-01
+1.726226e-01
+6.783706e-02
+6.564678e-02
+2.614389e-02
+8.496013e-02
+3.871673e-02
+8.326214e-02
+''')
+ImportString('d4x(numeric)','''
+6.080209e-02
+2.055850e+00
+''')
+ImportString('d4y(numeric)','''
+1.000000e+00
+1.000000e+00
+''')
+Add('page', name='page1', autoadd=False)
+To('page1')
+Add('grid', name='grid1', autoadd=False)
+To('grid1')
+Set('rows', 1)
+Set('columns', 2)
+Set('leftMargin', '0.4cm')
+Set('rightMargin', '0.2cm')
+Set('topMargin', '0.2cm')
+Set('bottomMargin', '0.4cm')
+Set('internalMargin', '0.5cm')
+Add('graph', name='g0', autoadd=False)
+To('g0')
+Add('axis', name='x', autoadd=False)
+To('x')
+Set('label', 'theta [deg]')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', True)
+To('..')
+Add('axis', name='y', autoadd=False)
+To('y')
+Set('label', 'w(theta)')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', True)
+Set('direction', 'vertical')
+To('..')
+Add('label', name='title', autoadd=False)
+To('title')
+Set('label', 'ensemble w(theta): two completion priors')
+Set('xPos', [0.5])
+Set('yPos', [1.04])
+Set('alignHorz', 'centre')
+Set('Text/size', '11pt')
+To('..')
+Add('xy', name='xy1', autoadd=False)
+To('xy1')
+Set('xData', 'd1x')
+Set('yData', 'd1y')
+Set('marker', 'circle')
+Set('markerSize', '3pt')
+Set('key', 'photo-z x clustering')
+Set('PlotLine/hide', False)
+Set('PlotLine/color', '#3a6ea8')
+Set('PlotLine/style', 'solid')
+Set('PlotLine/width', '1.5pt')
+Set('MarkerFill/color', '#3a6ea8')
+Set('MarkerLine/color', '#3a6ea8')
+Set('MarkerLine/transparency', 0)
+Set('MarkerFill/transparency', 0)
+Set('errorStyle', 'barends')
+Set('ErrorBarLine/color', '#3a6ea8')
+To('..')
+Add('xy', name='xy2', autoadd=False)
+To('xy2')
+Set('xData', 'd2x')
+Set('yData', 'd2y')
+Set('marker', 'square')
+Set('markerSize', '3pt')
+Set('key', 'photo-z only')
+Set('PlotLine/hide', False)
+Set('PlotLine/color', '#c0392b')
+Set('PlotLine/style', 'dashed')
+Set('PlotLine/width', '1.5pt')
+Set('MarkerFill/color', '#c0392b')
+Set('MarkerLine/color', '#c0392b')
+Set('MarkerLine/transparency', 0)
+Set('MarkerFill/transparency', 0)
+Set('errorStyle', 'barends')
+Set('ErrorBarLine/color', '#c0392b')
+To('..')
+To('..')
+Add('graph', name='g1', autoadd=False)
+To('g1')
+Add('axis', name='x', autoadd=False)
+To('x')
+Set('label', 'theta [deg]')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', True)
+To('..')
+Add('axis', name='y', autoadd=False)
+To('y')
+Set('label', 'Delta_sys / sigma_stat')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', False)
+Set('direction', 'vertical')
+To('..')
+Add('label', name='title', autoadd=False)
+To('title')
+Set('label', 'prior-systematic budget')
+Set('xPos', [0.5])
+Set('yPos', [1.04])
+Set('alignHorz', 'centre')
+Set('Text/size', '11pt')
+To('..')
+Add('xy', name='xy3', autoadd=False)
+To('xy3')
+Set('xData', 'd3x')
+Set('yData', 'd3y')
+Set('marker', 'circle')
+Set('markerSize', '3pt')
+Set('PlotLine/hide', False)
+Set('PlotLine/color', '#333333')
+Set('PlotLine/style', 'solid')
+Set('PlotLine/width', '1.5pt')
+Set('MarkerFill/color', '#333333')
+Set('MarkerLine/color', '#333333')
+Set('MarkerLine/transparency', 0)
+Set('MarkerFill/transparency', 0)
+To('..')
+Add('xy', name='xy4', autoadd=False)
+To('xy4')
+Set('xData', 'd4x')
+Set('yData', 'd4y')
+Set('marker', 'none')
+Set('markerSize', '3pt')
+Set('key', 'systematic = statistical')
+Set('PlotLine/hide', False)
+Set('PlotLine/color', '#c0392b')
+Set('PlotLine/style', 'dashed')
+Set('PlotLine/width', '1.5pt')
+Set('MarkerFill/color', '#c0392b')
+Set('MarkerLine/color', '#c0392b')
+Set('MarkerLine/transparency', 0)
+Set('MarkerFill/transparency', 0)
+To('..')
+To('..')
+To('..')
+To('..')

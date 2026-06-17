@@ -421,12 +421,15 @@ th,td{padding:5px 14px;text-align:left;border-bottom:1px solid #e6e6e6;} th{back
 
 
 def render(D, figs, Dm, Dc):
+    from tools.veusz_vsz import EMBED_SCRIPT
     g = lambda k: float(D[k])
-    img = lambda k: f'<figure><img src="data:image/png;base64,{figs[k]}"/>'
+    # each figure is a browser-editable Veusz embed (figs[k] is the <veusz-figure> tag)
+    img = lambda k: f'<figure>{figs[k]}'
     date = datetime.date.today().isoformat()
     H = []
     H.append(f"<!doctype html><html><head><meta charset='utf-8'>"
              f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+             f"{EMBED_SCRIPT}"
              f"<title>Photo-z completion of the BOSS CMASS catalog</title><style>{CSS}</style></head><body>")
     H.append("<h1>Imaging-informed completion of the BOSS CMASS catalog</h1>")
     H.append(f"<div class='sub'>Cosmology-free correction of spectroscopic incompleteness "
@@ -439,6 +442,11 @@ def render(D, figs, Dm, Dc):
             ("scatter", "Scatter &amp; systematics"),
             ("meaning", "What it means"), ("future", "Future")]) + "</nav>")
 
+    H.append("<div class='callout'>Every figure below is a <b>live, browser-editable Veusz figure</b> "
+             "(rendered in-browser via WASM, no server): drag to pan, scroll to zoom, double-click to "
+             "edit axes, colours, markers and fonts, and re-export — adjust any plot to taste. RA axes "
+             "are wrapped and drawn increasing leftwards so the CMASS-South cap is contiguous and "
+             "centred near 0. First render fetches the embed engine, so allow a moment.</div>")
     H.append(f"""<div class='metric-grid'>
       <div>Observed galaxies: <b>{int(D['N_obs']):,}</b></div>
       <div>Missing fraction: <b>{100*g('miss_frac'):.1f}%</b></div>
@@ -605,6 +613,18 @@ def render(D, figs, Dm, Dc):
              "to or larger than the correlation length are weakly constrained (the realizations span "
              "that uncertainty). This is an optional hole-free field product, separate from the "
              "unbiased masked clustering catalogs.</figcaption></figure>")
+    H.append(f"<p>To judge how well the transplant works, here are <b>{int(Dm['n_gallery'])} interior "
+             f"holes</b> shown before and after. Each row is one hole: <b>left</b> the observed "
+             f"galaxies around the empty region (the gap is plainly visible); <b>right</b> the same "
+             f"region after inpainting, with the transplanted galaxies in blue at 70% opacity so any "
+             f"overlap with the real galaxies is visible. The fill follows the surrounding density and "
+             f"carries real redshifts and colours.</p>")
+    H.append(img("inpaint_gallery") + "<figcaption>Before/after for "
+             f"{int(Dm['n_gallery'])} interior mask holes (each row: observed | inpainted). Inpainted "
+             "galaxies are drawn semi-transparent (alpha 0.7). All panels share the astronomical RA "
+             "convention (increasing leftwards), wrapped so the South cap is contiguous. Like every "
+             "figure here, this is a live Veusz embed — zoom, restyle, or re-export it in "
+             "place.</figcaption></figure>")
 
     # --- selection coupling + validation (Wechsler v0 lessons, cosmology-free) ---
     gc = lambda k: float(Dc[k])
@@ -752,8 +772,36 @@ def compute_mask():
     big = max(holes, key=lambda h: h.radius_deg if h.radius_deg < 0.5 else 0)
     bx = lambda ra, dec: (np.abs(((ra-big.ra+180)%360)-180) < 1.0) & (np.abs(dec-big.dec) < 1.0)
     mb_o = bx(ra_d, dec_d); mb_i = bx(real["ra"], real["dec"])
+
+    # ---- inpaint GALLERY: many holes, before (observed) vs after (inpainted) ----
+    # work in wrapped RA so holes near RA=0/360 are contiguous; store per-hole.
+    wrap = lambda r: ((np.asarray(r, float) + 180.0) % 360.0) - 180.0
+    hid_all = real["hole_id"].astype(int)
+    per_hole = np.bincount(hid_all, minlength=len(holes))
+    ra_d_w = wrap(ra_d); inp_ra_w = wrap(real["ra"])
+    # show the most-filled visible holes (clearest before/after); honest counts.
+    cand = [hi for hi, h in enumerate(holes)
+            if per_hole[hi] >= 1 and 0.05 <= h.radius_deg <= 0.7]
+    cand.sort(key=lambda hi: -per_hole[hi])
+    cand = cand[:12]
+    g_ra, g_dec, g_hid, i_ra, i_dec, i_hid = [], [], [], [], [], []
+    c_ra, c_dec, c_rad, c_box = [], [], [], []
+    for k, hi in enumerate(cand):
+        h = holes[hi]; cw = wrap(h.ra); cd = h.dec
+        R = max(2.5 * h.radius_deg, 0.22)
+        cosd = np.cos(np.radians(cd))
+        mo = (np.abs((ra_d_w - cw) * cosd) < R) & (np.abs(dec_d - cd) < R)
+        mi = (hid_all == hi)
+        g_ra.append(ra_d_w[mo]); g_dec.append(dec_d[mo]); g_hid.append(np.full(int(mo.sum()), k))
+        i_ra.append(inp_ra_w[mi]); i_dec.append(real["dec"][mi]); i_hid.append(np.full(int(mi.sum()), k))
+        c_ra.append(cw); c_dec.append(cd); c_rad.append(h.radius_deg); c_box.append(R)
+    cat_ = lambda L: (np.concatenate(L) if L else np.zeros(0))
     return {
         "sky_ra": ra_d[sub], "sky_dec": dec_d[sub],
+        "gal_ra": cat_(g_ra), "gal_dec": cat_(g_dec), "gal_hid": cat_(g_hid),
+        "inp_ra": cat_(i_ra), "inp_dec": cat_(i_dec), "inp_hid": cat_(i_hid),
+        "gcen_ra": np.array(c_ra), "gcen_dec": np.array(c_dec),
+        "grad": np.array(c_rad), "gbox": np.array(c_box), "n_gallery": len(cand),
         "hole_ra": np.array([h.ra for h in holes]), "hole_dec": np.array([h.dec for h in holes]),
         "hole_rad": np.array([h.radius_deg for h in holes]),
         "hole_area_tot": float(sum(h.area_deg2 for h in holes)), "n_holes": len(holes),
@@ -944,14 +992,30 @@ def main():
     D = get_data(recompute=args.recompute, quick=args.quick)
     Dm = get_mask_data(recompute=args.recompute)
     Dc = get_coupling_data(recompute=args.recompute)
-    print("[figures] rendering ...")
-    figs = {"data": fig_data(D), "weights": fig_weights(D), "colorz": fig_colorz(D),
-            "photoz": fig_photoz(D), "clpair": fig_clpair(D), "missing": fig_missing(D),
-            "samples": fig_samples(D), "wtheta": fig_wtheta(D), "2d": fig_2d(D),
-            "systematics": fig_systematics(D), "mask": fig_mask(Dm), "inpaint": fig_inpaint(Dm),
-            "coupling": fig_coupling(Dc), "trust": fig_trust(Dc)}
+    print("[figures] building interactive Veusz (.vsz) figures ...")
+    import shutil
+    import demos.veusz_report_figs as RF
+    figs_dir = "docs/figs"
+    if os.path.isdir(figs_dir):
+        shutil.rmtree(figs_dir)
+    os.makedirs(figs_dir, exist_ok=True)
+    figs = {
+        "data": RF.footprint(D, figs_dir), "weights": RF.weights(D, figs_dir),
+        "colorz": RF.colorz(D, figs_dir), "photoz": RF.photoz(D, figs_dir),
+        "clpair": RF.clpair(D, figs_dir), "missing": RF.missing(D, figs_dir),
+        "samples": RF.samples_nz(D, figs_dir), "wtheta": RF.wtheta(D, figs_dir),
+        "2d": RF.xi2d(D, figs_dir), "systematics": RF.systematics(D, figs_dir),
+        "mask": RF.mask(Dm, figs_dir), "inpaint": RF.inpaint_closure(Dm, figs_dir),
+        "inpaint_gallery": RF.inpaint_gallery(Dm, figs_dir),
+        "coupling": RF.coupling(Dc, figs_dir), "trust": RF.trust(Dc, figs_dir),
+    }
+    print(f"[figures] wrote {len(os.listdir(figs_dir))} .vsz files to {figs_dir}")
     html = render(D, figs, Dm, Dc)
     os.makedirs("output", exist_ok=True); os.makedirs("docs", exist_ok=True)
+    # the embed loads .vsz via relative 'figs/...'; mirror the dir next to each HTML
+    if os.path.isdir("output/figs"):
+        shutil.rmtree("output/figs")
+    shutil.copytree(figs_dir, "output/figs")
     for path in ["output/completion_presentation.html", "docs/completion.html"]:
         with open(path, "w") as f:
             f.write(html)

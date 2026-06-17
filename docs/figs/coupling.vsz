@@ -1,0 +1,265 @@
+# Veusz saved document (version 4.2)
+SetCompatLevel(0)
+Set('width', '30cm')
+Set('height', '13cm')
+Set('StyleSheet/Font/font', 'Helvetica')
+Set('StyleSheet/Font/size', '11pt')
+Set('StyleSheet/axis/Line/width', '0.8pt')
+ImportString('d1x(numeric)','''
+-3.902439e-01
+-2.200000e-01
+-9.677419e-02
+1.250195e-02
+1.287129e-01
+2.619048e-01
+4.368932e-01
+7.391304e-01
+''')
+ImportString('d1y(numeric),+-','''
+9.880092e-01 9.250665e-04
+9.855031e-01 1.015096e-03
+9.851820e-01 1.024742e-03
+9.881380e-01 9.179598e-04
+9.860951e-01 9.939135e-04
+9.865613e-01 9.761119e-04
+9.867626e-01 9.693943e-04
+9.854781e-01 1.014313e-03
+''')
+ImportString('d2x(numeric)','''
+-3.877551e-01
+-2.183908e-01
+-9.473684e-02
+1.492537e-02
+1.304348e-01
+2.631579e-01
+4.382022e-01
+7.391304e-01
+''')
+ImportString('d2y(numeric),+-','''
+9.663696e-01 1.504286e-03
+9.574007e-01 1.689044e-03
+9.560531e-01 1.709269e-03
+9.506939e-01 1.808053e-03
+9.521395e-01 1.779173e-03
+9.480781e-01 1.849746e-03
+9.519104e-01 1.784886e-03
+9.502924e-01 1.813436e-03
+''')
+ImportString('d3x(numeric)','''
+1.202550e-01
+1.739038e-01
+2.514867e-01
+3.636813e-01
+5.259289e-01
+7.605591e-01
+1.099864e+00
+1.590541e+00
+2.300123e+00
+3.326266e+00
+''')
+ImportString('d3y(numeric)','''
+1.962513e-01
+1.468670e-01
+1.076002e-01
+7.340023e-02
+5.079428e-02
+3.433791e-02
+1.963392e-02
+9.312718e-03
+5.922536e-03
+3.252061e-03
+''')
+ImportString('d4x(numeric)','''
+1.202550e-01
+1.739038e-01
+2.514867e-01
+3.636813e-01
+5.259289e-01
+7.605591e-01
+1.099864e+00
+1.590541e+00
+2.300123e+00
+3.326266e+00
+''')
+ImportString('d4y(numeric)','''
+2.082005e-01
+1.462956e-01
+1.073018e-01
+7.580739e-02
+5.111332e-02
+3.370510e-02
+1.957028e-02
+8.757476e-03
+5.214290e-03
+2.748796e-03
+''')
+ImportString('d5x(numeric)','''
+1.202550e-01
+1.739038e-01
+2.514867e-01
+3.636813e-01
+5.259289e-01
+7.605591e-01
+1.099864e+00
+1.590541e+00
+2.300123e+00
+3.326266e+00
+''')
+ImportString('d5y(numeric)','''
+1.726147e-01
+1.310090e-01
+9.792716e-02
+6.783529e-02
+4.815769e-02
+3.312416e-02
+1.876632e-02
+1.031188e-02
+6.399151e-03
+3.593325e-03
+''')
+Add('page', name='page1', autoadd=False)
+To('page1')
+Add('grid', name='grid1', autoadd=False)
+To('grid1')
+Set('rows', 1)
+Set('columns', 2)
+Set('leftMargin', '0.4cm')
+Set('rightMargin', '0.2cm')
+Set('topMargin', '0.2cm')
+Set('bottomMargin', '0.4cm')
+Set('internalMargin', '0.5cm')
+Add('graph', name='g0', autoadd=False)
+To('g0')
+Add('axis', name='x', autoadd=False)
+To('x')
+Set('label', 'local success overdensity delta')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', False)
+To('..')
+Add('axis', name='y', autoadd=False)
+To('y')
+Set('label', 'redshift-success fraction S(delta)')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', False)
+Set('direction', 'vertical')
+To('..')
+Add('label', name='title', autoadd=False)
+To('title')
+Set('label', 'density coupling of selection')
+Set('xPos', [0.5])
+Set('yPos', [1.04])
+Set('alignHorz', 'centre')
+Set('Text/size', '11pt')
+To('..')
+Add('xy', name='xy1', autoadd=False)
+To('xy1')
+Set('xData', 'd1x')
+Set('yData', 'd1y')
+Set('marker', 'circle')
+Set('markerSize', '4pt')
+Set('key', 'redshift failures: h=-0.06 (z=-0.7)')
+Set('PlotLine/hide', False)
+Set('PlotLine/color', '#7b3ff2')
+Set('PlotLine/style', 'solid')
+Set('PlotLine/width', '1.5pt')
+Set('MarkerFill/color', '#7b3ff2')
+Set('MarkerLine/color', '#7b3ff2')
+Set('MarkerLine/transparency', 0)
+Set('MarkerFill/transparency', 0)
+Set('errorStyle', 'barends')
+Set('ErrorBarLine/color', '#7b3ff2')
+To('..')
+Add('xy', name='xy2', autoadd=False)
+To('xy2')
+Set('xData', 'd2x')
+Set('yData', 'd2y')
+Set('marker', 'circle')
+Set('markerSize', '4pt')
+Set('key', 'fiber collisions: h=-0.24 (z=-4.5)')
+Set('PlotLine/hide', False)
+Set('PlotLine/color', '#e8853a')
+Set('PlotLine/style', 'solid')
+Set('PlotLine/width', '1.5pt')
+Set('MarkerFill/color', '#e8853a')
+Set('MarkerLine/color', '#e8853a')
+Set('MarkerLine/transparency', 0)
+Set('MarkerFill/transparency', 0)
+Set('errorStyle', 'barends')
+Set('ErrorBarLine/color', '#e8853a')
+To('..')
+To('..')
+Add('graph', name='g1', autoadd=False)
+To('g1')
+Add('axis', name='x', autoadd=False)
+To('x')
+Set('label', 'theta [deg]')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', True)
+To('..')
+Add('axis', name='y', autoadd=False)
+To('y')
+Set('label', 'w(theta)')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', True)
+Set('direction', 'vertical')
+To('..')
+Add('label', name='title', autoadd=False)
+To('title')
+Set('label', 'spurious large-scale power (MegaZ test)')
+Set('xPos', [0.5])
+Set('yPos', [1.04])
+Set('alignHorz', 'centre')
+Set('Text/size', '11pt')
+To('..')
+Add('xy', name='xy3', autoadd=False)
+To('xy3')
+Set('xData', 'd3x')
+Set('yData', 'd3y')
+Set('marker', 'none')
+Set('markerSize', '3pt')
+Set('key', 'weighted baseline')
+Set('PlotLine/hide', False)
+Set('PlotLine/color', '#000000')
+Set('PlotLine/style', 'solid')
+Set('PlotLine/width', '1.5pt')
+Set('MarkerFill/color', '#000000')
+Set('MarkerLine/color', '#000000')
+Set('MarkerLine/transparency', 0)
+Set('MarkerFill/transparency', 0)
+To('..')
+Add('xy', name='xy4', autoadd=False)
+To('xy4')
+Set('xData', 'd4x')
+Set('yData', 'd4y')
+Set('marker', 'circle')
+Set('markerSize', '3pt')
+Set('key', 'completion (real positions)')
+Set('PlotLine/hide', True)
+Set('MarkerFill/color', '#3a6ea8')
+Set('MarkerLine/color', '#3a6ea8')
+Set('MarkerLine/transparency', 15)
+Set('MarkerFill/transparency', 15)
+To('..')
+Add('xy', name='xy5', autoadd=False)
+To('xy5')
+Set('xData', 'd5x')
+Set('yData', 'd5y')
+Set('marker', 'square')
+Set('markerSize', '3pt')
+Set('key', 'density-blind null')
+Set('PlotLine/hide', False)
+Set('PlotLine/color', '#c0392b')
+Set('PlotLine/style', 'dashed')
+Set('PlotLine/width', '1.5pt')
+Set('MarkerFill/color', '#c0392b')
+Set('MarkerLine/color', '#c0392b')
+Set('MarkerLine/transparency', 15)
+Set('MarkerFill/transparency', 15)
+To('..')
+To('..')
+To('..')
+To('..')
