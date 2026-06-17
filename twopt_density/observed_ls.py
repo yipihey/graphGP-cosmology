@@ -99,6 +99,78 @@ def measure_K2d(
     return theta_edges, z_edges, xi
 
 
+def complete_catalog(
+    catalog,
+    *,
+    seed: int = 0,
+    collision_scale_deg: float = 62.0 / 3600.0,
+    count: str = "poisson",
+    z_assign: str = "host",
+    verbose: bool = False,
+):
+    """One equal-weight realization of the systematics-corrected catalog.
+
+    Replaces the FKP×completeness *weighting* with an explicit *completion*: keep
+    the observed galaxies and add the ones the completeness weights say are
+    missing (fiber collisions w_cp, redshift failures w_noz, imaging systematics
+    w_systot — **not** FKP, which is an estimator weight). Each galaxy is
+    realized ``n_i`` times with E[n_i] = w_c,i = w_systot·(w_cp+w_noz−1) (the
+    BOSS completeness weight); the extra copies are placed within the unresolved
+    collision scale of the host, so the **equal-weight** catalog reproduces the
+    **w_c-weighted** clustering at resolved separations (θ ≳ collision scale)
+    by construction (Σ nᵢnⱼ → Σ w_c,i w_c,j), while recovering the close-pair
+    structure the weighting cannot. ``count='poisson'`` makes the integer counts
+    stochastic (so realizations also span the missing-number shot noise);
+    ``count='round'`` is deterministic. ``z_assign`` controls the added galaxies'
+    redshift: ``'host'`` (clustered, = nearest-neighbour correction), ``'nz'``
+    (drawn from the global n(z), background), or ``'mix'`` (half/half) — the
+    small-scale prior to scan across realizations.
+
+    Returns ``dict(ra, dec, z, N)`` — an equal-weight catalog.
+    """
+    rng = np.random.default_rng(seed)
+    ra = np.asarray(catalog.ra_data, np.float64)
+    dec = np.asarray(catalog.dec_data, np.float64)
+    z = np.asarray(catalog.z_data, np.float64)
+    one = np.ones(len(ra))
+    wsys = np.asarray(catalog.w_sys_data if catalog.w_sys_data is not None else one)
+    wcp = np.asarray(catalog.w_cp_data if catalog.w_cp_data is not None else one)
+    wnoz = np.asarray(catalog.w_noz_data if catalog.w_noz_data is not None else one)
+    w_c = wsys * (wcp + wnoz - 1.0)                       # completeness weight
+
+    n = (rng.poisson(w_c) if count == "poisson"
+         else np.floor(w_c + rng.random(len(w_c))).astype(int))  # randomized round
+    n_extra = np.maximum(n - 1, 0)
+    keep = n > 0                                          # base copy kept iff n≥1
+
+    ra_out = [ra[keep]]; dec_out = [dec[keep]]; z_out = [z[keep]]
+    # extra copies: one host index repeated n_extra times
+    host = np.repeat(np.arange(len(ra)), n_extra)
+    m = len(host)
+    if m:
+        # jitter angular position within the collision scale (a 2-D Gaussian
+        # well below the smallest measured bin) so copies are not exact duplicates
+        s = np.radians(collision_scale_deg) / 3.0
+        dra = np.degrees(rng.normal(0, s, m) / np.cos(np.radians(dec[host])))
+        ddec = np.degrees(rng.normal(0, s, m))
+        ra_e = ra[host] + dra; dec_e = dec[host] + ddec
+        if z_assign == "host":
+            z_e = z[host]
+        elif z_assign == "nz":
+            z_e = rng.choice(z, m)
+        else:  # mix
+            clustered = rng.random(m) < 0.5
+            z_e = np.where(clustered, z[host], rng.choice(z, m))
+        ra_out.append(ra_e); dec_out.append(dec_e); z_out.append(z_e)
+
+    ra_f = np.concatenate(ra_out); dec_f = np.concatenate(dec_out); z_f = np.concatenate(z_out)
+    if verbose:
+        print(f"[complete] N_obs={len(ra):,} -> N_eq={len(ra_f):,} "
+              f"(+{100*(len(ra_f)/len(ra)-1):.1f}%, {m:,} added, z_assign={z_assign})")
+    return {"ra": ra_f.astype(np.float32), "dec": dec_f.astype(np.float32),
+            "z": z_f.astype(np.float32), "N": len(ra_f)}
+
+
 def generate_catalogs_from_kernel(
     catalog, cov, sigma2,
     *,
