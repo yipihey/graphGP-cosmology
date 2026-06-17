@@ -117,6 +117,14 @@ class BOSSCatalog:
     w_cp_data:   Optional[np.ndarray] = None  # WEIGHT_CP     (fiber collision close pairs)
     w_fkp_data:  Optional[np.ndarray] = None  # WEIGHT_FKP    (FKP statistical weight)
 
+    # Optional ugriz photometry of the observed galaxies (with_photometry=True),
+    # used to train a colour→z photo-z for completing the missing galaxies.
+    mags_data:      Optional[np.ndarray] = None  # (N,5) extinction-corrected ugriz mags
+    colors_data:    Optional[np.ndarray] = None  # (N,4) u-g,g-r,r-i,i-z
+    colors_finite:  Optional[np.ndarray] = None  # (N,) all-bands-finite mask
+    imatch_data:    Optional[np.ndarray] = None  # spectroscopic match status
+    icollided_data: Optional[np.ndarray] = None  # fiber-collision flag
+
     @property
     def N_data(self) -> int:
         return len(self.ra_data)
@@ -136,15 +144,38 @@ class BOSSCatalog:
         return positions, randoms, box_size
 
 
+def fluxes_to_colors(modelflux, extinction):
+    """ugriz model fluxes (nanomaggies) + per-band extinction → mags, colors.
+
+    ``mag = 22.5 − 2.5·log10(flux) − extinction`` (SDSS asinh→Pogson is fine here
+    for the bright CMASS targets). Colors are the four adjacent differences
+    (u−g, g−r, r−i, i−z). Non-positive fluxes give non-finite mags; the returned
+    ``finite`` mask flags rows with all five mags finite. Use this SAME definition
+    for training galaxies and for the photometric targets, or the photo-z match
+    is biased.
+    """
+    flux = np.asarray(modelflux, dtype=np.float64)
+    ext = np.asarray(extinction, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mags = 22.5 - 2.5 * np.log10(flux) - ext
+    colors = mags[:, :-1] - mags[:, 1:]          # (N,4): u-g, g-r, r-i, i-z
+    finite = np.isfinite(mags).all(axis=1)
+    return mags, colors, finite
+
+
 def _read_boss_fits(
     path: str,
     with_weight_fkp: bool = True,
+    with_photometry: bool = False,
 ) -> tuple:
-    """Read RA/DEC/Z and all weight components from a BOSS LSS FITS file.
+    """Read RA/DEC/Z and weight components from a BOSS LSS FITS file.
 
-    Returns (ra, dec, z, w_total, w_sys, w_noz, w_cp, w_fkp) so callers
-    can preserve individual components for weight-budget decomposition.
-    Falls back gracefully when any column is absent (treats as 1).
+    Returns ``(ra, dec, z, w_total, w_sys, w_noz, w_cp, w_fkp, phot)`` where
+    ``phot`` is ``None`` unless ``with_photometry`` is set, in which case it is a
+    dict with ``mags`` (N,5), ``colors`` (N,4), ``finite`` (N,), ``imatch``,
+    ``icollided`` — the ugriz photometry (extinction-corrected) and spectroscopic
+    bookkeeping needed to train a colour→z photo-z. Falls back gracefully when a
+    column is absent (treats as 1 / NaN).
     """
     from astropy.io import fits
 
@@ -167,7 +198,21 @@ def _read_boss_fits(
         w_fkp = _get("WEIGHT_FKP") if with_weight_fkp else np.ones(len(t))
         w = w_sys * w_noz * w_cp * (w_fkp if with_weight_fkp else 1.0)
 
-    return ra, dec, z, w, w_sys, w_noz, w_cp, w_fkp
+        phot = None
+        if with_photometry and "MODELFLUX" in cols:
+            modelflux = np.asarray(t["MODELFLUX"], dtype=np.float64)
+            ext = (np.asarray(t["EXTINCTION"], dtype=np.float64)
+                   if "EXTINCTION" in cols else np.zeros_like(modelflux))
+            mags, colors, finite = fluxes_to_colors(modelflux, ext)
+            phot = {
+                "mags": mags, "colors": colors, "finite": finite,
+                "imatch": (np.asarray(t["IMATCH"], dtype=np.int64)
+                           if "IMATCH" in cols else np.ones(len(t), np.int64)),
+                "icollided": (np.asarray(t["ICOLLIDED"], dtype=np.int64)
+                              if "ICOLLIDED" in cols else np.zeros(len(t), np.int64)),
+            }
+
+    return ra, dec, z, w, w_sys, w_noz, w_cp, w_fkp, phot
 
 
 def load_boss(
@@ -179,6 +224,7 @@ def load_boss(
     nside: int = 256,
     n_random_max: Optional[int] = None,
     with_weight_fkp: bool = True,
+    with_photometry: bool = False,
     simbig_sgc_cuts: bool = True,
     rng_seed: int = 0,
 ) -> BOSSCatalog:
@@ -225,9 +271,10 @@ def load_boss(
 
     ra_l, dec_l, z_l, w_l = [], [], [], []
     ws_l, wn_l, wc_l, wf_l = [], [], [], []   # individual components
+    ph_l = []                                 # photometry sub-dicts (or None)
     for p in data_paths:
-        ra, dec, z, w, w_sys, w_noz, w_cp, w_fkp = _read_boss_fits(
-            p, with_weight_fkp=with_weight_fkp)
+        ra, dec, z, w, w_sys, w_noz, w_cp, w_fkp, phot = _read_boss_fits(
+            p, with_weight_fkp=with_weight_fkp, with_photometry=with_photometry)
         m = np.isfinite(w) & (w > 0) & (z >= z_min) & (z <= z_max)
         if simbig_sgc_cuts:
             m = m & _in_sgc_footprint(ra, dec, dec_min=dec_min)
@@ -235,6 +282,8 @@ def load_boss(
         z_l.append(z[m]); w_l.append(w[m])
         ws_l.append(w_sys[m]); wn_l.append(w_noz[m])
         wc_l.append(w_cp[m]);  wf_l.append(w_fkp[m])
+        if phot is not None:
+            ph_l.append({k: v[m] for k, v in phot.items()})
 
     ra_data = np.concatenate(ra_l)
     dec_data = np.concatenate(dec_l)
@@ -245,11 +294,20 @@ def load_boss(
     w_cp_data  = np.concatenate(wc_l)
     w_fkp_data = np.concatenate(wf_l)
     xyz_data = radec_z_to_cartesian(ra_data, dec_data, z_data, fid_cosmo)
+    if ph_l:
+        mags_data = np.concatenate([d["mags"] for d in ph_l])
+        colors_data = np.concatenate([d["colors"] for d in ph_l])
+        colors_finite = np.concatenate([d["finite"] for d in ph_l])
+        imatch_data = np.concatenate([d["imatch"] for d in ph_l])
+        icollided_data = np.concatenate([d["icollided"] for d in ph_l])
+    else:
+        mags_data = colors_data = colors_finite = imatch_data = icollided_data = None
 
     if randoms_paths is not None:
         ra_rl, dec_rl, z_rl, w_rl = [], [], [], []
         for p in randoms_paths:
-            ra, dec, z, w, *_ = _read_boss_fits(p, with_weight_fkp=with_weight_fkp)
+            ra, dec, z, w, *_ = _read_boss_fits(p, with_weight_fkp=with_weight_fkp,
+                                                with_photometry=False)
             m = np.isfinite(w) & (w > 0) & (z >= z_min) & (z <= z_max)
             if simbig_sgc_cuts:
                 m = m & _in_sgc_footprint(ra, dec, dec_min=dec_min)
@@ -292,6 +350,8 @@ def load_boss(
         photsys_data=photsys_d, photsys_random=photsys_r,
         w_sys_data=w_sys_data, w_noz_data=w_noz_data,
         w_cp_data=w_cp_data,   w_fkp_data=w_fkp_data,
+        mags_data=mags_data, colors_data=colors_data, colors_finite=colors_finite,
+        imatch_data=imatch_data, icollided_data=icollided_data,
     )
 
 
