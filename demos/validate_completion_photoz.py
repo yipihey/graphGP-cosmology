@@ -20,8 +20,9 @@ from twopt_density.boss import load_boss
 from twopt_density.quaia import make_random_from_selection_function
 from twopt_density.photoz import PhotoZKNN, photoz_features
 from twopt_density.cmass_targets import load_cmass_targets
-from twopt_density.observed_ls import (measure_K2d, complete_catalog_photoz,
+from twopt_density.observed_ls import (measure_K2d, compute_rr, complete_catalog_photoz,
                                        measure_close_pair_dz)
+from twopt_density import perf
 
 COLL = 62.0 / 3600.0
 
@@ -62,14 +63,15 @@ def main():
         z_data=np.asarray(cat.z_data), nside=cat.nside, rng=rng)
     wr = np.ones(len(rar))
 
+    rr_full = compute_rr(rar, decr, zr, wr, theta_edges=te, z_edges=ze)  # randoms fixed
     _, _, xw = measure_K2d(cat.ra_data, cat.dec_data, cat.z_data, w_c,
-                           rar, decr, zr, wr, theta_edges=te, z_edges=ze)
+                           rar, decr, zr, wr, theta_edges=te, z_edges=ze, precomp_rr=rr_full)
     X = []
     for s in range(args.n_real):
         c = complete_catalog_photoz(cat, targets, pz, seed=s, dz_pool=dz_pool,
                                     verbose=(s == 0))
         _, _, xe = measure_K2d(c["ra"], c["dec"], c["z"], np.ones(c["N"]),
-                               rar, decr, zr, wr, theta_edges=te, z_edges=ze)
+                               rar, decr, zr, wr, theta_edges=te, z_edges=ze, precomp_rr=rr_full)
         X.append(xe)
     X = np.array(X); xm = X.mean(0)[:, 0]; xs = X.std(0)[:, 0]; xw0 = xw[:, 0]
 
@@ -101,6 +103,7 @@ def main():
     dens_t = np.bincount(pix_t, minlength=12 * ns**2).astype(float)
     r = np.corrcoef(dens_c[occ], dens_t[occ])[0, 1]
     print(f"\nangular density per nside={ns} pixel: corr(completed, observed+targets)={r:.3f}")
+    perf.report("validate_completion_photoz")
 
 
 if __name__ == "__main__":

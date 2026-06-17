@@ -24,15 +24,17 @@ from twopt_density.quaia import make_random_from_selection_function
 from twopt_density.photoz import PhotoZKNN, photoz_features
 from twopt_density.cmass_targets import load_cmass_targets
 from twopt_density.observed_ls import complete_catalog_photoz, measure_close_pair_dz
+from twopt_density import perf
 
 COLL = 62.0 / 3600.0
 NTH = 16
 
 
-def wtheta(ra_d, dec_d, ra_r, dec_r, tb):
+def wtheta(ra_d, dec_d, ra_r, dec_r, tb, rr=None):
     nd, nr = len(ra_d), len(ra_r)
     dd = DDtheta_mocks(1, NTH, tb, ra_d.astype("f8"), dec_d.astype("f8"))["npairs"].astype(float)
-    rr = DDtheta_mocks(1, NTH, tb, ra_r.astype("f8"), dec_r.astype("f8"))["npairs"].astype(float)
+    if rr is None:                                    # RR depends only on the (fixed) randoms
+        rr = DDtheta_mocks(1, NTH, tb, ra_r.astype("f8"), dec_r.astype("f8"))["npairs"].astype(float)
     dr = DDtheta_mocks(0, NTH, tb, ra_d.astype("f8"), dec_d.astype("f8"),
                        RA2=ra_r.astype("f8"), DEC2=dec_r.astype("f8"))["npairs"].astype(float)
     return np.where(rr > 0, (dd/(nd*(nd-1.)) - 2*dr/(nd*nr) + rr/(nr*(nr-1.)))/(rr/(nr*(nr-1.))), np.nan)
@@ -61,6 +63,7 @@ def main():
         sel_map=cat.sel_map, n_random=300_000, z_data=z_d, nside=cat.nside, rng=rng)
     tb = np.logspace(np.log10(0.05), np.log10(2.5), 11); tc = np.sqrt(tb[1:]*tb[:-1])
 
+    rr_w = DDtheta_mocks(1, NTH, tb, rar.astype("f8"), decr.astype("f8"))["npairs"].astype(float)
     configs = {"photo-z × clustering": "data", "photo-z only": "none"}
     res = {}
     for label, prior in configs.items():
@@ -68,7 +71,7 @@ def main():
         for s in range(args.n_real):
             c = complete_catalog_photoz(cat, targets, pz, seed=s, clustering_prior=prior,
                                         dz_pool=dz_pool)
-            W.append(wtheta(c["ra"], c["dec"], rar, decr, tb))
+            W.append(wtheta(c["ra"], c["dec"], rar, decr, tb, rr=rr_w))
         W = np.array(W)
         res[label] = (W.mean(0), W.std(0))
 
@@ -93,6 +96,7 @@ def main():
     a2.set_title("prior-systematic budget"); a2.legend(); a2.grid(True, which="both", alpha=0.2)
     plt.tight_layout(); plt.savefig(args.out, dpi=140, bbox_inches="tight")
     print(f"\nSaved: {args.out}")
+    perf.report("completion_systematics_scan")
 
 
 if __name__ == "__main__":

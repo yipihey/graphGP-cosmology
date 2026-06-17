@@ -19,17 +19,19 @@ from twopt_density.boss import load_boss
 from twopt_density.quaia import make_random_from_selection_function
 from twopt_density.photoz import PhotoZKNN, photoz_features
 from twopt_density.cmass_targets import load_cmass_targets
-from twopt_density.observed_ls import measure_K2d, complete_catalog_photoz, measure_close_pair_dz
+from twopt_density.observed_ls import (measure_K2d, compute_rr, complete_catalog_photoz,
+                                       measure_close_pair_dz)
+from twopt_density import perf
 
 COLL = 62.0 / 3600.0
 
 
-def xi_grid(ra_d, dec_d, z_d, w_d, ra_r, dec_r, z_r, te, ze, md=None, mr=None):
+def xi_grid(ra_d, dec_d, z_d, w_d, ra_r, dec_r, z_r, te, ze, md=None, mr=None, precomp_rr=None):
     if md is not None:
         ra_d, dec_d, z_d, w_d = ra_d[md], dec_d[md], z_d[md], w_d[md]
         ra_r, dec_r, z_r = ra_r[mr], dec_r[mr], z_r[mr]
     return measure_K2d(ra_d, dec_d, z_d, w_d, ra_r, dec_r, z_r, np.ones(len(ra_r)),
-                       theta_edges=te, z_edges=ze)[2]
+                       theta_edges=te, z_edges=ze, precomp_rr=precomp_rr)[2]
 
 
 def main():
@@ -62,11 +64,13 @@ def main():
         sel_map=cat.sel_map, n_random=args.n_rand_factor * cat.N_data,
         z_data=z_d, nside=cat.nside, rng=rng)
 
-    xw = xi_grid(ra_d, dec_d, z_d, w_c, rar, decr, zr, te, ze)               # (nθ,nz)
-    Xc = []
-    for s in range(args.n_real):
-        c = complete_catalog_photoz(cat, targets, pz, seed=s, dz_pool=dz_pool)
-        Xc.append(xi_grid(c["ra"], c["dec"], c["z"], np.ones(c["N"]), rar, decr, zr, te, ze))
+    # generate completions ONCE; reuse for full-plane and every per-z slice below
+    cats = [complete_catalog_photoz(cat, targets, pz, seed=s, dz_pool=dz_pool)
+            for s in range(args.n_real)]
+    rr_full = compute_rr(rar, decr, zr, np.ones(len(rar)), theta_edges=te, z_edges=ze)
+    xw = xi_grid(ra_d, dec_d, z_d, w_c, rar, decr, zr, te, ze, precomp_rr=rr_full)   # (nθ,nz)
+    Xc = [xi_grid(c["ra"], c["dec"], c["z"], np.ones(c["N"]), rar, decr, zr, te, ze, precomp_rr=rr_full)
+          for c in cats]
     xc = np.mean(Xc, 0)
 
     # full-plane ratio where the signal is measurable
@@ -84,13 +88,14 @@ def main():
     slice_curves = []
     for a, b in zip(zedges[:-1], zedges[1:]):
         md = (z_d >= a) & (z_d < b); mr = (zr >= a) & (zr < b)
-        xw_s = xi_grid(ra_d, dec_d, z_d, w_c, rar, decr, zr, te, ze, md, mr)[:, 0]
-        # measure per realization restricting to the slice
+        rr_sl = compute_rr(rar[mr], decr[mr], zr[mr], np.ones(int(mr.sum())),
+                           theta_edges=te, z_edges=ze)
+        xw_s = xi_grid(ra_d, dec_d, z_d, w_c, rar, decr, zr, te, ze, md, mr, precomp_rr=rr_sl)[:, 0]
+        # measure per realization restricting to the slice (cached completions)
         xcs = []
-        for s in range(args.n_real):
-            c = complete_catalog_photoz(cat, targets, pz, seed=s, dz_pool=dz_pool)
+        for c in cats:
             mc = (c["z"] >= a) & (c["z"] < b)
-            xcs.append(xi_grid(c["ra"], c["dec"], c["z"], np.ones(c["N"]), rar, decr, zr, te, ze, mc, mr)[:, 0])
+            xcs.append(xi_grid(c["ra"], c["dec"], c["z"], np.ones(c["N"]), rar, decr, zr, te, ze, mc, mr, precomp_rr=rr_sl)[:, 0])
         rr = np.mean(xcs, 0) / xw_s
         slice_curves.append((a, b, rr))
         print(f"  z∈[{a:.2f},{b:.2f}): median={np.nanmedian(rr[res]):.3f}  N={md.sum():,}")
@@ -108,6 +113,7 @@ def main():
     a2.set_ylabel("completed/weighted"); a2.legend(fontsize=8); a2.set_title("per-z-slice angular")
     plt.tight_layout(); plt.savefig(args.out, dpi=140, bbox_inches="tight")
     print(f"\nSaved: {args.out}")
+    perf.report("verify_completion_2d")
 
 
 if __name__ == "__main__":

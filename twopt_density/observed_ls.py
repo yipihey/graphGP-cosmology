@@ -25,6 +25,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from . import perf
 from .observed import _radec_to_nhat
 from .quaia import make_random_from_selection_function
 
@@ -36,6 +37,7 @@ def measure_K2d(
     theta_edges: np.ndarray,
     z_edges: np.ndarray,
     return_counts: bool = False,
+    precomp_rr: dict = None,
 ):
     """Weighted Landy-Szalay ξ(Δθ, Δz) from one 4-D ``query_pairs``.
 
@@ -51,6 +53,7 @@ def measure_K2d(
     dict of the normalised ``dd, dr, rr`` and raw weighted ``DD, DR, RR``.
     """
     from scipy.spatial import cKDTree
+    from . import perf
 
     ra_d = np.asarray(ra_d, np.float64); dec_d = np.asarray(dec_d, np.float64)
     z_d = np.asarray(z_d, np.float64); w_d = np.asarray(w_d, np.float64)
@@ -61,42 +64,73 @@ def measure_K2d(
     theta_max = float(theta_edges[-1]); dz_max = float(z_edges[-1])
     chord_max = 2.0 * np.sin(np.radians(theta_max) / 2.0)
     beta = chord_max / dz_max
-
-    nhat = np.vstack([_radec_to_nhat(ra_d, dec_d), _radec_to_nhat(ra_r, dec_r)])
-    zz = np.concatenate([z_d, z_r])
-    w = np.concatenate([w_d, w_r])
-    tag = np.concatenate([np.zeros(nd, bool), np.ones(nr, bool)])   # False=data
-    P = np.hstack([nhat, (beta * zz)[:, None]])
     R = np.sqrt(chord_max ** 2 + (beta * dz_max) ** 2)
+    Pd = np.hstack([_radec_to_nhat(ra_d, dec_d), (beta * z_d)[:, None]])
+    Pr = np.hstack([_radec_to_nhat(ra_r, dec_r), (beta * z_r)[:, None]])
 
-    tree = cKDTree(P)
-    pairs = tree.query_pairs(R, output_type="ndarray")
-    i, j = pairs[:, 0], pairs[:, 1]
-    chord = np.linalg.norm(P[i, :3] - P[j, :3], axis=1)
-    dtheta = np.degrees(2.0 * np.arcsin(np.clip(chord / 2.0, 0.0, 1.0)))
-    dz = np.abs(P[i, 3] - P[j, 3]) / beta
-    wij = w[i] * w[j]
-    ti, tj = tag[i], tag[j]
-
-    def hist(mask):
-        return np.histogram2d(dtheta[mask], dz[mask], bins=[theta_edges, z_edges],
-                              weights=wij[mask])[0]
-
-    DD = hist((~ti) & (~tj)); RR = hist(ti & tj); DR = hist(ti ^ tj)
+    def hist_pairs(Pa, Pb, wa, wb, i, j):
+        chord = np.linalg.norm(Pa[i, :3] - Pb[j, :3], axis=1)
+        dth = np.degrees(2.0 * np.arcsin(np.clip(chord / 2.0, 0.0, 1.0)))
+        dz = np.abs(Pa[i, 3] - Pb[j, 3]) / beta
+        return np.histogram2d(dth, dz, bins=[theta_edges, z_edges], weights=wa[i] * wb[j])[0]
 
     Wd, W2d = w_d.sum(), (w_d ** 2).sum()
-    Wr, W2r = w_r.sum(), (w_r ** 2).sum()
-    nDD = 0.5 * (Wd ** 2 - W2d)
-    nRR = 0.5 * (Wr ** 2 - W2r)
-    nDR = Wd * Wr
-    dd = DD / nDD; rr = RR / nRR; dr = DR / nDR
+    nDD = 0.5 * (Wd ** 2 - W2d); nDR = Wd * (w_r.sum())
+
+    with perf.timer("measure_K2d"):
+        with perf.timer("measure_K2d.DD"):
+            pdd = cKDTree(Pd).query_pairs(R, output_type="ndarray")
+            perf.count("pairs.DD", len(pdd))
+            DD = hist_pairs(Pd, Pd, w_d, w_d, pdd[:, 0], pdd[:, 1])
+        # DR: data-vs-random cross pairs (always needed)
+        with perf.timer("measure_K2d.DR"):
+            nbr = cKDTree(Pd).query_ball_tree(cKDTree(Pr), R)
+            di = np.repeat(np.arange(nd), [len(x) for x in nbr])
+            rj = np.fromiter((k for x in nbr for k in x), dtype=np.int64,
+                             count=sum(len(x) for x in nbr))
+            perf.count("pairs.DR", len(di))
+            DR = hist_pairs(Pd, Pr, w_d, w_r, di, rj)
+        if precomp_rr is not None:                     # cached RR (randoms fixed)
+            rr = precomp_rr["rr"]; nRR = precomp_rr["nRR"]
+        else:
+            with perf.timer("measure_K2d.RR"):
+                prr = cKDTree(Pr).query_pairs(R, output_type="ndarray")
+                perf.count("pairs.RR", len(prr))
+                RR = hist_pairs(Pr, Pr, w_r, w_r, prr[:, 0], prr[:, 1])
+            nRR = 0.5 * (w_r.sum() ** 2 - (w_r ** 2).sum())
+            rr = RR / nRR
+
+    dd = DD / nDD; dr = DR / nDR
     with np.errstate(divide="ignore", invalid="ignore"):
         xi = np.where(rr > 0, (dd - 2.0 * dr + rr) / rr, 0.0)
 
     if return_counts:
-        return theta_edges, z_edges, xi, {
-            "dd": dd, "dr": dr, "rr": rr, "DD": DD, "DR": DR, "RR": RR}
+        return theta_edges, z_edges, xi, {"dd": dd, "dr": dr, "rr": rr, "nRR": nRR}
     return theta_edges, z_edges, xi
+
+
+def compute_rr(ra_r, dec_r, z_r, w_r, *, theta_edges, z_edges):
+    """Precompute the normalised random-random RR(Δθ,Δz) and its normalisation,
+    to be reused across many ``measure_K2d`` calls against the SAME randoms
+    (``precomp_rr=`` argument) — skips the dominant random-random pair count."""
+    from scipy.spatial import cKDTree
+    from . import perf
+    ra_r = np.asarray(ra_r, np.float64); dec_r = np.asarray(dec_r, np.float64)
+    z_r = np.asarray(z_r, np.float64); w_r = np.asarray(w_r, np.float64)
+    theta_max = float(theta_edges[-1]); dz_max = float(z_edges[-1])
+    chord_max = 2.0 * np.sin(np.radians(theta_max) / 2.0); beta = chord_max / dz_max
+    R = np.sqrt(chord_max ** 2 + (beta * dz_max) ** 2)
+    Pr = np.hstack([_radec_to_nhat(ra_r, dec_r), (beta * z_r)[:, None]])
+    with perf.timer("compute_rr"):
+        prr = cKDTree(Pr).query_pairs(R, output_type="ndarray")
+        perf.count("pairs.RR", len(prr))
+        chord = np.linalg.norm(Pr[prr[:, 0], :3] - Pr[prr[:, 1], :3], axis=1)
+        dth = np.degrees(2.0 * np.arcsin(np.clip(chord / 2.0, 0.0, 1.0)))
+        dz = np.abs(Pr[prr[:, 0], 3] - Pr[prr[:, 1], 3]) / beta
+        RR = np.histogram2d(dth, dz, bins=[theta_edges, z_edges],
+                            weights=w_r[prr[:, 0]] * w_r[prr[:, 1]])[0]
+    nRR = 0.5 * (w_r.sum() ** 2 - (w_r ** 2).sum())
+    return {"rr": RR / nRR, "nRR": nRR}
 
 
 def measure_close_pair_dz(catalog, collision_scale_deg: float = 62.0 / 3600.0):
@@ -119,6 +153,7 @@ def measure_close_pair_dz(catalog, collision_scale_deg: float = 62.0 / 3600.0):
     return np.concatenate([dz, -dz])
 
 
+@perf.timed("complete_catalog")
 def complete_catalog(
     catalog,
     *,
@@ -222,6 +257,7 @@ def _clpair_density(dz_pool, n_bins: int = 121, dz_max: float = 0.06):
                                h[cen >= 0], left=h[cen >= 0][0], right=0.0)
 
 
+@perf.timed("complete_catalog_photoz")
 def complete_catalog_photoz(
     catalog, targets, photoz,
     *,
@@ -294,6 +330,7 @@ def complete_catalog_photoz(
             "z": base_z[idx].astype(np.float32), "N": len(idx)}
 
 
+@perf.timed("generate_catalogs_from_kernel")
 def generate_catalogs_from_kernel(
     catalog, cov, sigma2,
     *,

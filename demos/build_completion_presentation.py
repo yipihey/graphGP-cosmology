@@ -28,7 +28,9 @@ C_NEW = "#3a6ea8"     # completed / photo-z
 C_ZF = "#7b3ff2"      # z-failures
 C_NEUTRAL = "#888888"
 CACHE = "output/_presentation_cache.npz"
+MASK_CACHE = "output/_presentation_mask_cache.npz"
 COLL = 62.0 / 3600.0
+NSIDE_MASK = 512
 DATA = "data/boss/galaxy_DR12v5_CMASS_South.fits.gz"
 RAND = "data/boss/random0_DR12v5_CMASS_South.fits.gz"
 TARGETS = "data/boss/cmass_targets_South.fits"
@@ -50,19 +52,21 @@ def compute(quick=False):
     from twopt_density.quaia import make_random_from_selection_function
     from twopt_density.photoz import PhotoZKNN, photoz_features
     from twopt_density.cmass_targets import load_cmass_targets
-    from twopt_density.observed_ls import (measure_K2d, complete_catalog_photoz,
+    from twopt_density.observed_ls import (measure_K2d, compute_rr, complete_catalog_photoz,
                                            measure_close_pair_dz, _clpair_density)
+    from twopt_density import perf
 
     NTH = 16
     n_real = 4 if quick else 12
     n_real_2d = 2 if quick else 4
     nrf = 2
 
-    def wtheta(ra_d, dec_d, ra_r, dec_r, tb, w_d=None):
+    def wtheta(ra_d, dec_d, ra_r, dec_r, tb, w_d=None, rr=None):
         nd, nr = len(ra_d), len(ra_r)
         kw = dict(weights1=w_d.astype("f8"), weight_type="pair_product") if w_d is not None else {}
         dd = DDtheta_mocks(1, NTH, tb, ra_d.astype("f8"), dec_d.astype("f8"), **kw)
-        rr = DDtheta_mocks(1, NTH, tb, ra_r.astype("f8"), dec_r.astype("f8"))["npairs"].astype(float)
+        if rr is None:                                    # RR depends only on the (fixed) randoms
+            rr = DDtheta_mocks(1, NTH, tb, ra_r.astype("f8"), dec_r.astype("f8"))["npairs"].astype(float)
         if w_d is not None:
             Wd = w_d.sum()
             DD = dd["npairs"] * dd["weightavg"] / Wd**2
@@ -131,20 +135,27 @@ def compute(quick=False):
     rar, decr, zr = make_random_from_selection_function(
         sel_map=cat.sel_map, n_random=nrf * cat.N_data, z_data=z_d, nside=cat.nside, rng=rng)
 
+    # Completion realizations are EXPENSIVE; generate each (seed, prior) ONCE and
+    # reuse the same catalogs across the w(theta) ensemble, the 2-D xi closure and
+    # the per-z-slice closure below (previously regenerated ~44 times).
+    print(f"[compute] generating {n_real} completion realizations (reused throughout) ...")
+    cats_data, cats_none = [], []
+    for s in range(n_real):
+        cats_data.append(complete_catalog_photoz(cat, targets, pz, seed=s,
+                                                 clustering_prior="data", dz_pool=dz_pool))
+        cats_none.append(complete_catalog_photoz(cat, targets, pz, seed=s,
+                                                 clustering_prior="none", dz_pool=dz_pool))
+        print(f"  realization {s+1}/{n_real}")
+    cats_keep = cats_data[:3]
+
     tb = np.logspace(np.log10(0.05), np.log10(2.5), 11); tc = np.sqrt(tb[1:] * tb[:-1])
     D["wt_tc"] = tc
     print("[compute] w(theta): weighted observed + ensembles ...")
-    D["wt_data"] = wtheta(ra_d, dec_d, rar, decr, tb, w_d=w_c)
-    Wd, Wp = [], []
-    cats_keep = []
-    for s in range(n_real):
-        c = complete_catalog_photoz(cat, targets, pz, seed=s, clustering_prior="data", dz_pool=dz_pool)
-        Wd.append(wtheta(c["ra"], c["dec"], rar, decr, tb))
-        if s < 3:
-            cats_keep.append(c)
-        cp = complete_catalog_photoz(cat, targets, pz, seed=s, clustering_prior="none", dz_pool=dz_pool)
-        Wp.append(wtheta(cp["ra"], cp["dec"], rar, decr, tb))
-        print(f"  realization {s+1}/{n_real}")
+    with perf.timer("wtheta.RR_corrfunc"):
+        rr_w = DDtheta_mocks(1, NTH, tb, rar.astype("f8"), decr.astype("f8"))["npairs"].astype(float)
+    D["wt_data"] = wtheta(ra_d, dec_d, rar, decr, tb, w_d=w_c, rr=rr_w)
+    Wd = [wtheta(c["ra"], c["dec"], rar, decr, tb, rr=rr_w) for c in cats_data]
+    Wp = [wtheta(c["ra"], c["dec"], rar, decr, tb, rr=rr_w) for c in cats_none]
     D["wt_ens_data"] = np.array(Wd); D["wt_ens_pzonly"] = np.array(Wp)
 
     # n(z): weighted observed vs completed (one realization)
@@ -159,28 +170,29 @@ def compute(quick=False):
     tcen = np.empty(len(te) - 1); tcen[0] = 0.5 * te[1]; tcen[1:] = np.sqrt(te[1:-1] * te[2:])
     D["k2d_tcen"] = tcen; D["k2d_zcen"] = 0.5 * (ze[1:] + ze[:-1])
     one = lambda n: np.ones(n)
+    # RR depends only on the (fixed) randoms — compute once, reuse for every
+    # measure_K2d against the full random set (skips the dominant RR pair count).
+    rr_full = compute_rr(rar, decr, zr, one(len(rar)), theta_edges=te, z_edges=ze)
     D["xi2d_w"] = measure_K2d(ra_d, dec_d, z_d, w_c, rar, decr, zr, one(len(rar)),
-                              theta_edges=te, z_edges=ze)[2]
-    Xc = []
-    for s in range(n_real_2d):
-        c = complete_catalog_photoz(cat, targets, pz, seed=s, clustering_prior="data", dz_pool=dz_pool)
-        Xc.append(measure_K2d(c["ra"], c["dec"], c["z"], one(c["N"]), rar, decr, zr, one(len(rar)),
-                              theta_edges=te, z_edges=ze)[2])
+                              theta_edges=te, z_edges=ze, precomp_rr=rr_full)[2]
+    Xc = [measure_K2d(c["ra"], c["dec"], c["z"], one(c["N"]), rar, decr, zr, one(len(rar)),
+                      theta_edges=te, z_edges=ze, precomp_rr=rr_full)[2]
+          for c in cats_data[:n_real_2d]]
     D["xi2d_c"] = np.mean(Xc, 0)
-    # per-z-slice angular closure
+    # per-z-slice angular closure (reuse cached completions; RR cached per slice)
     zedges = np.quantile(z_d, [0.0, 0.25, 0.5, 0.75, 1.0]); D["slice_edges"] = zedges
     slice_ratio = []
     for a, b in zip(zedges[:-1], zedges[1:]):
         md = (z_d >= a) & (z_d < b); mr = (zr >= a) & (zr < b)
+        rr_sl = compute_rr(rar[mr], decr[mr], zr[mr], one(mr.sum()), theta_edges=te, z_edges=ze)
         xw = measure_K2d(ra_d[md], dec_d[md], z_d[md], w_c[md], rar[mr], decr[mr], zr[mr],
-                         one(mr.sum()), theta_edges=te, z_edges=ze)[2][:, 0]
+                         one(mr.sum()), theta_edges=te, z_edges=ze, precomp_rr=rr_sl)[2][:, 0]
         xcs = []
-        for s in range(n_real_2d):
-            c = complete_catalog_photoz(cat, targets, pz, seed=s, clustering_prior="data", dz_pool=dz_pool)
+        for c in cats_data[:n_real_2d]:
             mc = (c["z"] >= a) & (c["z"] < b)
             xcs.append(measure_K2d(c["ra"][mc], c["dec"][mc], c["z"][mc], one(mc.sum()),
                                    rar[mr], decr[mr], zr[mr], one(mr.sum()),
-                                   theta_edges=te, z_edges=ze)[2][:, 0])
+                                   theta_edges=te, z_edges=ze, precomp_rr=rr_sl)[2][:, 0])
         slice_ratio.append(np.mean(xcs, 0) / xw)
     D["slice_ratio"] = np.array(slice_ratio)
 
@@ -211,6 +223,7 @@ def compute(quick=False):
     D["snap_zlo"] = zlo; D["snap_zhi"] = zhi
     for s in range(2):
         D[f"snap{s}_ra"], D[f"snap{s}_dec"] = snaps[s]
+    perf.report("build_completion_presentation.compute")
     return D
 
 
@@ -406,7 +419,7 @@ th,td{padding:5px 14px;text-align:left;border-bottom:1px solid #e6e6e6;} th{back
 """
 
 
-def render(D, figs):
+def render(D, figs, Dm):
     g = lambda k: float(D[k])
     img = lambda k: f'<figure><img src="data:image/png;base64,{figs[k]}"/>'
     date = datetime.date.today().isoformat()
@@ -421,8 +434,8 @@ def render(D, figs):
         f"<a href='#{i}'>{t}</a>" for i, t in [
             ("problem", "Problem"), ("opportunity", "Opportunity"), ("method", "Method"),
             ("data", "Data"), ("catalogs", "Corrected catalogs"), ("clustering", "Clustering"),
-            ("scatter", "Scatter &amp; systematics"), ("meaning", "What it means"),
-            ("future", "Future")]) + "</nav>")
+            ("mask", "Mask &amp; inpainting"), ("scatter", "Scatter &amp; systematics"),
+            ("meaning", "What it means"), ("future", "Future")]) + "</nav>")
 
     H.append(f"""<div class='metric-grid'>
       <div>Observed galaxies: <b>{int(D['N_obs']):,}</b></div>
@@ -560,6 +573,37 @@ def render(D, figs):
              "is slightly lower than the weighting implies. The mild rise with Δz is the photo-z "
              "scatter (σ<sub>NMAD</sub>≈0.019) redistributing pairs radially.</figcaption></figure>")
 
+    H.append("<h2 id='mask'>Survey mask and inpainting</h2>")
+    H.append(f"<p>The completion above corrects galaxies missing from <i>observed</i> area. It does "
+             f"not touch interior <b>mask holes</b> — bright-star masks, bad fields and tiling gaps "
+             f"where there is no data at all (no galaxies, no randoms, no usable imaging). For "
+             f"clustering measured against masked randoms these holes cancel and need no action. But a "
+             f"theorist who wants a hole-free, equal-weight catalog can have one: we fill each hole by "
+             f"<b>transplanting real galaxies</b> — with their colours, magnitudes and local spatial "
+             f"configuration — from environment-matched nearby clean regions, setting each hole's count "
+             f"so its galaxy/random ratio matches its surrounding collar. This is data resampling, not "
+             f"a field model: higher-order clustering and the colour/luminosity structure transfer by "
+             f"construction, and it stays cosmology-free.</p>")
+    H.append(img("mask") + f"<figcaption><b>Left:</b> the {int(Dm['n_holes'])} interior mask holes "
+             f"(red) located on the footprint from a finer (nside={NSIDE_MASK}, ≈7′-pixel) "
+             f"random-count map — pixels with zero randoms enclosed by populated footprint. "
+             f"<b>Right:</b> their radius distribution; total interior masked area "
+             f"{float(Dm['hole_area_tot']):.1f} deg² ({100*float(Dm['hole_area_tot'])/float(Dm['footprint_deg2']):.1f}% "
+             f"of the footprint). Sub-7′ bright-star masks are below this random-derived resolution "
+             f"(we lack the mangle veto polygons) and are not resolved here.</figcaption></figure>")
+    H.append(img("inpaint") + "<figcaption><b>Left:</b> a zoomed region around a large hole, observed "
+             "(grey) and inpainted (blue) galaxies. <b>Middle/right:</b> the closure test — the "
+             "standard masked measurement w(θ)=LS(data, masked randoms), where holes cancel, against "
+             "the inpainted measurement w(θ)=LS(data+inpainted, hole-filled randoms), where the "
+             "catalog is treated as hole-free. They agree to ~1% across 0.06°–2°, i.e. the inpaint "
+             "fills the holes with statistically-consistent galaxies. <b>Limitations:</b> only the "
+             "fully-empty mask cores are filled — the partial-completeness halos at mask edges remain "
+             "locally under-dense (handled by the weighting/randoms for clustering, a residual local "
+             "deficit for field-level use); boundary continuity is approximate; and holes comparable "
+             "to or larger than the correlation length are weakly constrained (the realizations span "
+             "that uncertainty). This is an optional hole-free field product, separate from the "
+             "unbiased masked clustering catalogs.</figcaption></figure>")
+
     H.append("<h2 id='scatter'>Scatter and systematics</h2>")
     H.append(img("systematics") + "<figcaption><b>Left:</b> the w(θ) ensemble under two redshift-"
              "assignment priors — photo-z combined with the close-pair clustering prior (blue) vs "
@@ -613,18 +657,117 @@ def render(D, figs):
     return "".join(H)
 
 
+# ----------------------------------------------------------------------
+# Mask + inpainting (separate cache so it doesn't trigger the main recompute)
+# ----------------------------------------------------------------------
+def compute_mask():
+    import healpy as hp
+    from Corrfunc.mocks.DDtheta_mocks import DDtheta_mocks
+    from twopt_density.boss import load_boss
+    from twopt_density.observed import _radec_to_nhat
+    from twopt_density.inpaint import fine_completeness_map, find_interior_holes, inpaint_holes
+
+    def wtheta(ra_d, dec_d, ra_r, dec_r, tb):
+        nd, nr = len(ra_d), len(ra_r)
+        dd = DDtheta_mocks(1, 16, tb, ra_d.astype("f8"), dec_d.astype("f8"))["npairs"].astype(float)
+        rr = DDtheta_mocks(1, 16, tb, ra_r.astype("f8"), dec_r.astype("f8"))["npairs"].astype(float)
+        dr = DDtheta_mocks(0, 16, tb, ra_d.astype("f8"), dec_d.astype("f8"),
+                           RA2=ra_r.astype("f8"), DEC2=dec_r.astype("f8"))["npairs"].astype(float)
+        return np.where(rr > 0, (dd/(nd*(nd-1.)) - 2*dr/(nd*nr) + rr/(nr*(nr-1.)))/(rr/(nr*(nr-1.))), np.nan)
+
+    cat = load_boss([DATA], [RAND], sample="CMASS", nside=256, with_photometry=True)
+    ra_d = np.asarray(cat.ra_data); dec_d = np.asarray(cat.dec_data); z_d = np.asarray(cat.z_data)
+    w_c = float((np.asarray(cat.w_sys_data)*(np.asarray(cat.w_cp_data)+np.asarray(cat.w_noz_data)-1)).mean())
+    rar_full = np.asarray(cat.ra_random); decr_full = np.asarray(cat.dec_random)
+    counts, _ = fine_completeness_map(rar_full, decr_full, nside=NSIDE_MASK)
+    holes = find_interior_holes(counts, NSIDE_MASK, empty_count=0.0, min_neighbour_frac=0.75)
+    hole_pix = np.concatenate([h.pixels for h in holes])
+    real = inpaint_holes(holes, counts, NSIDE_MASK, donor_ra=ra_d, donor_dec=dec_d, donor_z=z_d,
+                         rand_ra=rar_full, rand_dec=decr_full, donor_colors=cat.colors_data,
+                         donor_mags=cat.mags_data, seed=0, n_real=1, density_boost=w_c)[0]
+
+    rng = np.random.default_rng(3)
+    nsub = min(400_000, cat.N_random)
+    ri = rng.choice(cat.N_random, nsub, False); rar, decr = rar_full[ri], decr_full[ri]
+    med = int(np.median(counts[counts > 0])); res = hp.nside2resol(NSIDE_MASK)
+    th, ph = hp.pix2ang(NSIDE_MASK, hole_pix)
+    ath = np.repeat(th, med) + (rng.random(len(hole_pix)*med)-0.5)*res
+    aph = np.repeat(ph, med) + (rng.random(len(hole_pix)*med)-0.5)*res/np.sin(np.clip(np.repeat(th, med),.01,np.pi-.01))
+    rar_f = np.concatenate([rar_full, np.degrees(aph) % 360]); decr_f = np.concatenate([decr_full, 90-np.degrees(ath)])
+    rf = rng.choice(len(rar_f), nsub, False); rar_f, decr_f = rar_f[rf], decr_f[rf]
+
+    tb = np.logspace(np.log10(0.05), np.log10(2.5), 11); tc = np.sqrt(tb[1:]*tb[:-1])
+    w_masked = wtheta(ra_d, dec_d, rar, decr, tb)
+    w_inp = wtheta(np.concatenate([ra_d, real["ra"]]), np.concatenate([dec_d, real["dec"]]), rar_f, decr_f, tb)
+
+    sub = rng.choice(cat.N_data, min(40000, cat.N_data), False)
+    big = max(holes, key=lambda h: h.radius_deg if h.radius_deg < 0.5 else 0)
+    bx = lambda ra, dec: (np.abs(((ra-big.ra+180)%360)-180) < 1.0) & (np.abs(dec-big.dec) < 1.0)
+    mb_o = bx(ra_d, dec_d); mb_i = bx(real["ra"], real["dec"])
+    return {
+        "sky_ra": ra_d[sub], "sky_dec": dec_d[sub],
+        "hole_ra": np.array([h.ra for h in holes]), "hole_dec": np.array([h.dec for h in holes]),
+        "hole_rad": np.array([h.radius_deg for h in holes]),
+        "hole_area_tot": float(sum(h.area_deg2 for h in holes)), "n_holes": len(holes),
+        "n_inpaint": int(len(real["ra"])), "footprint_deg2": float(np.sum(counts > 0)*hp.nside2pixarea(NSIDE_MASK, degrees=True)),
+        "wt_tc": tc, "wt_masked": w_masked, "wt_inp": w_inp,
+        "zoom_obs_ra": ra_d[mb_o], "zoom_obs_dec": dec_d[mb_o],
+        "zoom_inp_ra": real["ra"][mb_i], "zoom_inp_dec": real["dec"][mb_i],
+        "zoom_rad": float(big.radius_deg), "z_obs": z_d[rng.choice(len(z_d), 40000, False)],
+        "z_inp": real["z"]}
+
+
+def get_mask_data(recompute=False):
+    if (not recompute) and os.path.exists(MASK_CACHE):
+        return dict(np.load(MASK_CACHE, allow_pickle=True))
+    Dm = compute_mask()
+    os.makedirs("output", exist_ok=True)
+    np.savez(MASK_CACHE, **{k: np.asarray(v) for k, v in Dm.items()})
+    return Dm
+
+
+def fig_mask(Dm):
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.6))
+    a1.scatter(Dm["sky_ra"], Dm["sky_dec"], s=1, c=C_NEUTRAL, alpha=0.3, lw=0)
+    a1.scatter(Dm["hole_ra"], Dm["hole_dec"], s=12, facecolors="none", edgecolors="#c0392b", lw=0.8)
+    a1.set_xlabel("RA [deg]"); a1.set_ylabel("Dec [deg]"); a1.invert_xaxis()
+    a1.set_title(f"{int(Dm['n_holes'])} interior mask holes (red) on the footprint")
+    a2.hist(Dm["hole_rad"]*60, bins=np.linspace(0, 30, 31), color="#c0392b", alpha=0.8, edgecolor="white", lw=0.4)
+    a2.set_yscale("log"); a2.set_xlabel("hole radius [arcmin]"); a2.set_ylabel("number of holes")
+    a2.set_title(f"total masked interior area {float(Dm['hole_area_tot']):.1f} deg² "
+                 f"({100*float(Dm['hole_area_tot'])/float(Dm['footprint_deg2']):.1f}% of footprint)")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+
+def fig_inpaint(Dm):
+    fig, (a1, a2, a3) = plt.subplots(1, 3, figsize=(15, 4.4))
+    a1.scatter(Dm["zoom_obs_ra"], Dm["zoom_obs_dec"], s=5, c=C_NEUTRAL, alpha=0.5, lw=0, label="observed")
+    a1.scatter(Dm["zoom_inp_ra"], Dm["zoom_inp_dec"], s=10, c=C_NEW, lw=0, label="inpainted")
+    a1.set_xlabel("RA [deg]"); a1.set_ylabel("Dec [deg]"); a1.invert_xaxis(); a1.legend()
+    a1.set_title(f"before/after zoom (hole r≈{float(Dm['zoom_rad'])*60:.0f}′)")
+    tc = Dm["wt_tc"]
+    a2.loglog(tc, Dm["wt_masked"], "s--", color=C_OBS, label="masked + masked randoms")
+    a2.loglog(tc, Dm["wt_inp"], "o-", color=C_NEW, label="inpainted + hole-filled randoms")
+    a2.set_xlabel("θ [deg]"); a2.set_ylabel("w(θ)"); a2.legend(); a2.set_title("clustering closure")
+    a3.semilogx(tc, Dm["wt_inp"]/Dm["wt_masked"], "o-", color="#333"); a3.axhline(1, color="gray", ls="--")
+    a3.fill_between(tc, 0.95, 1.05, color="green", alpha=0.12); a3.set_ylim(0.85, 1.15)
+    a3.set_xlabel("θ [deg]"); a3.set_ylabel("inpainted / masked"); a3.set_title("closure ratio")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--recompute", action="store_true")
     p.add_argument("--quick", action="store_true")
     args = p.parse_args()
     D = get_data(recompute=args.recompute, quick=args.quick)
+    Dm = get_mask_data(recompute=args.recompute)
     print("[figures] rendering ...")
     figs = {"data": fig_data(D), "weights": fig_weights(D), "colorz": fig_colorz(D),
             "photoz": fig_photoz(D), "clpair": fig_clpair(D), "missing": fig_missing(D),
             "samples": fig_samples(D), "wtheta": fig_wtheta(D), "2d": fig_2d(D),
-            "systematics": fig_systematics(D)}
-    html = render(D, figs)
+            "systematics": fig_systematics(D), "mask": fig_mask(Dm), "inpaint": fig_inpaint(Dm)}
+    html = render(D, figs, Dm)
     os.makedirs("output", exist_ok=True); os.makedirs("docs", exist_ok=True)
     for path in ["output/completion_presentation.html", "docs/completion.html"]:
         with open(path, "w") as f:
