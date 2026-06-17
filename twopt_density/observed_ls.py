@@ -99,13 +99,34 @@ def measure_K2d(
     return theta_edges, z_edges, xi
 
 
+def measure_close_pair_dz(catalog, collision_scale_deg: float = 62.0 / 3600.0):
+    """Empirical signed Δz of *observed* angular close pairs (≤ collision scale).
+
+    Surviving close pairs (both redshifts measured — e.g. tile overlaps that
+    escaped fiber collision) sample the true redshift-separation distribution of
+    collided pairs (collisions are imposed by tiling, not physics). Their Δz
+    carries the clustered (Δz≈0, true 1-halo pairs) + background (broad, chance
+    projections) mixture *data-drivenly*, so the missing partner's redshift can
+    be drawn as z_host + Δz without a parametric clustered/background fraction.
+    Returned symmetrised (±Δz).
+    """
+    from scipy.spatial import cKDTree
+    nhat = _radec_to_nhat(np.asarray(catalog.ra_data), np.asarray(catalog.dec_data))
+    z = np.asarray(catalog.z_data, np.float64)
+    chord = 2.0 * np.sin(np.radians(collision_scale_deg) / 2.0)
+    pairs = cKDTree(nhat).query_pairs(chord, output_type="ndarray")
+    dz = z[pairs[:, 1]] - z[pairs[:, 0]]
+    return np.concatenate([dz, -dz])
+
+
 def complete_catalog(
     catalog,
     *,
     seed: int = 0,
     collision_scale_deg: float = 62.0 / 3600.0,
     count: str = "poisson",
-    z_assign: str = "host",
+    z_assign: str = "data",
+    dz_pool=None,
     verbose: bool = False,
 ):
     """One equal-weight realization of the systematics-corrected catalog.
@@ -115,16 +136,28 @@ def complete_catalog(
     missing (fiber collisions w_cp, redshift failures w_noz, imaging systematics
     w_systot — **not** FKP, which is an estimator weight). Each galaxy is
     realized ``n_i`` times with E[n_i] = w_c,i = w_systot·(w_cp+w_noz−1) (the
-    BOSS completeness weight); the extra copies are placed within the unresolved
-    collision scale of the host, so the **equal-weight** catalog reproduces the
-    **w_c-weighted** clustering at resolved separations (θ ≳ collision scale)
-    by construction (Σ nᵢnⱼ → Σ w_c,i w_c,j), while recovering the close-pair
-    structure the weighting cannot. ``count='poisson'`` makes the integer counts
-    stochastic (so realizations also span the missing-number shot noise);
-    ``count='round'`` is deterministic. ``z_assign`` controls the added galaxies'
-    redshift: ``'host'`` (clustered, = nearest-neighbour correction), ``'nz'``
-    (drawn from the global n(z), background), or ``'mix'`` (half/half) — the
-    small-scale prior to scan across realizations.
+    BOSS completeness weight), so the **equal-weight** catalog reproduces the
+    **w_c-weighted** clustering at resolved separations by construction
+    (Σ nᵢnⱼ → Σ w_c,i w_c,j).
+
+    Every missing galaxy is a *local* addition (collisions, failures, and the
+    imaging systematic alike: the systematic-missing galaxy is clustered like
+    the local field, NOT scattered over the global n(z) — drawing it from the
+    global n(z) would dilute the radial clustering). It is placed within the
+    unresolved collision scale of the host (preserving angular clustering); its
+    redshift is set by ``z_assign``:
+
+    - ``'host'``: z_host — the nearest-neighbour assumption the BOSS weights
+      themselves make; reproduces the w_c-weighted clustering exactly.
+    - ``'data'`` (recommended): z_host + Δz with Δz drawn from the measured
+      close-pair distribution — relaxes the NN assumption using the observed
+      mix of true close pairs (Δz≈0) and chance projections (broad Δz), giving
+      more realistic small-scale *radial* structure.
+    - ``'nz'``: global n(z) (background); ``'mix'``: half host / half n(z).
+
+    ``count='poisson'`` makes the integer counts stochastic (realizations also
+    span the missing-number shot noise; w_systot<1 over-dense regions are thinned
+    when n_i=0); ``count='round'`` is deterministic.
 
     Returns ``dict(ra, dec, z, N)`` — an equal-weight catalog.
     """
@@ -142,25 +175,27 @@ def complete_catalog(
          else np.floor(w_c + rng.random(len(w_c))).astype(int))  # randomized round
     n_extra = np.maximum(n - 1, 0)
     keep = n > 0                                          # base copy kept iff n≥1
+    if z_assign == "data" and dz_pool is None:
+        dz_pool = measure_close_pair_dz(catalog, collision_scale_deg)
 
     ra_out = [ra[keep]]; dec_out = [dec[keep]]; z_out = [z[keep]]
-    # extra copies: one host index repeated n_extra times
-    host = np.repeat(np.arange(len(ra)), n_extra)
+    host = np.repeat(np.arange(len(ra)), n_extra)        # host index per extra copy
     m = len(host)
     if m:
-        # jitter angular position within the collision scale (a 2-D Gaussian
-        # well below the smallest measured bin) so copies are not exact duplicates
+        # angular: jitter within the collision scale (≪ smallest measured bin)
         s = np.radians(collision_scale_deg) / 3.0
         dra = np.degrees(rng.normal(0, s, m) / np.cos(np.radians(dec[host])))
         ddec = np.degrees(rng.normal(0, s, m))
         ra_e = ra[host] + dra; dec_e = dec[host] + ddec
-        if z_assign == "host":
-            z_e = z[host]
+        zc = z[host]
+        if z_assign == "data":
+            z_e = zc + rng.choice(dz_pool, m)
         elif z_assign == "nz":
             z_e = rng.choice(z, m)
-        else:  # mix
-            clustered = rng.random(m) < 0.5
-            z_e = np.where(clustered, z[host], rng.choice(z, m))
+        elif z_assign == "mix":
+            z_e = np.where(rng.random(m) < 0.5, zc, rng.choice(z, m))
+        else:  # 'host'
+            z_e = zc
         ra_out.append(ra_e); dec_out.append(dec_e); z_out.append(z_e)
 
     ra_f = np.concatenate(ra_out); dec_f = np.concatenate(dec_out); z_f = np.concatenate(z_out)
@@ -169,6 +204,94 @@ def complete_catalog(
               f"(+{100*(len(ra_f)/len(ra)-1):.1f}%, {m:,} added, z_assign={z_assign})")
     return {"ra": ra_f.astype(np.float32), "dec": dec_f.astype(np.float32),
             "z": z_f.astype(np.float32), "N": len(ra_f)}
+
+
+def _clpair_density(dz_pool, n_bins: int = 121, dz_max: float = 0.06):
+    """Empirical p(Δz) of observed close pairs → a callable density on Δz.
+
+    Built from ``measure_close_pair_dz`` (symmetrised signed Δz). Returns a
+    function evaluating the normalised histogram density at arbitrary Δz (0
+    outside the range), used as the clustering prior that pulls a collided
+    partner's redshift toward its host's when the pair is physical.
+    """
+    dz = np.asarray(dz_pool, np.float64)
+    edges = np.linspace(-dz_max, dz_max, n_bins)
+    h, _ = np.histogram(np.clip(dz, -dz_max, dz_max), bins=edges, density=True)
+    cen = 0.5 * (edges[1:] + edges[:-1])
+    return lambda x: np.interp(np.abs(x), np.abs(cen[cen >= 0]),
+                               h[cen >= 0], left=h[cen >= 0][0], right=0.0)
+
+
+def complete_catalog_photoz(
+    catalog, targets, photoz,
+    *,
+    seed: int = 0,
+    clustering_prior: str = "data",
+    dz_pool=None,
+    count: str = "poisson",
+    verbose: bool = False,
+):
+    """Equal-weight completion using REAL imaging positions + photo-z redshifts.
+
+    The missing galaxies (``targets``: fiber collisions + redshift failures) are
+    real photometric detections — known positions, only the redshift uncertain.
+    So we (1) keep every observed galaxy, (2) add every missing target at its
+    KNOWN position with a redshift sampled from its photo-z posterior
+    p(z|colours) — for collided objects reweighted by the close-pair clustering
+    prior p(Δz) (a physical pair is near the host's z; a projection is not), and
+    (3) apply the imaging systematic w_systot as a per-object Poisson multiplicity
+    on the whole set. Thus E[count per host group] = w_systot·(w_cp+w_noz−1) =
+    w_c, reproducing the weighted clustering in the mean, while the missing
+    galaxies land at their true positions and the per-realization scatter comes
+    from the (calibrated) photo-z redshift uncertainty — exactly the systematic
+    to scan. Cosmology-free throughout. Returns ``dict(ra, dec, z, N)``.
+    """
+    from .photoz import photoz_features
+
+    rng = np.random.default_rng(seed)
+    ra_o = np.asarray(catalog.ra_data, np.float64)
+    dec_o = np.asarray(catalog.dec_data, np.float64)
+    z_o = np.asarray(catalog.z_data, np.float64)
+    wsys_o = np.asarray(catalog.w_sys_data if catalog.w_sys_data is not None
+                        else np.ones(len(ra_o)))
+
+    # ---- redshift of each missing target: photo-z posterior × clustering prior ----
+    feat = photoz_features(targets.colors, targets.mags)
+    zk, wk = photoz.posterior(feat)                       # (M,k) neighbour z + weights
+    host = targets.host_index
+    z_host = np.where(host >= 0, z_o[np.clip(host, 0, len(z_o) - 1)], np.nan)
+    if clustering_prior == "data":
+        if dz_pool is None:
+            dz_pool = measure_close_pair_dz(catalog)
+        pcl = _clpair_density(dz_pool)
+        coll = (targets.miss_kind == "collided") & (host >= 0)
+        wk = wk.copy()
+        wk[coll] *= pcl(zk[coll] - z_host[coll, None])     # reweight collided only
+    # weighted sample one z per missing object; fall back to host z if degenerate
+    z_miss = np.empty(len(zk))
+    for i in range(len(zk)):
+        w = wk[i]; ok = np.isfinite(w) & (w > 0)
+        if ok.any():
+            wp = w[ok] / w[ok].sum()
+            z_miss[i] = rng.choice(zk[i][ok], p=wp)
+        else:
+            z_miss[i] = z_host[i] if np.isfinite(z_host[i]) else rng.choice(z_o)
+
+    # ---- base equal-weight set: observed (spec-z) + missing (photo-z) ----
+    base_ra = np.concatenate([ra_o, np.asarray(targets.ra, np.float64)])
+    base_dec = np.concatenate([dec_o, np.asarray(targets.dec, np.float64)])
+    base_z = np.concatenate([z_o, z_miss])
+    base_wsys = np.concatenate([wsys_o, wsys_o[np.clip(host, 0, len(z_o) - 1)]])
+
+    # ---- imaging-systematic completion: Poisson(w_systot) multiplicity ----
+    n = (rng.poisson(base_wsys) if count == "poisson"
+         else np.floor(base_wsys + rng.random(len(base_wsys))).astype(int))
+    idx = np.repeat(np.arange(len(base_ra)), n)
+    if verbose:
+        print(f"[complete-photoz] N_obs={len(ra_o):,} + {targets.N:,} missing "
+              f"-> N_eq={len(idx):,} (+{100*(len(idx)/len(ra_o)-1):.1f}%)")
+    return {"ra": base_ra[idx].astype(np.float32), "dec": base_dec[idx].astype(np.float32),
+            "z": base_z[idx].astype(np.float32), "N": len(idx)}
 
 
 def generate_catalogs_from_kernel(

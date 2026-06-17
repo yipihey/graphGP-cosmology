@@ -25,6 +25,17 @@ from __future__ import annotations
 import numpy as np
 
 
+def photoz_features(colors, mags):
+    """Standard photo-z features for CMASS: g−r, r−i, i−z, i_mag.
+
+    Drops the u-band (CMASS galaxies are very red → u flux is mostly noise).
+    ``colors`` is (N,4) [u-g,g-r,r-i,i-z]; ``mags`` is (N,5) ugriz. Use this for
+    BOTH training and the missing-target query so the colour space matches.
+    """
+    colors = np.asarray(colors); mags = np.asarray(mags)
+    return np.column_stack([colors[:, 1], colors[:, 2], colors[:, 3], mags[:, 3]])
+
+
 class PhotoZKNN:
     """k-NN colour→redshift posterior sampler."""
 
