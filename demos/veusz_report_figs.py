@@ -141,13 +141,14 @@ def inpaint_gallery(Dm, figs_dir):
         xr = (cra[k] - box[k] / cosd, cra[k] + box[k] / cosd)
         yr = (cdec[k] - box[k], cdec[k] + box[k])
         rr = f"r={rad[k]*60:.0f}'"
+        # note: equal_aspect collapses panels inside a grid (zero plot area) — omit it
         before = Panel([Series(g_ra[go], g_dec[go], color=C_NEUTRAL, marker="dot", size="3pt", alpha=0.7)],
                        xlabel="", ylabel="Dec", title=f"hole {k+1} ({rr}) - observed",
-                       xrange=xr, yrange=yr, invert_x=True, equal_aspect=True)
+                       xrange=xr, yrange=yr, invert_x=True)
         after = Panel([Series(g_ra[go], g_dec[go], color=C_NEUTRAL, marker="dot", size="3pt", alpha=0.7),
                        Series(i_ra[io], i_dec[io], color=C_NEW, marker="circle", size="3.5pt", alpha=0.7)],
                       xlabel="", ylabel="", title=f"hole {k+1} - inpainted",
-                      xrange=xr, yrange=yr, invert_x=True, equal_aspect=True)
+                      xrange=xr, yrange=yr, invert_x=True)
         panels += [before, after]
     path = os.path.join(figs_dir, "inpaint_gallery.vsz")
     V.grid(path, panels, rows=n, cols=2, width="24cm", height=f"{max(10, 7*n)}cm")
