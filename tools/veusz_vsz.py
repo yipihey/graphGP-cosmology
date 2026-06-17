@@ -270,13 +270,19 @@ def image(path, grid2d, *, xrange, yrange, xlabel="", ylabel="", title="",
     return _write(path, v.render())
 
 
-def embed_tag(vsz_relpath, *, width=720, height=460):
-    """HTML ``<veusz-figure>`` element referencing a ``.vsz`` (browser-editable)."""
-    return (f'<veusz-figure src="{vsz_relpath}" width="{width}" height="{height}" '
-            f'style="display:block;max-width:100%"></veusz-figure>')
-
-
 EMBED_SCRIPT_VERSION = "v4.5.0"
-EMBED_SCRIPT = (f'<script type="module" '
-                f'src="https://yipihey.github.io/veusz/embed/{EMBED_SCRIPT_VERSION}/veusz-embed.js">'
-                f'</script>')
+_EMBED_BASE = f"https://yipihey.github.io/veusz/embed/{EMBED_SCRIPT_VERSION}"
+# The browser embed runs veusz headless in a (shared, singleton) Pyodide worker;
+# it only installs veusz when given the wheel URL via the `veusz-wheel` attribute.
+WHEEL_URL = f"{_EMBED_BASE}/veusz-{EMBED_SCRIPT_VERSION[1:]}-py3-none-any.whl"
+EMBED_SCRIPT = f'<script type="module" src="{_EMBED_BASE}/veusz-embed.js"></script>'
+
+
+def embed_tag(vsz_relpath, *, width=720, height=460):
+    """HTML ``<veusz-figure>`` element referencing a ``.vsz`` (browser-editable).
+
+    Carries ``veusz-wheel`` so the embed's Pyodide worker installs veusz (without
+    it the worker raises ``No module named 'veusz'``)."""
+    return (f'<veusz-figure src="{vsz_relpath}" veusz-wheel="{WHEEL_URL}" '
+            f'width="{width}" height="{height}" '
+            f'style="display:block;max-width:100%"></veusz-figure>')
