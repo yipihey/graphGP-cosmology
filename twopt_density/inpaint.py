@@ -127,6 +127,14 @@ def inpaint_holes(holes, counts, nside, *, donor_ra, donor_dec, donor_z,
     transplanted count to the completeness-corrected density. Each realization
     uses independent donor centres; returns a list of ``n_real`` dicts with arrays
     ``ra, dec, z, colors, mags, hole_id``.
+
+    Amplitude is set *selection-immune* by construction: the per-hole target
+    count uses the local data/random ratio of the collar (``g_collar/r_collar``,
+    a random-normalised 1+δ), so it matches the surrounding field's true density
+    rather than any raw count, exactly as the total-target density anchor of
+    ``selection_coupling.total_target_density`` does globally. ``density_boost``
+    is the residual completeness factor (<w_c>); for a fully selection-immune
+    amplitude pass the total-target density ratio as ``density_boost`` instead.
     """
     import healpy as hp
     donor_ra = np.asarray(donor_ra); donor_dec = np.asarray(donor_dec); donor_z = np.asarray(donor_z)

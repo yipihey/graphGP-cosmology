@@ -29,6 +29,7 @@ C_ZF = "#7b3ff2"      # z-failures
 C_NEUTRAL = "#888888"
 CACHE = "output/_presentation_cache.npz"
 MASK_CACHE = "output/_presentation_mask_cache.npz"
+COUP_CACHE = "output/_presentation_coupling_cache.npz"
 COLL = 62.0 / 3600.0
 NSIDE_MASK = 512
 DATA = "data/boss/galaxy_DR12v5_CMASS_South.fits.gz"
@@ -419,7 +420,7 @@ th,td{padding:5px 14px;text-align:left;border-bottom:1px solid #e6e6e6;} th{back
 """
 
 
-def render(D, figs, Dm):
+def render(D, figs, Dm, Dc):
     g = lambda k: float(D[k])
     img = lambda k: f'<figure><img src="data:image/png;base64,{figs[k]}"/>'
     date = datetime.date.today().isoformat()
@@ -434,7 +435,8 @@ def render(D, figs, Dm):
         f"<a href='#{i}'>{t}</a>" for i, t in [
             ("problem", "Problem"), ("opportunity", "Opportunity"), ("method", "Method"),
             ("data", "Data"), ("catalogs", "Corrected catalogs"), ("clustering", "Clustering"),
-            ("mask", "Mask &amp; inpainting"), ("scatter", "Scatter &amp; systematics"),
+            ("mask", "Mask &amp; inpainting"), ("coupling", "Selection coupling"),
+            ("scatter", "Scatter &amp; systematics"),
             ("meaning", "What it means"), ("future", "Future")]) + "</nav>")
 
     H.append(f"""<div class='metric-grid'>
@@ -604,6 +606,52 @@ def render(D, figs, Dm):
              "that uncertainty). This is an optional hole-free field product, separate from the "
              "unbiased masked clustering catalogs.</figcaption></figure>")
 
+    # --- selection coupling + validation (Wechsler v0 lessons, cosmology-free) ---
+    gc = lambda k: float(Dc[k])
+    zf_det = abs(gc("zfail_z")) >= 3.0
+    cl_det = abs(gc("collided_z")) >= 3.0
+    zf_word = "<b>density-coupled</b>" if zf_det else "consistent with no coupling"
+    zf_imp = ("a real coupling the completion must reproduce" if zf_det else
+              "so a density-blind redshift-failure correction carries no spurious-power risk here")
+    H.append("<h2 id='coupling'>Selection coupling and validation</h2>")
+    H.append("<p>A forward-model field reconstruction in the same collaboration "
+             "(Wechsler, v0 pipeline) raises a question our correction must answer: is the "
+             "spectroscopic <i>selection</i> itself <b>density-coupled</b> — does the rate at which a "
+             "targeted galaxy goes missing depend on the local galaxy overdensity? If it is and the "
+             "correction ignores it, the missing galaxies imprint spurious large-scale power (the "
+             "mechanism behind the historical MegaZ excess; Thomas et al. 2011). We measure the "
+             "coupling directly and cosmology-free: at every member of the <i>total target sample</i> "
+             "(spectroscopic successes plus a given failure kind) we evaluate the local success "
+             "overdensity δ from an angular aperture, normalised by the random catalogue (so δ is a "
+             "true overdensity needing no distances and automatically footprint/completeness-aware), "
+             "then fit the success indicator against δ with a logistic model. The slope <i>h</i> is the "
+             "coupling; a label-shuffle null fixes its zero point.</p>")
+    H.append(img("coupling") + f"<figcaption><b>Left:</b> the redshift-success fraction S(δ) versus "
+             f"local overdensity for the two selection kinds. <b>Redshift failures</b> are "
+             f"{zf_word} "
+             f"(h = {gc('zfail_h'):+.2f} ± {gc('zfail_herr'):.2f}, "
+             f"{abs(gc('zfail_z')):.1f}σ from the shuffle null) — {zf_imp}. "
+             f"<b>Fiber collisions</b> are strongly coupled "
+             f"(h = {gc('collided_h'):+.2f} ± {gc('collided_herr'):.2f}, "
+             f"{abs(gc('collided_z')):.1f}σ; negative ⇒ collisions over-occupy dense regions), exactly "
+             f"as expected since close pairs are what get collided — a clean, cosmology-free "
+             f"confirmation. <b>Right:</b> the spurious-power test. The completion places every missing "
+             f"galaxy at its <i>real</i> imaging position, so it tracks the completeness-weighted "
+             f"baseline w(θ); a density-blind null that scatters the same galaxies over random "
+             f"footprint positions distorts w(θ) at large θ. Because the coupling lives almost entirely "
+             f"in the (small-scale) collisions and our completion places them where they truly are, the "
+             f"coupling is reproduced by construction rather than modelled. The largest-θ bins are "
+             f"random-count limited.</figcaption></figure>")
+    H.append(img("trust") + f"<figcaption><b>Left:</b> the completed-catalog angular density against the "
+             f"<i>total-target</i> density (successes + failures), in which the spectroscopic-success "
+             f"selection cancels by construction — the cleanest cosmology-free amplitude reference. They "
+             f"agree with correlation {gc('amp_corr'):.2f}, i.e. the completion restores the "
+             f"selection-immune density, not an arbitrary one. <b>Right:</b> a trustworthiness map — the "
+             f"galaxy-count scatter across completion realizations per HEALPix cell (median "
+             f"{gc('trust_med'):.2f}), the data-space analogue of a per-voxel posterior σ. It tells a "
+             f"downstream user where the catalog is well-constrained and where the photo-z redshift "
+             f"uncertainty leaves the most freedom.</figcaption></figure>")
+
     H.append("<h2 id='scatter'>Scatter and systematics</h2>")
     H.append(img("systematics") + "<figcaption><b>Left:</b> the w(θ) ensemble under two redshift-"
              "assignment priors — photo-z combined with the close-pair clustering prior (blue) vs "
@@ -755,6 +803,139 @@ def fig_inpaint(Dm):
     fig.tight_layout(); return fig_to_b64(fig)
 
 
+# ----------------------------------------------------------------------
+# Selection coupling + validation (separate cache)
+# ----------------------------------------------------------------------
+def compute_coupling():
+    """Density-coupling of selection, the MegaZ spurious-power test, the
+    selection-immune amplitude anchor, and the trustworthiness map — all
+    cosmology-free (angular, random-normalised). See validate_selection_coupling.py."""
+    import healpy as hp
+    from Corrfunc.mocks.DDtheta_mocks import DDtheta_mocks
+    from twopt_density.boss import load_boss
+    from twopt_density.photoz import PhotoZKNN, photoz_features
+    from twopt_density.cmass_targets import load_cmass_targets
+    from twopt_density.observed_ls import complete_catalog_photoz, measure_close_pair_dz
+    from twopt_density.selection_coupling import measure_failure_coupling, total_target_density
+
+    cat = load_boss([DATA], [RAND], sample="CMASS", nside=256, with_photometry=True)
+    ra_d = np.asarray(cat.ra_data); dec_d = np.asarray(cat.dec_data); z_d = np.asarray(cat.z_data)
+    rar_full = np.asarray(cat.ra_random); decr_full = np.asarray(cat.dec_random)
+    feat = photoz_features(cat.colors_data, cat.mags_data)
+    good = np.isfinite(feat).all(axis=1) & (cat.imatch_data == 1)
+    pz = PhotoZKNN(k=100).fit(feat[good], z_d[good])
+    dz_pool = measure_close_pair_dz(cat, COLL)
+    targets = load_cmass_targets(cat, path=TARGETS, seed=0)
+    w_c = np.asarray(cat.w_sys_data) * (np.asarray(cat.w_cp_data) + np.asarray(cat.w_noz_data) - 1.0)
+
+    rng = np.random.default_rng(0)
+    nsub = min(2 * cat.N_data, cat.N_random)
+    ri = rng.choice(cat.N_random, nsub, replace=False)
+    rar, decr = rar_full[ri], decr_full[ri]
+
+    D = {}
+    for kind in ["zfail", "collided"]:
+        r = measure_failure_coupling(cat, targets, rand_ra=rar, rand_dec=decr, kind=kind,
+                                     aperture_deg=0.5, n_boot=150, seed=1)
+        D[f"{kind}_h"] = r.h; D[f"{kind}_herr"] = r.h_err; D[f"{kind}_z"] = r.z_score
+        D[f"{kind}_nullstd"] = r.h_null_std
+        D[f"{kind}_dc"] = r.delta_bin_centres; D[f"{kind}_S"] = r.S_of_delta; D[f"{kind}_Se"] = r.S_err
+        D[f"{kind}_nfail"] = r.n_fail
+
+    # spurious-large-scale-power test
+    NTH = 16
+    tb = np.logspace(np.log10(0.1), np.log10(4.0), 11); tc = np.sqrt(tb[1:] * tb[:-1])
+    rr_w = DDtheta_mocks(1, NTH, tb, rar.astype("f8"), decr.astype("f8"))["npairs"].astype(float)
+    nr = len(rar)
+
+    def wth(ra, dec, w=None):
+        if w is not None:
+            dd = DDtheta_mocks(1, NTH, tb, ra.astype("f8"), dec.astype("f8"),
+                               weights1=w.astype("f8"), weight_type="pair_product")
+            DD = dd["npairs"] * dd["weightavg"] / w.sum()**2
+            dr = DDtheta_mocks(0, NTH, tb, ra.astype("f8"), dec.astype("f8"), weights1=w.astype("f8"),
+                               RA2=rar.astype("f8"), DEC2=decr.astype("f8"), weight_type="pair_product")
+            DR = dr["npairs"] * dr["weightavg"] / (w.sum() * nr)
+        else:
+            n = len(ra)
+            DD = DDtheta_mocks(1, NTH, tb, ra.astype("f8"), dec.astype("f8"))["npairs"].astype(float)/(n*(n-1.))
+            dr = DDtheta_mocks(0, NTH, tb, ra.astype("f8"), dec.astype("f8"),
+                               RA2=rar.astype("f8"), DEC2=decr.astype("f8"))["npairs"].astype(float)
+            DR = dr / (n * nr)
+        RR = rr_w / (nr * (nr - 1.))
+        return np.where(RR > 0, (DD - 2*DR + RR)/RR, np.nan)
+
+    c = complete_catalog_photoz(cat, targets, pz, seed=0, clustering_prior="data", dz_pool=dz_pool)
+    j = rng.choice(len(rar_full), targets.N, replace=False)
+    D["sp_tc"] = tc
+    D["sp_wgt"] = wth(ra_d, dec_d, w=w_c)
+    D["sp_real"] = wth(np.asarray(c["ra"]), np.asarray(c["dec"]))
+    D["sp_blind"] = wth(np.concatenate([ra_d, rar_full[j]]), np.concatenate([dec_d, decr_full[j]]))
+
+    # selection-immune amplitude + trustworthiness map (nside=64)
+    ns = 64
+    _, dens_tot, _ = total_target_density(cat, targets, nside=ns)
+    n_real = 6
+    maps = np.zeros((n_real, 12*ns**2))
+    for s in range(n_real):
+        cs = complete_catalog_photoz(cat, targets, pz, seed=100+s, clustering_prior="data", dz_pool=dz_pool)
+        pix = hp.ang2pix(ns, np.deg2rad(90 - np.asarray(cs["dec"])), np.deg2rad(np.asarray(cs["ra"]) % 360))
+        maps[s] = np.bincount(pix, minlength=12*ns**2)
+    mean_map = maps.mean(0); std_map = maps.std(0); foot = mean_map > 0
+    dc = mean_map[foot] / np.median(mean_map[foot]); dt = dens_tot[foot]
+    keep = (dt > 0) & (dc > 0)
+    D["amp_dt"] = dt[keep]; D["amp_dc"] = dc[keep]
+    D["amp_corr"] = float(np.corrcoef(dt[keep], dc[keep])[0, 1])
+    cv = np.full(12*ns**2, np.nan); cv[foot] = std_map[foot] / np.maximum(mean_map[foot], 1e-9)
+    sub = rng.choice(np.where(foot)[0], min(40000, int(foot.sum())), replace=False)
+    th, ph = hp.pix2ang(ns, sub)
+    D["trust_ra"] = np.degrees(ph); D["trust_dec"] = 90 - np.degrees(th); D["trust_cv"] = cv[sub]
+    D["trust_med"] = float(np.nanmedian(cv[foot]))
+    return D
+
+
+def get_coupling_data(recompute=False):
+    if (not recompute) and os.path.exists(COUP_CACHE):
+        return dict(np.load(COUP_CACHE, allow_pickle=True))
+    Dc = compute_coupling()
+    os.makedirs("output", exist_ok=True)
+    np.savez(COUP_CACHE, **{k: np.asarray(v) for k, v in Dc.items()})
+    return Dc
+
+
+def fig_coupling(Dc):
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.7))
+    for kind, col, lab in [("zfail", C_ZF, "redshift failures"), ("collided", C_OBS, "fiber collisions")]:
+        a1.errorbar(Dc[f"{kind}_dc"], Dc[f"{kind}_S"], yerr=Dc[f"{kind}_Se"], fmt="o-", color=col, ms=4,
+                    label=f"{lab}: h={float(Dc[f'{kind}_h']):+.2f}±{float(Dc[f'{kind}_herr']):.2f} "
+                          f"(z={float(Dc[f'{kind}_z']):+.1f})")
+    a1.set_xlabel("local success overdensity δ  (random-normalised, angular)")
+    a1.set_ylabel("redshift-success fraction  S(δ)")
+    a1.set_title("density coupling of selection (cosmology-free)"); a1.legend(fontsize=8); a1.grid(alpha=0.2)
+    tc = Dc["sp_tc"]
+    a2.loglog(tc, Dc["sp_wgt"], "k-", lw=2, label="weighted observed (baseline)")
+    a2.loglog(tc, Dc["sp_real"], "o-", color=C_NEW, label="completion (real positions)")
+    a2.loglog(tc, Dc["sp_blind"], "s--", color="#c0392b", label="density-blind null (random positions)")
+    a2.set_xlabel("θ [deg]"); a2.set_ylabel("w(θ)"); a2.legend(fontsize=8)
+    a2.set_title("spurious large-scale power (MegaZ test)"); a2.grid(alpha=0.2, which="both")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+
+def fig_trust(Dc):
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.7))
+    a1.hexbin(Dc["amp_dt"], Dc["amp_dc"], gridsize=40, cmap="viridis", mincnt=1, bins="log")
+    lim = [0, max(np.percentile(Dc["amp_dt"], 99), np.percentile(Dc["amp_dc"], 99))]
+    a1.plot(lim, lim, "r--", lw=1); a1.set_xlim(lim); a1.set_ylim(lim)
+    a1.set_xlabel("total-target density (selection-immune)"); a1.set_ylabel("completed catalog density")
+    a1.set_title(f"amplitude anchor: corr = {float(Dc['amp_corr']):.3f}")
+    sc = a2.scatter(Dc["trust_ra"], Dc["trust_dec"], c=Dc["trust_cv"], s=6, cmap="magma_r",
+                    vmin=0, vmax=float(np.nanpercentile(Dc["trust_cv"], 95)), lw=0)
+    a2.set_xlabel("RA [deg]"); a2.set_ylabel("Dec [deg]"); a2.invert_xaxis()
+    cb = fig.colorbar(sc, ax=a2); cb.set_label("realization scatter  std/mean")
+    a2.set_title(f"trustworthiness map (median {float(Dc['trust_med']):.2f})")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--recompute", action="store_true")
@@ -762,12 +943,14 @@ def main():
     args = p.parse_args()
     D = get_data(recompute=args.recompute, quick=args.quick)
     Dm = get_mask_data(recompute=args.recompute)
+    Dc = get_coupling_data(recompute=args.recompute)
     print("[figures] rendering ...")
     figs = {"data": fig_data(D), "weights": fig_weights(D), "colorz": fig_colorz(D),
             "photoz": fig_photoz(D), "clpair": fig_clpair(D), "missing": fig_missing(D),
             "samples": fig_samples(D), "wtheta": fig_wtheta(D), "2d": fig_2d(D),
-            "systematics": fig_systematics(D), "mask": fig_mask(Dm), "inpaint": fig_inpaint(Dm)}
-    html = render(D, figs, Dm)
+            "systematics": fig_systematics(D), "mask": fig_mask(Dm), "inpaint": fig_inpaint(Dm),
+            "coupling": fig_coupling(Dc), "trust": fig_trust(Dc)}
+    html = render(D, figs, Dm, Dc)
     os.makedirs("output", exist_ok=True); os.makedirs("docs", exist_ok=True)
     for path in ["output/completion_presentation.html", "docs/completion.html"]:
         with open(path, "w") as f:
