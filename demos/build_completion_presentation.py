@@ -618,17 +618,20 @@ def render(D, figs, Dm, Dc):
              "that uncertainty). This is an optional hole-free field product, separate from the "
              "unbiased masked clustering catalogs.</figcaption></figure>")
     H.append(f"<p>To judge how well the transplant works, here are <b>{int(Dm['n_gallery'])} interior "
-             f"holes</b> shown before and after. Each row is one hole: <b>left</b> the observed "
-             f"galaxies around the empty region (the gap is plainly visible); <b>right</b> the same "
-             f"region after inpainting, with the transplanted galaxies in blue at 70% opacity so any "
-             f"overlap with the real galaxies is visible. The fill follows the surrounding density and "
-             f"carries real redshifts and colours.</p>")
-    H.append(img("inpaint_gallery") + "<figcaption>Before/after for "
-             f"{int(Dm['n_gallery'])} interior mask holes (each row: observed | inpainted). Inpainted "
-             "galaxies are drawn semi-transparent (alpha 0.7). All panels share the astronomical RA "
-             "convention (increasing leftwards), wrapped so the South cap is contiguous. Like every "
-             "figure here, this is a live Veusz embed — zoom, restyle, or re-export it in "
-             "place.</figcaption></figure>")
+             f"holes</b>, one per row, with three views each: <b>left</b>, the actual DESI Legacy "
+             f"Survey multicolour imaging of the spot (deeper imaging of the same SGC sky the SDSS "
+             f"targeting used) — often a saturated bright star or bad field is visible, the reason the "
+             f"region was masked; <b>middle</b>, the observed galaxies around the empty region (the gap "
+             f"is plainly visible); <b>right</b>, the same region after inpainting, with the "
+             f"transplanted galaxies in blue at 70% opacity so any overlap with real galaxies shows. "
+             f"The fill follows the surrounding density and carries real redshifts and colours.</p>")
+    H.append(img("inpaint_gallery") + "<figcaption>For "
+             f"{int(Dm['n_gallery'])} interior mask holes (each row: Legacy imaging | observed | "
+             "inpainted). Inpainted galaxies are semi-transparent (alpha 0.7). Panels use the "
+             "astronomical RA convention (increasing leftwards), wrapped so the South cap is "
+             "contiguous; the imaging cutout is centred on the hole at the panel's field of view. The "
+             "static view (shown) carries the imaging; clicking opens the live, editable Veusz "
+             "before/after.</figcaption></figure>")
 
     # --- selection coupling + validation (Wechsler v0 lessons, cosmology-free) ---
     gc = lambda k: float(Dc[k])
@@ -988,23 +991,73 @@ def fig_trust(Dc):
     fig.tight_layout(); return fig_to_b64(fig)
 
 
-def fig_inpaint_gallery(Dm):
-    """Static poster mirroring the interactive gallery: holes before/after (RA-wrapped)."""
+def fetch_gallery_cutouts(Dm, figs_dir, layer="ls-dr10", size=512):
+    """Fetch (and cache) a DESI Legacy Survey multicolor cutout per gallery hole.
+
+    The interior mask holes are bright-star masks / bad fields / tiling gaps; the
+    cutout shows what is actually in the imaging there (e.g. the saturated star
+    that caused the mask). Centred on each hole at the panel's field of view.
+    Legacy (DECaLS/BASS/MzLS) imaging of the same SGC sky as the SDSS targeting,
+    but deeper. Returns a list of local JPEG paths (or None on failure). Cached:
+    refetched only if the file is missing."""
+    import urllib.request
+    os.makedirs(figs_dir, exist_ok=True)
+    cra = np.asarray(Dm["gcen_ra"]) % 360.0; cdec = np.asarray(Dm["gcen_dec"])
+    box = np.asarray(Dm["gbox"]); n = int(Dm["n_gallery"])
+    paths = []
+    for k in range(n):
+        out = os.path.join(figs_dir, f"cutout_{k}.jpg")
+        if not os.path.exists(out) or os.path.getsize(out) < 2000:
+            pixscale = max(0.262, 2 * box[k] * 3600.0 / size)        # arcsec/pix for the FOV
+            url = (f"https://www.legacysurvey.org/viewer/jpeg-cutout?ra={cra[k]:.5f}"
+                   f"&dec={cdec[k]:.5f}&layer={layer}&pixscale={pixscale:.3f}&size={size}")
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "graphGP-cosmology/1.0"})
+                data = urllib.request.urlopen(req, timeout=60).read()
+                if len(data) > 2000:
+                    with open(out, "wb") as f:
+                        f.write(data)
+                else:
+                    out = None
+            except Exception as e:
+                print(f"  [cutout {k+1}] fetch failed: {e}"); out = None
+        paths.append(out if (out and os.path.exists(out)) else None)
+    print(f"[figures] gallery cutouts: {sum(p is not None for p in paths)}/{n} fetched/cached")
+    return paths
+
+
+def fig_inpaint_gallery(Dm, cutouts=None):
+    """Static poster mirroring the interactive gallery: per hole, the Legacy imaging
+    cutout, the observed galaxies (the gap), and the inpainted fill (RA-wrapped)."""
+    import matplotlib.image as mpimg
     n = int(Dm["n_gallery"])
     g_ra, g_dec, g_hid = Dm["gal_ra"], Dm["gal_dec"], Dm["gal_hid"]
     i_ra, i_dec, i_hid = Dm["inp_ra"], Dm["inp_dec"], Dm["inp_hid"]
     cra, cdec, rad, box = Dm["gcen_ra"], Dm["gcen_dec"], Dm["grad"], Dm["gbox"]
-    fig, axes = plt.subplots(n, 2, figsize=(8, 3.0 * max(n, 1)))
+    ncol = 3 if cutouts is not None else 2
+    fig, axes = plt.subplots(n, ncol, figsize=(4.0 * ncol, 3.0 * max(n, 1)))
     axes = np.atleast_2d(axes)
+    titles = (["imaging (Legacy)", "observed", "inpainted"] if ncol == 3 else ["observed", "inpainted"])
     for k in range(n):
         go = g_hid == k; io = i_hid == k; cosd = np.cos(np.radians(cdec[k]))
-        for j, ax in enumerate(axes[k]):
+        xlo, xhi = cra[k] + box[k] / cosd, cra[k] - box[k] / cosd      # RA increases left
+        ylo, yhi = cdec[k] - box[k], cdec[k] + box[k]
+        col = 0
+        if ncol == 3:
+            ax = axes[k][0]
+            if cutouts[k] is not None:
+                ax.imshow(mpimg.imread(cutouts[k]), extent=[xlo, xhi, ylo, yhi], aspect="auto")
+            else:
+                ax.text(0.5, 0.5, "no imaging", ha="center", va="center", fontsize=7, transform=ax.transAxes)
+            ax.set_title(f"hole {k+1} ({rad[k]*60:.0f}') - {titles[0]}", fontsize=8)
+            ax.tick_params(labelsize=6); col = 1
+        for j in range(2):
+            ax = axes[k][col + j]
             ax.scatter(g_ra[go], g_dec[go], s=7, c=C_NEUTRAL, alpha=0.7, lw=0)
             if j == 1:
                 ax.scatter(i_ra[io], i_dec[io], s=11, c=C_NEW, alpha=0.7, lw=0)
-            ax.set_xlim(cra[k] + box[k] / cosd, cra[k] - box[k] / cosd)   # RA increases left
-            ax.set_ylim(cdec[k] - box[k], cdec[k] + box[k])
-            ax.set_title(f"hole {k+1} ({rad[k]*60:.0f}') - {'inpainted' if j else 'observed'}", fontsize=8)
+            ax.set_xlim(xlo, xhi); ax.set_ylim(ylo, yhi)
+            ax.set_title(f"hole {k+1} - {titles[col + j]}", fontsize=8)
             ax.tick_params(labelsize=6)
     fig.tight_layout(); return fig_to_b64(fig)
 
@@ -1038,12 +1091,13 @@ def main():
     # Pyodide, etc.); each <veusz-figure> shows its poster and boots editing on click.
     print("[figures] rendering static poster PNGs ...")
     import base64 as _b64
+    cutouts = fetch_gallery_cutouts(Dm, "output/_cutouts")
     posters = {
         "footprint": fig_data(D), "weights": fig_weights(D), "colorz": fig_colorz(D),
         "photoz": fig_photoz(D), "clpair": fig_clpair(D), "missing": fig_missing(D),
         "samples_nz": fig_samples(D), "wtheta": fig_wtheta(D), "xi2d": fig_2d(D),
         "systematics": fig_systematics(D), "mask": fig_mask(Dm), "inpaint_closure": fig_inpaint(Dm),
-        "inpaint_gallery": fig_inpaint_gallery(Dm), "coupling": fig_coupling(Dc), "trust": fig_trust(Dc),
+        "inpaint_gallery": fig_inpaint_gallery(Dm, cutouts), "coupling": fig_coupling(Dc), "trust": fig_trust(Dc),
     }
     for stem, b64 in posters.items():
         with open(os.path.join(figs_dir, stem + ".png"), "wb") as fh:
