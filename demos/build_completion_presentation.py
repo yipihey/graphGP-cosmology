@@ -242,10 +242,14 @@ def get_data(recompute=False, quick=False):
 # ----------------------------------------------------------------------
 # Figures
 # ----------------------------------------------------------------------
+def _wrapra(r):
+    return ((np.asarray(r, float) + 180.0) % 360.0) - 180.0
+
+
 def fig_data(D):
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4.4))
-    a1.scatter(D["sky_ra"], D["sky_dec"], s=1, c=C_NEUTRAL, alpha=0.4, lw=0)
-    a1.set_xlabel("RA [deg]"); a1.set_ylabel("Dec [deg]")
+    a1.scatter(_wrapra(D["sky_ra"]), D["sky_dec"], s=1, c=C_NEUTRAL, alpha=0.4, lw=0)
+    a1.set_xlabel("RA [deg] (wrapped)"); a1.set_ylabel("Dec [deg]")
     a1.set_title("CMASS-SGC footprint (40k of %d shown)" % int(D["N_obs"]))
     a1.invert_xaxis()
     a2.hist(D["z_all"], bins=40, color=C_OBS, alpha=0.85, edgecolor="white", lw=0.4)
@@ -824,8 +828,8 @@ def get_mask_data(recompute=False):
 
 def fig_mask(Dm):
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.6))
-    a1.scatter(Dm["sky_ra"], Dm["sky_dec"], s=1, c=C_NEUTRAL, alpha=0.3, lw=0)
-    a1.scatter(Dm["hole_ra"], Dm["hole_dec"], s=12, facecolors="none", edgecolors="#c0392b", lw=0.8)
+    a1.scatter(_wrapra(Dm["sky_ra"]), Dm["sky_dec"], s=1, c=C_NEUTRAL, alpha=0.3, lw=0)
+    a1.scatter(_wrapra(Dm["hole_ra"]), Dm["hole_dec"], s=12, facecolors="none", edgecolors="#c0392b", lw=0.8)
     a1.set_xlabel("RA [deg]"); a1.set_ylabel("Dec [deg]"); a1.invert_xaxis()
     a1.set_title(f"{int(Dm['n_holes'])} interior mask holes (red) on the footprint")
     a2.hist(Dm["hole_rad"]*60, bins=np.linspace(0, 30, 31), color="#c0392b", alpha=0.8, edgecolor="white", lw=0.4)
@@ -976,11 +980,32 @@ def fig_trust(Dc):
     a1.plot(lim, lim, "r--", lw=1); a1.set_xlim(lim); a1.set_ylim(lim)
     a1.set_xlabel("total-target density (selection-immune)"); a1.set_ylabel("completed catalog density")
     a1.set_title(f"amplitude anchor: corr = {float(Dc['amp_corr']):.3f}")
-    sc = a2.scatter(Dc["trust_ra"], Dc["trust_dec"], c=Dc["trust_cv"], s=6, cmap="magma_r",
+    sc = a2.scatter(_wrapra(Dc["trust_ra"]), Dc["trust_dec"], c=Dc["trust_cv"], s=6, cmap="magma_r",
                     vmin=0, vmax=float(np.nanpercentile(Dc["trust_cv"], 95)), lw=0)
     a2.set_xlabel("RA [deg]"); a2.set_ylabel("Dec [deg]"); a2.invert_xaxis()
     cb = fig.colorbar(sc, ax=a2); cb.set_label("realization scatter  std/mean")
     a2.set_title(f"trustworthiness map (median {float(Dc['trust_med']):.2f})")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+
+def fig_inpaint_gallery(Dm):
+    """Static poster mirroring the interactive gallery: holes before/after (RA-wrapped)."""
+    n = int(Dm["n_gallery"])
+    g_ra, g_dec, g_hid = Dm["gal_ra"], Dm["gal_dec"], Dm["gal_hid"]
+    i_ra, i_dec, i_hid = Dm["inp_ra"], Dm["inp_dec"], Dm["inp_hid"]
+    cra, cdec, rad, box = Dm["gcen_ra"], Dm["gcen_dec"], Dm["grad"], Dm["gbox"]
+    fig, axes = plt.subplots(n, 2, figsize=(8, 3.0 * max(n, 1)))
+    axes = np.atleast_2d(axes)
+    for k in range(n):
+        go = g_hid == k; io = i_hid == k; cosd = np.cos(np.radians(cdec[k]))
+        for j, ax in enumerate(axes[k]):
+            ax.scatter(g_ra[go], g_dec[go], s=7, c=C_NEUTRAL, alpha=0.7, lw=0)
+            if j == 1:
+                ax.scatter(i_ra[io], i_dec[io], s=11, c=C_NEW, alpha=0.7, lw=0)
+            ax.set_xlim(cra[k] + box[k] / cosd, cra[k] - box[k] / cosd)   # RA increases left
+            ax.set_ylim(cdec[k] - box[k], cdec[k] + box[k])
+            ax.set_title(f"hole {k+1} ({rad[k]*60:.0f}') - {'inpainted' if j else 'observed'}", fontsize=8)
+            ax.tick_params(labelsize=6)
     fig.tight_layout(); return fig_to_b64(fig)
 
 
@@ -1009,7 +1034,21 @@ def main():
         "inpaint_gallery": RF.inpaint_gallery(Dm, figs_dir),
         "coupling": RF.coupling(Dc, figs_dir), "trust": RF.trust(Dc, figs_dir),
     }
-    print(f"[figures] wrote {len(os.listdir(figs_dir))} .vsz files to {figs_dir}")
+    # static poster PNGs (so the report displays no matter what — no WebGPU, slow
+    # Pyodide, etc.); each <veusz-figure> shows its poster and boots editing on click.
+    print("[figures] rendering static poster PNGs ...")
+    import base64 as _b64
+    posters = {
+        "footprint": fig_data(D), "weights": fig_weights(D), "colorz": fig_colorz(D),
+        "photoz": fig_photoz(D), "clpair": fig_clpair(D), "missing": fig_missing(D),
+        "samples_nz": fig_samples(D), "wtheta": fig_wtheta(D), "xi2d": fig_2d(D),
+        "systematics": fig_systematics(D), "mask": fig_mask(Dm), "inpaint_closure": fig_inpaint(Dm),
+        "inpaint_gallery": fig_inpaint_gallery(Dm), "coupling": fig_coupling(Dc), "trust": fig_trust(Dc),
+    }
+    for stem, b64 in posters.items():
+        with open(os.path.join(figs_dir, stem + ".png"), "wb") as fh:
+            fh.write(_b64.b64decode(b64))
+    print(f"[figures] wrote {len(os.listdir(figs_dir))} files (.vsz + .png) to {figs_dir}")
     html = render(D, figs, Dm, Dc)
     os.makedirs("output", exist_ok=True); os.makedirs("docs", exist_ok=True)
     # the embed loads .vsz via relative 'figs/...'; mirror the dir next to each HTML

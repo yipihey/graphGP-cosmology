@@ -281,12 +281,22 @@ WASM_BASE = f"{_EMBED_BASE}/wasm"
 EMBED_SCRIPT = f'<script type="module" src="{_EMBED_BASE}/veusz-embed.js"></script>'
 
 
-def embed_tag(vsz_relpath, *, width=720, height=460):
+def embed_tag(vsz_relpath, *, width=720, height=460, poster=True):
     """HTML ``<veusz-figure>`` element referencing a ``.vsz`` (browser-editable).
 
     Carries ``veusz-wheel`` (so the Pyodide worker installs veusz) and
-    ``wasm-base`` (so the WASM paint module resolves) — both are required when the
-    page is served from a different origin than the embed assets."""
+    ``wasm-base`` (so the WASM paint module resolves) — both required when the page
+    is served from a different origin than the embed assets.
+
+    With ``poster`` (default: the sibling ``.png``) the figure shows a **static
+    image** immediately and only boots the heavy interactive engine on demand —
+    so the report displays no matter what (no WebGPU, slow Pyodide, etc.) and the
+    editable Veusz is an opt-in enhancement."""
+    poster_attr = ""
+    if poster:
+        png = poster if isinstance(poster, str) else (
+            vsz_relpath[:-4] + ".png" if vsz_relpath.endswith(".vsz") else vsz_relpath + ".png")
+        poster_attr = f'poster="{png}" eager="false" '
     return (f'<veusz-figure src="{vsz_relpath}" veusz-wheel="{WHEEL_URL}" '
-            f'wasm-base="{WASM_BASE}" width="{width}" height="{height}" '
+            f'wasm-base="{WASM_BASE}" {poster_attr}width="{width}" height="{height}" '
             f'style="display:block;max-width:100%"></veusz-figure>')
