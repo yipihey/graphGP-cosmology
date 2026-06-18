@@ -275,14 +275,18 @@ _EMBED_BASE = f"https://yipihey.github.io/veusz/embed/{EMBED_SCRIPT_VERSION}"
 # The browser embed runs veusz headless in a (shared, singleton) Pyodide worker;
 # it only installs veusz when given the wheel URL via the `veusz-wheel` attribute.
 WHEEL_URL = f"{_EMBED_BASE}/veusz-{EMBED_SCRIPT_VERSION[1:]}-py3-none-any.whl"
+# the Rust/WASM paint module lives under a wasm/ subdir; without wasm-base the
+# embed does import("undefined/veusz_paint_wasm.js") -> "module script failed".
+WASM_BASE = f"{_EMBED_BASE}/wasm"
 EMBED_SCRIPT = f'<script type="module" src="{_EMBED_BASE}/veusz-embed.js"></script>'
 
 
 def embed_tag(vsz_relpath, *, width=720, height=460):
     """HTML ``<veusz-figure>`` element referencing a ``.vsz`` (browser-editable).
 
-    Carries ``veusz-wheel`` so the embed's Pyodide worker installs veusz (without
-    it the worker raises ``No module named 'veusz'``)."""
+    Carries ``veusz-wheel`` (so the Pyodide worker installs veusz) and
+    ``wasm-base`` (so the WASM paint module resolves) — both are required when the
+    page is served from a different origin than the embed assets."""
     return (f'<veusz-figure src="{vsz_relpath}" veusz-wheel="{WHEEL_URL}" '
-            f'width="{width}" height="{height}" '
+            f'wasm-base="{WASM_BASE}" width="{width}" height="{height}" '
             f'style="display:block;max-width:100%"></veusz-figure>')
