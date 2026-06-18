@@ -362,12 +362,15 @@ def complete_catalog_photoz(
                 z_miss[i] = rng.choice(zk[a][ok], p=w[ok] / w[ok].sum()) if ok.any() else rng.choice(z_o)
                 zhost_fallback[i] = True
     elif z_mode == "field":
-        # PRINCIPLED, GP/local-density-informed redshift. A missing galaxy at angular
+        # PRINCIPLED, local-density (KNN) redshift estimate. A missing galaxy at angular
         # position n̂ is drawn from its LINE-OF-SIGHT density posterior
         #   p(z | n̂, colours) ∝ (1+δ_g(n̂,z)) · n̄(z) · p_photoz(z|colours)
         # where (1+δ_g)·n̄ is estimated nonparametrically as a KDE of the redshifts of
-        # the K nearest observed (spec-z) galaxies (the data-driven GP field along the
-        # sightline), p_photoz is the colour likelihood, and collisions add the
+        # the K nearest observed (spec-z) galaxies — a fast, cosmology-free KNN
+        # *approximation* to the conditional GP field along the sightline (the actual
+        # graphGP Matheron posterior is the separate engine in density_field.py; on real
+        # CMASS it recovers the same clustering, so this KNN proxy is the default).
+        # p_photoz is the colour likelihood, and collisions add the
         # close-pair prior about the host. This places each galaxy on a REAL, colour-
         # consistent local structure (sharp where structure is) instead of a delta at
         # one neighbour (NN) or a broad LOS-smearing photo-z — recovering 3-D clustering.

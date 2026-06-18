@@ -13,7 +13,7 @@ The completion's structure makes it cheaply shareable:
     storage per sample.
 
 This module:
-  * :func:`build_package` — runs the expensive GP/local-density posterior ONCE and
+  * :func:`build_package` — runs the expensive local-density (KNN) posterior ONCE and
     returns a compact package (immutable observed base + missing positions + per-
     object inverse-CDF + systot weights + provenance).
   * :func:`write_package` / :func:`load_package` — heavily-compressed (.npz, uint16

@@ -3,7 +3,7 @@
 Equal-weight, cosmology-free completed catalogs of BOSS DR12 CMASS-South. Every
 realization keeps the 109,636 observed galaxies (fixed) and adds the
 6,777 spectroscopically-missing galaxies (fiber collisions + redshift
-failures) at their real imaging positions with a GP/local-density redshift. The
+failures) at their real imaging positions with a data-driven local-density (KNN) redshift. The
 posterior is stored compactly so you draw as many samples as you like locally.
 
 ## Files

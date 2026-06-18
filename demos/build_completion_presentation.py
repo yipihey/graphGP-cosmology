@@ -513,7 +513,7 @@ def render(D, figs, Dm, Dc):
              "incompleteness (fiber collisions, redshift failures, imaging systematics) been "
              "negligible. Every observed galaxy is kept at its spectroscopic (RA, Dec, z); each "
              "missing galaxy is added at its real SDSS imaging position with a redshift drawn "
-             "from a GP/local-density posterior. The realizations differ only in the missing "
+             "from a local-density (KNN) posterior. The realizations differ only in the missing "
              "galaxies' redshifts, so the ensemble spread is the calibrated uncertainty <i>of the "
              "completion</i>. Any summary statistic — w(θ), ξ(Δθ,Δz), wp(rp), multipoles, "
              "counts-in-cells, kNN-CDF, higher-order — can be computed directly from the points."
@@ -673,25 +673,29 @@ def render(D, figs, Dm, Dc):
              "over-corrects; the <b>oracle</b> curve (missing galaxies placed at their "
              f"<i>true</i> redshift) recovers to {v['tr_oracle_lo']:.3f}–{v['tr_oracle_hi']:.3f}, "
              "proving the entire residual lives in the redshift assignment. The fix — a "
-             "GP/local-density redshift (below) — closes the gap.</figcaption></figure>")
+             "local-density (KNN) redshift (below) — closes the gap.</figcaption></figure>")
     H.append(pimg("output/patchy_truth_recovery.png") +
              "<figcaption><b>Independent N-body mocks (MultiDark-Patchy SGC).</b> The same "
              "battery on independent clustering with its own randoms. Recovery is faithful above "
              "~1 Mpc/h; the residual sub-Mpc deficit is a known Patchy artifact (its 1-halo term "
              "is not realistic), confirmed by the real-BOSS-truth test recovering the small "
              "scales the Patchy mock cannot.</figcaption></figure>")
-    H.append("<div class='callout'><b>The GP/local-density redshift (the key fix).</b> A raw "
+    H.append("<div class='callout'><b>The local-density redshift (the key fix).</b> A raw "
              "photo-z posterior has σ<sub>z</sub>≈0.03 (~90 Mpc/h), which smears the "
              "line-of-sight pair counts and drives wp(rp) 3–4% low. Instead of drawing from the "
              "photo-z alone — or collapsing each missing galaxy onto its nearest neighbour's "
              "redshift, which is unphysically sharp — we draw from "
              "<b>p(z | n̂, colours) ∝ (1+δ<sub>g</sub>(n̂,z)) · n̄(z) · p<sub>photoz</sub></b>, "
              "where (1+δ<sub>g</sub>)·n̄ is a kernel estimate of the local redshift density built "
-             "from the K nearest observed spectroscopic galaxies along the sightline — a "
-             "data-driven Gaussian-process field. The photo-z picks the right peak; the local "
-             "galaxy field sharpens it to the physical clustering scale; no cosmology is assumed. "
-             "This is what brings wp(rp), the redshift-space multipoles ξ0/ξ2, the higher-order "
-             "statistics and the angular w(θ) all back to truth at once.</div>")
+             "from the K nearest observed spectroscopic galaxies along the sightline. This default "
+             "engine is a fast, cosmology-free <b>KNN approximation</b> to a conditional Gaussian-"
+             "process field — not a GP itself. The actual graphGP Matheron posterior is available "
+             "as a separate engine; a head-to-head on real CMASS shows the two recover the same "
+             "clustering to ~1%, so the KNN proxy is the default (it is also what compresses to the "
+             "2&nbsp;MB shareable package). The photo-z picks the right peak; the local galaxy "
+             "field sharpens it to the physical clustering scale; no cosmology is assumed. This is "
+             "what brings wp(rp), the redshift-space multipoles ξ0/ξ2, the higher-order statistics "
+             "and the angular w(θ) all back to truth at once.</div>")
 
     # ---- Higher-order ----
     H.append("<h2 id='highorder'>Higher-order and coincidence-sensitive statistics</h2>")
@@ -875,11 +879,11 @@ def render(D, figs, Dm, Dc):
              "<tr><th>Effect</th><th>Mechanism</th><th>Correction</th><th>Residual</th>"
              "<th>Validation</th></tr>"
              "<tr><td>Fiber collisions</td><td>close pairs (&lt;62″) dropped; small-scale "
-             "deficit</td><td>add at real imaging position; redshift from GP-field × close-pair "
+             "deficit</td><td>add at real imaging position; redshift from local-density (KNN) field × close-pair "
              "Δz prior</td><td>&lt;1–2% on wp(rp)</td><td>truth recovery; kNN-CDF; scale "
              "40–90″ &lt;0.6%</td></tr>"
              "<tr><td>Redshift failures</td><td>spectrum taken, no reliable z</td><td>add at real "
-             "position; redshift from GP-field posterior</td><td>partial (~75% of weight-implied); "
+             "position; redshift from local-density (KNN) field posterior</td><td>partial (~75% of weight-implied); "
              "&lt;1% on wp</td><td>truth recovery; failure-population photo-z audit; coupling test "
              "(uncoupled)</td></tr>"
              "<tr><td>Imaging systematics</td><td>stellar density / seeing / extinction modulate "
