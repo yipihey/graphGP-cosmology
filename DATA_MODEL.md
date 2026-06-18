@@ -29,6 +29,38 @@ with the best-estimate redshift and its uncertainty. The stochastic
 WEIGHT_SYSTOT *additions* are NOT in the summary (they are in the ensemble);
 instead `WEIGHT_SYSTOT` is provided as a column for users who prefer to weight.
 
+## Compact posterior package (recommended — draw your own samples)
+
+Because every realization shares the **same** observed galaxies and only the ~9%
+missing galaxies' redshifts vary (and each missing galaxy's redshift posterior is
+fixed), the whole ensemble compresses to a single small file plus a tiny sampler:
+
+```
+docs/data/
+  cmass_south_posterior.npz   ~2 MB   observed base ONCE + each missing galaxy's
+                                      redshift inverse-CDF (uint16). The whole posterior.
+  cmass_south_randoms.npz     ~5 MB   uniform-footprint randoms (RA, DEC, Z); CMASS is
+                                      ~99% complete (COMP~0.99) so these are uniform to ~1%.
+  draw_samples.py                     standalone numpy-only sampler
+  README.md
+```
+
+A realization is just a **seed** — draw as many as you want (~500/s), no per-sample
+storage. A fixed reproducible ensemble of K catalogs is K seeds (0..K-1), never K
+copies of the observed galaxies. This is ~700× smaller than a stored FITS ensemble
+(2 MB + seeds vs ~1.4 GB for 1000 realizations) and reproduces the full completion
+to n(z) ~1% and w(θ) ~0.1%.
+
+```python
+from draw_samples import load_package, draw
+pkg = load_package("cmass_south_posterior.npz")
+cat = draw(pkg, seed=0)        # dict(ra, dec, z, prov, N) — ~120k equal-weight galaxies
+```
+
+Built by `demos/build_release_bundle.py`; sampler core in
+`twopt_density/posterior_sampler.py`. The FITS ensemble/summary below remain
+available for users who prefer materialized catalogues.
+
 ## Columns
 
 ### ensemble/realization_*.fits  (HDU `CATALOG`)

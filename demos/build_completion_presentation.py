@@ -748,6 +748,18 @@ def render(D, figs, Dm, Dc):
              f"{v['cc_xi0_lo']:.2f}–{v['cc_xi0_hi']:.2f}, and the quadrupole ξ2 (the RSD "
              "anisotropy) is reproduced. The completion is a faithful, equal-weight stand-in for "
              "the standard weighted catalog across the standard statistics.</figcaption></figure>")
+    H.append("<p><b>The strong form — uniform randoms, no weights.</b> An equal-weight catalog "
+             "should also work with a <i>trivial</i> random: uniform over the footprint, no "
+             "completeness weighting. Testing this head-on (cross-checked against the BOSS mangle "
+             "mask) shows CMASS-South is <b>~99% complete</b> (COMP≈0.99 at the galaxies) — so "
+             "there is essentially no angular completeness window to remove, and the survey random "
+             "already <i>is</i> a uniform-footprint random to ~1%. Used that way the completed "
+             "catalog reproduces the official weighted w(θ) to ~1.5% and wp/ξ₀ to ~1–2%. A "
+             "separately-constructed uniform random matches only to the precision with which it "
+             "resolves the survey boundary — a control on the unbiased official data shows the "
+             "same residual, confirming it is the window construction, not the catalog (and the "
+             "<code>mask_DR12v5</code> geometry mask is ~40% larger in area than the LSS clustering "
+             "footprint, so uniform randoms must be clipped to the LSS region).</p>")
 
     H.append("<h2 id='mask'>Survey mask and inpainting</h2>")
     H.append(f"<p>The completion above corrects galaxies missing from <i>observed</i> area. It does "
@@ -906,8 +918,23 @@ def render(D, figs, Dm, Dc):
              "surviving pairs, assumed representative of collided pairs.</div>")
 
     H.append("<h2 id='release'>Data release</h2>")
-    H.append("<p>The product ships as FITS, loadable with astropy, in two complementary "
-             "forms:</p><ul>"
+    H.append("<div class='callout'><b>Draw your own samples (≈2 MB).</b> Because every "
+             "realization shares the same observed galaxies and only the missing ~9% vary, the "
+             "<i>entire posterior</i> ships as one small file + a standalone sampler — no need to "
+             "download a multi-GB ensemble. A realization is just a seed (~500/s); a reproducible "
+             "K-catalog ensemble is K seeds. This is ~700× smaller than a stored ensemble (2 MB vs "
+             "~1.4 GB for 1000 realizations) and reproduces the full completion to n(z)~1%, "
+             "w(θ)~0.1%. Downloads: "
+             "<a href='data/cmass_south_posterior.npz'>cmass_south_posterior.npz</a> (~2 MB) · "
+             "<a href='data/cmass_south_randoms.npz'>cmass_south_randoms.npz</a> (~5 MB) · "
+             "<a href='data/draw_samples.py'>draw_samples.py</a> · "
+             "<a href='data/README.md'>README</a>."
+             "<pre>from draw_samples import load_package, draw\n"
+             "pkg = load_package(\"cmass_south_posterior.npz\")\n"
+             "cat = draw(pkg, seed=0)   # dict(ra, dec, z, prov) — ~120k equal-weight galaxies</pre>"
+             "</div>")
+    H.append("<p>Materialized FITS products are also available (loadable with astropy) in two "
+             "complementary forms:</p><ul>"
              "<li><b>Ensemble</b> (<code>ensemble/realization_*.fits</code>): N equal-weight "
              "realizations — columns <code>RA</code>, <code>DEC</code>, <code>Z</code>, "
              "<code>PROV</code> (provenance). Use the full ensemble to propagate the correction "
