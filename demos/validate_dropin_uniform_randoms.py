@@ -101,6 +101,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n-real", type=int, default=6)
     p.add_argument("--out", default="output/dropin_uniform_randoms.png")
+    p.add_argument("--mangle", default="data/boss/mangle_uniform_radec.npy",
+                   help="npy of (RA,Dec) uniform-geometric randoms from the BOSS mangle mask; "
+                        "if present, used as the uniform window (true geometric boundary) "
+                        "instead of the binary HEALPix footprint")
     args = p.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
@@ -146,8 +150,26 @@ def main():
     Nr = 4 * cat.N_data
     ro = rng.choice(len(rar_full), min(Nr, len(rar_full)), replace=False)
     rar_o, decr_o, zr_o = rar_full[ro], decr_full[ro], zr_full[ro]
-    win_ra, win_dec, win_z = make_uniform_window(footprint_pix, NSIDE_MASK, 8 * cat.N_data, z_pool, rng)
-    print(f"[dropin] randoms: official(survey) {len(rar_o):,} | uniform window {len(win_ra):,} (RR computed once)")
+    if args.mangle and os.path.exists(args.mangle):
+        from scipy.spatial import cKDTree
+        from twopt_density.observed import _radec_to_nhat
+        md = np.load(args.mangle).astype(float)                 # uniform over the mangle GEOMETRY mask
+        # the geometry mask is ~40% larger than the LSS clustering footprint; clip the
+        # uniform points to the LSS footprint = within `clip_deg` of a survey random
+        # (keeps mangle's exact interior uniformity + a fine boundary).
+        clip_deg = 0.12
+        sub = rng.choice(len(rar_full), min(300000, len(rar_full)), replace=False)
+        tree = cKDTree(_radec_to_nhat(rar_full[sub], decr_full[sub]))
+        chord = 2.0 * np.sin(np.radians(clip_deg) / 2.0)
+        d, _ = tree.query(_radec_to_nhat(md[:, 0], md[:, 1]), k=1)
+        keep = d < chord
+        win_ra, win_dec, win_z = md[keep, 0], md[keep, 1], rng.choice(z_pool, int(keep.sum()))
+        win_src = f"mangle mask clipped to LSS footprint (<{clip_deg}°, {keep.mean():.2f} kept)"
+    else:
+        win_ra, win_dec, win_z = make_uniform_window(footprint_pix, NSIDE_MASK, 8 * cat.N_data, z_pool, rng)
+        win_src = f"binary HEALPix footprint (nside {NSIDE_MASK})"
+    print(f"[dropin] randoms: official(survey) {len(rar_o):,} | uniform window {len(win_ra):,} "
+          f"from {win_src} (RR computed once)")
 
     results = {}
 
