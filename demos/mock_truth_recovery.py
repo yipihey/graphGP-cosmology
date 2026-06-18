@@ -26,8 +26,8 @@ from Corrfunc.mocks.DDtheta_mocks import DDtheta_mocks
 from twopt_density.boss import load_boss
 from twopt_density.photoz import PhotoZKNN, photoz_features
 from twopt_density.observed import _radec_to_nhat
-from twopt_density.observed_ls import (complete_catalog_photoz, measure_close_pair_dz,
-                                       measure_K2d, compute_rr)
+from twopt_density.observed_ls import complete_catalog_photoz, measure_close_pair_dz
+from twopt_density.clustering_corrfunc import wp_rp
 from twopt_density.quaia import make_random_from_selection_function
 from twopt_density.mock_systematics import (apply_survey_systematics, load_patchy_truth,
                                             load_patchy_randoms)
@@ -116,14 +116,17 @@ def main():
         print(f"  θ={tc[i]:.3f}: truth={w_truth[i]:.4f} obs={w_obs[i]:.4f} cmp={w_cmp[i]:.4f}"
               f"  cmp/tru={w_cmp[i]/w_truth[i]:.3f}  obs/tru={w_obs[i]/w_truth[i]:.3f}")
 
-    # ---- xi(dtheta, dz=0) recovery ----
-    te = np.concatenate([[0.0], np.geomspace(0.01, 2.5, 14)]); ze = np.linspace(0, 0.03, 9)
-    tcen = np.empty(len(te)-1); tcen[0] = 0.5*te[1]; tcen[1:] = np.sqrt(te[1:-1]*te[2:])
-    rrc = compute_rr(rar, decr, zr, one, theta_edges=te, z_edges=ze)
-    xi_tru = measure_K2d(ra, dec, z, np.ones(len(ra)), rar, decr, zr, one, theta_edges=te, z_edges=ze, precomp_rr=rrc)[2][:,0]
-    Xi = np.array([measure_K2d(np.asarray(c["ra"]),np.asarray(c["dec"]),np.asarray(c["z"]),np.ones(c["N"]),
-                               rar,decr,zr,one,theta_edges=te,z_edges=ze,precomp_rr=rrc)[2][:,0] for c in cats])
-    xi_cmp = Xi.mean(0)
+    # ---- projected wp(rp) recovery (standard statistic, Corrfunc, parallel) ----
+    # fiducial cosmology used ONLY to measure wp; the catalogues stay cosmology-free.
+    rp_edges = np.logspace(np.log10(0.5), np.log10(40.0), 13); rpc = np.sqrt(rp_edges[1:]*rp_edges[:-1])
+    wp_tru, RRwp = wp_rp(ra, dec, z, rar, decr, zr, rp_edges=rp_edges, pimax=40., nthreads=32, return_RR=True)
+    wp_obs = wp_rp(obs.ra_data, obs.dec_data, obs.z_data, rar, decr, zr, rp_edges=rp_edges, pimax=40., nthreads=32, precomp_RR=RRwp)
+    Wp = np.array([wp_rp(np.asarray(c["ra"]), np.asarray(c["dec"]), np.asarray(c["z"]), rar, decr, zr,
+                         rp_edges=rp_edges, pimax=40., nthreads=32, precomp_RR=RRwp) for c in cats])
+    wp_cmp = Wp.mean(0)
+    print("\nwp(rp) recovery  (completed/truth, observed/truth):")
+    for i in range(len(rpc)):
+        print(f"  rp={rpc[i]:6.2f} Mpc/h: truth={wp_tru[i]:7.2f} cmp/tru={wp_cmp[i]/wp_tru[i]:.3f} obs/tru={wp_obs[i]/wp_tru[i]:.3f}")
 
     # ---- n(z) recovery ----
     zb = np.linspace(0.43, 0.62, 30); zc = 0.5*(zb[1:]+zb[:-1])
@@ -153,9 +156,11 @@ def main():
     a.semilogx(tc, w_cmp/w_truth, "o-", color="#3a6ea8", label="completed/truth")
     a.set_ylim(0.7, 1.2); a.set_xlabel("θ [deg]"); a.set_ylabel("ratio to truth"); a.legend(); a.set_title("w(θ) ratio")
     a = ax[1,0]
-    a.semilogx(tcen, np.where(xi_tru>0, xi_cmp/xi_tru, np.nan), "o-", color="#3a6ea8")
-    a.axhline(1, color="gray", ls=":"); a.fill_between(tcen, 0.95, 1.05, color="green", alpha=0.1)
-    a.set_ylim(0.7,1.2); a.set_xlabel("Δθ [deg]"); a.set_ylabel("ξ(Δθ,0) completed/truth"); a.set_title("2-D ξ recovery")
+    a.axhline(1, color="gray", ls=":"); a.fill_between(rpc, 0.95, 1.05, color="green", alpha=0.1)
+    a.semilogx(rpc, wp_obs/wp_tru, "s--", color="#c0392b", label="observed/truth")
+    a.semilogx(rpc, wp_cmp/wp_tru, "o-", color="#3a6ea8", label="completed/truth")
+    a.set_ylim(0.7,1.2); a.set_xlabel("rp [Mpc/h]"); a.set_ylabel("wp(rp) ratio to truth")
+    a.legend(); a.set_title("projected wp(rp) recovery (Corrfunc)")
     a = ax[1,1]
     a.plot(zc, nz_tru, "k-", lw=2, label="truth"); a.plot(zc, nz_obs, "s--", color="#c0392b", label="observed")
     a.plot(zc, nz_cmp, "o-", color="#3a6ea8", label="completed"); a.set_xlabel("z"); a.set_ylabel("N/bin")
