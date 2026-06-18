@@ -1,0 +1,22 @@
+# Environment for the BOSS CMASS completion pipeline (catalogues + validation).
+# conda env create -f environment.yml   (then: pip install Corrfunc, build the graphgp fork)
+name: graphgp-cosmology
+channels: [conda-forge]
+dependencies:
+  - python=3.11
+  - numpy=2.2.2
+  - scipy=1.15.1
+  - astropy=7.2.0
+  - healpy=1.19.0
+  - matplotlib=3.10.0
+  - numba=0.65.1
+  - pip
+  - pip:
+      - astroquery==0.4.11          # Gaia bright-star cross-match (sync queries)
+      - Corrfunc==2.5.3             # parallel pair counts (wp/ξ via is_comoving_dist)
+      - jax==0.10.1                 # coordinate transforms in boss.py (set JAX_PLATFORMS=cpu if no GPU)
+      # - PyQt6==6.9.1              # optional: only for headless .vsz validation of the Veusz report
+# Notes:
+#  - graphGP fork (~/Projects/graphgp) on PYTHONPATH for the GP/LGCP utilities.
+#  - run with OMP_NUM_THREADS=32 for the parallel Corrfunc pair counts;
+#    JAX_PLATFORMS=cpu avoids a CUDA-init error in load_boss when no GPU is free.
