@@ -38,35 +38,16 @@ TARGETS = "data/boss/cmass_targets_South.fits"
 
 
 def graphgp_catalogs(res, cat, tg, pz, dz, n_real, rng):
-    """Assemble observed+missing catalogs whose missing-z come from the GP field draws."""
-    z_o = np.asarray(cat.z_data); ra_o = np.asarray(cat.ra_data); dec_o = np.asarray(cat.dec_data)
-    ra_m = np.asarray(tg.ra); dec_m = np.asarray(tg.dec)
-    host = np.asarray(tg.host_index); z_host = np.where(host >= 0, z_o[np.clip(host, 0, len(z_o)-1)], np.nan)
-    coll = (np.asarray(tg.miss_kind) == "collided") & (host >= 0)
-    feat = photoz_features(tg.colors, tg.mags); zk, wk = pz.posterior(feat)
-    pcl = _clpair_density(dz)
-    nside = res.nside; zc = 0.5 * (res.z_edges[1:] + res.z_edges[:-1])
-    zgrid = np.linspace(z_o.min(), z_o.max(), 256)
-    nbar_z = np.interp(zgrid, zc, np.histogram(z_o, bins=res.z_edges)[0].astype(float), left=0, right=0)
-    pix = hp.ang2pix(nside, np.radians(90 - dec_m), np.radians(ra_m % 360))
-    M = len(ra_m); bw_p = 0.02
+    """Observed+missing catalogs from the GP field draws, via the FIRST-CLASS engine
+    ``complete_catalog_photoz(z_mode='graphgp', gp_field=res)`` (systot stripped to
+    isolate the redshift assignment). ``rng`` is unused (seeds are seed=0..n_real-1)."""
+    from twopt_density.observed_ls import PROV
     cats = []
     for s in range(n_real):
-        dl = res.delta_lightcone[s]                                  # (n_z, N_pix) = 1+delta
-        zmiss = np.empty(M)
-        for i in range(M):
-            pf = np.interp(zgrid, zc, dl[:, pix[i]], left=0, right=0) * nbar_z   # GP local density x n(z)
-            w = wk[i]; ok = np.isfinite(w) & (w > 0)
-            pp = ((w[ok][None, :] * np.exp(-0.5 * ((zgrid[:, None] - zk[i][ok][None, :]) / bw_p) ** 2)).sum(1)
-                  if ok.any() else np.ones_like(zgrid))
-            p = pf * pp
-            if coll[i]:
-                p = p * pcl(zgrid - z_host[i])
-            ss = p.sum()
-            zmiss[i] = (rng.choice(zgrid, p=p / ss) if ss > 0
-                        else (z_host[i] if np.isfinite(z_host[i]) else np.median(z_o)))
-        cats.append({"ra": np.concatenate([ra_o, ra_m]), "dec": np.concatenate([dec_o, dec_m]),
-                     "z": np.concatenate([z_o, zmiss])})
+        c = complete_catalog_photoz(cat, tg, pz, seed=s, dz_pool=dz, z_mode="graphgp", gp_field=res)
+        m = np.asarray(c["prov"]) != PROV["systot"]
+        cats.append({"ra": np.asarray(c["ra"])[m], "dec": np.asarray(c["dec"])[m],
+                     "z": np.asarray(c["z"])[m]})
     return cats
 
 

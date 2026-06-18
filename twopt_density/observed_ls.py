@@ -284,6 +284,56 @@ def _systot_restore_extras(base_ra, base_dec, base_z, src, rng, jitter_arcsec=1.
     return ra % 360.0, dec, base_z[src]
 
 
+def build_gp_field(catalog, *, n_samples=8, seed=0, verbose=False, **kwargs):
+    """Convenience builder for ``z_mode='graphgp'``: the conditional GP posterior
+    density field (graphGP / Matheron). Build ONCE and pass as ``gp_field=`` to
+    :func:`complete_catalog_photoz` to amortise the (expensive) field solve across
+    an ensemble of realizations. Thin wrapper over
+    :func:`density_field.sample_posterior_density_field` (``kwargs``: nside,
+    n_z_bins, r_edges, …)."""
+    from .density_field import sample_posterior_density_field
+    return sample_posterior_density_field(catalog, n_samples=n_samples, seed=seed,
+                                          verbose=verbose, **kwargs)
+
+
+def _graphgp_zmiss(targets, photoz, dz_pool, gp_field, draw_index, z_o, z_host, miss_kind, rng):
+    """Missing-galaxy redshifts from ONE conditional GP field draw, evaluated along
+    each missing galaxy's sightline:
+        p(z | n̂, colours) ∝ (1+δ_GP(n̂,z)) · n̄(z) · p_photoz(z)   (× close-pair prior)
+    i.e. z_mode='field' with the graphGP posterior field replacing the KNN-KDE local
+    density (correlated across missing galaxies via the shared draw). Returns
+    ``(z_miss, zhost_fallback)``."""
+    import healpy as hp
+    from .photoz import photoz_features
+    ra_m = np.asarray(targets.ra, np.float64); dec_m = np.asarray(targets.dec, np.float64)
+    host = np.asarray(targets.host_index); coll = (miss_kind == "collided") & (host >= 0)
+    feat = photoz_features(targets.colors, targets.mags); zk, wk = photoz.posterior(feat)
+    pcl = _clpair_density(dz_pool)
+    nside = gp_field.nside; zc = 0.5 * (gp_field.z_edges[1:] + gp_field.z_edges[:-1])
+    zgrid = np.linspace(z_o.min(), z_o.max(), 256)
+    nbar_z = np.interp(zgrid, zc, np.histogram(z_o, bins=gp_field.z_edges)[0].astype(float),
+                       left=0.0, right=0.0)
+    dl = gp_field.delta_lightcone[draw_index % gp_field.n_samples]      # (n_z, N_pix) = 1+δ
+    pix = hp.ang2pix(nside, np.radians(90.0 - dec_m), np.radians(ra_m % 360.0))
+    bw_p = 0.02; M = len(ra_m)
+    z_miss = np.empty(M); fb = np.zeros(M, bool)
+    for i in range(M):
+        pf = np.interp(zgrid, zc, dl[:, pix[i]], left=0.0, right=0.0) * nbar_z   # GP local density × n̄(z)
+        w = wk[i]; ok = np.isfinite(w) & (w > 0)
+        pp = ((w[ok][None, :] * np.exp(-0.5 * ((zgrid[:, None] - zk[i][ok][None, :]) / bw_p) ** 2)).sum(1)
+              if ok.any() else np.ones_like(zgrid))
+        p = pf * pp
+        if coll[i]:
+            p = p * pcl(zgrid - z_host[i])
+        s = p.sum()
+        if s > 0:
+            z_miss[i] = rng.choice(zgrid, p=p / s)
+        else:
+            z_miss[i] = z_host[i] if np.isfinite(z_host[i]) else float(np.median(z_o))
+            fb[i] = True
+    return z_miss, fb
+
+
 @perf.timed("complete_catalog_photoz")
 def complete_catalog_photoz(
     catalog, targets, photoz,
@@ -294,6 +344,8 @@ def complete_catalog_photoz(
     count: str = "round",
     systot_mode: str = "analog",
     z_mode: str = "field",
+    gp_field=None,
+    gp_kwargs=None,
     verbose: bool = False,
 ):
     """Equal-weight completion using REAL imaging positions + photo-z redshifts.
@@ -322,6 +374,24 @@ def complete_catalog_photoz(
     weighted clustering is reproduced in the mean. Cosmology-free throughout.
     Returns ``dict(ra, dec, z, N, prov)`` where ``prov`` is a per-object
     provenance code (see :data:`PROV`).
+
+    ``z_mode`` selects the missing-galaxy redshift engine:
+
+    - ``'field'`` (default): a local-density (KNN) KDE of the K nearest observed
+      spec-z along the sightline × p_photoz × close-pair prior. Fast, cosmology-
+      free, compresses to the shareable inverse-CDF package.
+    - ``'graphgp'``: the **conditional anisotropic GP posterior** density field
+      (graphGP / Matheron, :func:`density_field.sample_posterior_density_field`)
+      evaluated along each missing sightline — correlated across missing galaxies,
+      the more flexible engine other surveys may need. Pass a precomputed
+      ``gp_field`` (a ``DensityFieldResult``; realization ``seed % n_samples`` is
+      used) to amortise the field solve across an ensemble; if ``None`` it is built
+      from ``catalog`` with ``n_samples=1`` (one solve per call — pass ``gp_field``
+      for ensembles). ``gp_kwargs`` (dict) overrides the build (nside, n_z_bins,
+      r_edges, …). The fiducial cosmology in the GP prior is a gauge/unit choice
+      (validated cosmology-invariant to <0.1%), so this stays data-driven.
+    - ``'nn'``: nearest-neighbour host z (+ close-pair Δz for collisions). Sharp.
+    - ``'photoz'``: per-object p(z|colours) only (LOS-smeared).
     """
     from .photoz import photoz_features
 
@@ -399,6 +469,18 @@ def complete_catalog_photoz(
             else:
                 z_miss[i] = z_host[i] if np.isfinite(z_host[i]) else rng.choice(z_o)
                 zhost_fallback[i] = True
+    elif z_mode == "graphgp":
+        # CONDITIONAL ANISOTROPIC GP posterior field (graphGP / Matheron) along each
+        # missing sightline — the principled, correlated version of 'field' (the more
+        # flexible engine for other surveys). Pass a precomputed gp_field to amortise
+        # the solve across an ensemble (realization = seed % n_samples); else build one.
+        if gp_field is None:
+            gp_field = build_gp_field(catalog, n_samples=1, seed=seed, **(gp_kwargs or {}))
+            draw_index = 0
+        else:
+            draw_index = seed % gp_field.n_samples
+        z_miss, zhost_fallback = _graphgp_zmiss(targets, photoz, dz_pool, gp_field, draw_index,
+                                                z_o, z_host, miss_kind, rng)
     else:
         # 'photoz': per-object redshift from p(z|colours) × close-pair prior (more
         # realistic per-object z, but LOS-smeared — degrades 3-D redshift-space clustering).
