@@ -96,3 +96,39 @@ def xi_smu_multipoles(ra, dec, z, rar, decr, zr, *, s_edges, nmu=20, w=None, wr=
     xi2 = 2.0 * 5.0 * (cf * L2[None, :] * dmu).sum(axis=1)
     scen = np.sqrt(s_edges[1:] * s_edges[:-1])
     return scen, xi0, xi2, (RR if return_RR else None)
+
+
+def xi_smu_ell024(ra, dec, z, rar, decr, zr, *, s_edges, nmu=20, w=None, wr=None,
+                  cosmo=None, nthreads=32, precomp_RR=None, return_RR=False):
+    """Like :func:`xi_smu_multipoles` but also returns the hexadecapole ξ4.
+
+    Returns ``(scen, xi0, xi2, xi4, RR)``. Used for the full multipole drop-in
+    comparison (ℓ = 0, 2, 4)."""
+    from Corrfunc.mocks.DDsmu_mocks import DDsmu_mocks
+    from Corrfunc.utils import convert_3d_counts_to_cf
+    d = comoving_mpc_h(z, cosmo); dr = comoving_mpc_h(zr, cosmo)
+    w = np.ones(len(ra)) if w is None else w
+    wr = np.ones(len(rar)) if wr is None else wr
+    ND, NR = len(ra), len(rar)
+
+    def smu(autocorr, A_ra, A_dec, A_d, A_w, B_ra=None, B_dec=None, B_d=None, B_w=None):
+        kw = dict(weights1=_f8(A_w), weight_type="pair_product", is_comoving_dist=True)
+        if B_ra is not None:
+            kw.update(RA2=_f8(B_ra), DEC2=_f8(B_dec), CZ2=_f8(B_d), weights2=_f8(B_w))
+        return DDsmu_mocks(autocorr, 1, nthreads, 1.0, nmu, s_edges,
+                           _f8(A_ra), _f8(A_dec), _f8(A_d), **kw)
+
+    DD = smu(1, ra, dec, d, w)
+    DR = smu(0, ra, dec, d, w, rar, decr, dr, wr)
+    RR = precomp_RR if precomp_RR is not None else smu(1, rar, decr, dr, wr)
+    ns = len(s_edges) - 1
+    cf = convert_3d_counts_to_cf(ND, ND, NR, NR, DD, DR, DR, RR).reshape(ns, nmu)
+    mu = (np.arange(nmu) + 0.5) / nmu
+    dmu = 1.0 / nmu
+    L2 = 0.5 * (3 * mu ** 2 - 1)
+    L4 = (35 * mu ** 4 - 30 * mu ** 2 + 3) / 8.0
+    xi0 = 2.0 * (cf * dmu).sum(axis=1)
+    xi2 = 2.0 * 5.0 * (cf * L2[None, :] * dmu).sum(axis=1)
+    xi4 = 2.0 * 9.0 * (cf * L4[None, :] * dmu).sum(axis=1)
+    scen = np.sqrt(s_edges[1:] * s_edges[:-1])
+    return scen, xi0, xi2, xi4, (RR if return_RR else None)
