@@ -159,7 +159,7 @@ def complete_catalog(
     *,
     seed: int = 0,
     collision_scale_deg: float = 62.0 / 3600.0,
-    count: str = "poisson",
+    count: str = "round",
     z_assign: str = "data",
     dz_pool=None,
     verbose: bool = False,
@@ -291,7 +291,7 @@ def complete_catalog_photoz(
     seed: int = 0,
     clustering_prior: str = "data",
     dz_pool=None,
-    count: str = "poisson",
+    count: str = "round",
     systot_mode: str = "analog",
     verbose: bool = False,
 ):
