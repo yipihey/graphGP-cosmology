@@ -29,7 +29,8 @@ from twopt_density.observed import _radec_to_nhat
 from twopt_density.observed_ls import (complete_catalog_photoz, measure_close_pair_dz,
                                        measure_K2d, compute_rr)
 from twopt_density.quaia import make_random_from_selection_function
-from twopt_density.mock_systematics import apply_survey_systematics
+from twopt_density.mock_systematics import (apply_survey_systematics, load_patchy_truth,
+                                            load_patchy_randoms)
 
 DATA = "data/boss/galaxy_DR12v5_CMASS_South.fits.gz"
 RAND = "data/boss/random0_DR12v5_CMASS_South.fits.gz"
@@ -56,15 +57,25 @@ def main():
     p.add_argument("--n-real", type=int, default=8)
     p.add_argument("--coll-frac", type=float, default=0.6)
     p.add_argument("--zfail-frac", type=float, default=0.014)
+    p.add_argument("--patchy", default=None, help="Patchy mock .dat as truth (else real BOSS)")
+    p.add_argument("--patchy-randoms", default="data/boss/mocks/Patchy-Mocks-Randoms-DR12SGC-COMPSAM_V6C_x10.dat")
     p.add_argument("--out", default="output/mock_truth_recovery.png")
     args = p.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     cat = load_boss([DATA], [RAND], sample="CMASS", nside=256, with_photometry=True)
-    ra = np.asarray(cat.ra_data); dec = np.asarray(cat.dec_data); z = np.asarray(cat.z_data)
-    colors = np.asarray(cat.colors_data); mags = np.asarray(cat.mags_data)
-    wsys = np.asarray(cat.w_sys_data)              # realistic w_systot amplitude template
-    print(f"TRUTH = {len(ra):,} real CMASS-South galaxies")
+    patchy_rand = None
+    if args.patchy:
+        ra, dec, z, colors, mags, wsys = load_patchy_truth(args.patchy, cat, z_min=0.43, z_max=0.7)
+        print(f"TRUTH = {len(ra):,} Patchy SGC mock galaxies (CMASS z-range), "
+              f"colours z-matched to real CMASS, w_systot from real BOSS pattern")
+        prr, prd, prz = load_patchy_randoms(args.patchy_randoms, z_min=0.43, z_max=0.7, max_n=450_000)
+        patchy_rand = (prr, prd, prz)
+    else:
+        ra = np.asarray(cat.ra_data); dec = np.asarray(cat.dec_data); z = np.asarray(cat.z_data)
+        colors = np.asarray(cat.colors_data); mags = np.asarray(cat.mags_data)
+        wsys = np.asarray(cat.w_sys_data)          # realistic w_systot amplitude template
+        print(f"TRUTH = {len(ra):,} real CMASS-South galaxies")
 
     # ---- inject known systematics ----
     obs, tg, kept = apply_survey_systematics(
@@ -82,8 +93,11 @@ def main():
 
     # ---- randoms (shared) ----
     rng = np.random.default_rng(7)
-    rar, decr, zr = make_random_from_selection_function(
-        sel_map=cat.sel_map, n_random=2*len(ra), z_data=z, nside=cat.nside, rng=rng)
+    if patchy_rand is not None:
+        rar, decr, zr = patchy_rand
+    else:
+        rar, decr, zr = make_random_from_selection_function(
+            sel_map=cat.sel_map, n_random=2*len(ra), z_data=z, nside=cat.nside, rng=rng)
     one = np.ones(len(rar))
 
     # ---- completion ensemble ----

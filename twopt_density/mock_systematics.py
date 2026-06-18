@@ -36,6 +36,67 @@ from .observed import _radec_to_nhat
 from .cmass_targets import CMASSTargets
 
 
+def load_patchy_truth(path, real_cat, *, z_min=0.43, z_max=0.7, nside_wsys=128, seed=0):
+    """Load a MultiDark-Patchy SGC COMPSAM mock as a TRUTH catalogue for recovery.
+
+    Patchy mocks have realistic, N-body-calibrated clustering INDEPENDENT of the
+    real data (a stronger truth than using the real galaxies). Columns are
+    ``RA Dec z log10(Mstar) nbar bias veto w_cp``; we keep the CMASS z-range with
+    ``veto==1`` (the complete parent). Patchy has no colours and no imaging-
+    systematic field, so we attach realistic ones for the forward model: colours
+    & mags are drawn from real CMASS galaxies matched in redshift (preserving the
+    colour-z relation + scatter), and a per-galaxy w_systot is looked up from a
+    HEALPix map of the real BOSS WEIGHT_SYSTOT (the true spatial pattern; 1 where
+    the footprint is uncovered). Returns ``(ra, dec, z, colors, mags, w_systot)``."""
+    import healpy as hp
+    rng = np.random.default_rng(seed)
+    arr = np.loadtxt(path, usecols=(0, 1, 2, 6))
+    ra, dec, z, veto = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+    keep = (z >= z_min) & (z <= z_max) & (veto == 1)
+    ra, dec, z = ra[keep], dec[keep], z[keep]
+
+    # colours/mags from real CMASS matched in z (fine z-bins, random draw per bin)
+    zr = np.asarray(real_cat.z_data); cr = np.asarray(real_cat.colors_data)
+    mr = np.asarray(real_cat.mags_data) if real_cat.mags_data is not None else None
+    fin = np.isfinite(cr).all(axis=1)
+    zr, cr = zr[fin], cr[fin]; mr = None if mr is None else mr[fin]
+    edges = np.linspace(z_min, z_max, 200)
+    which_r = np.clip(np.digitize(zr, edges) - 1, 0, len(edges) - 2)
+    bins = {b: np.where(which_r == b)[0] for b in np.unique(which_r)}
+    which_p = np.clip(np.digitize(z, edges) - 1, 0, len(edges) - 2)
+    sel = np.empty(len(z), int)
+    allidx = np.arange(len(zr))
+    for b in np.unique(which_p):
+        pool = bins.get(b, allidx)
+        m = which_p == b
+        sel[m] = rng.choice(pool, int(m.sum()), replace=True)
+    colors = cr[sel]; mags = None if mr is None else mr[sel]
+
+    # w_systot from a HEALPix map of the real BOSS WEIGHT_SYSTOT
+    wmap = np.ones(hp.nside2npix(nside_wsys))
+    pr = hp.ang2pix(nside_wsys, np.radians(90 - np.asarray(real_cat.dec_data)),
+                    np.radians(np.asarray(real_cat.ra_data) % 360))
+    wsys_r = np.asarray(real_cat.w_sys_data)
+    num = np.bincount(pr, weights=wsys_r, minlength=len(wmap))
+    den = np.bincount(pr, minlength=len(wmap))
+    wmap[den > 0] = num[den > 0] / den[den > 0]
+    pp = hp.ang2pix(nside_wsys, np.radians(90 - dec), np.radians(ra % 360))
+    w_systot = wmap[pp]
+    return ra, dec, z, colors, mags, w_systot
+
+
+def load_patchy_randoms(path, *, z_min=0.43, z_max=0.7, max_n=None, seed=0):
+    """Load Patchy randoms (RA Dec z nbar bias veto w_cp); keep z-range, veto==1."""
+    arr = np.loadtxt(path, usecols=(0, 1, 2, 5))
+    ra, dec, z, veto = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+    keep = (z >= z_min) & (z <= z_max) & (veto == 1)
+    ra, dec, z = ra[keep], dec[keep], z[keep]
+    if max_n is not None and len(ra) > max_n:
+        j = np.random.default_rng(seed).choice(len(ra), max_n, replace=False)
+        ra, dec, z = ra[j], dec[j], z[j]
+    return ra, dec, z
+
+
 @dataclass
 class MockObserved:
     """Minimal BOSS-catalogue interface used by complete_catalog_photoz / photoz."""
