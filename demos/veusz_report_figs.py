@@ -134,20 +134,21 @@ def inpaint_gallery(Dm, figs_dir):
     i_ra, i_dec, i_hid = np.asarray(Dm["inp_ra"]), np.asarray(Dm["inp_dec"]), np.asarray(Dm["inp_hid"])
     cra, cdec = np.asarray(Dm["gcen_ra"]), np.asarray(Dm["gcen_dec"])
     rad = np.asarray(Dm["grad"]); box = np.asarray(Dm["gbox"])
+    reason = Dm["greason"] if "greason" in Dm else np.array(["hole"] * n, dtype=object)
     panels = []
     for k in range(n):
         go = g_hid == k; io = i_hid == k
         cosd = np.cos(np.radians(cdec[k]))
         xr = (cra[k] - box[k] / cosd, cra[k] + box[k] / cosd)
         yr = (cdec[k] - box[k], cdec[k] + box[k])
-        rr = f"r={rad[k]*60:.0f}'"
+        why = str(reason[k])
         # note: equal_aspect collapses panels inside a grid (zero plot area) — omit it
         before = Panel([Series(g_ra[go], g_dec[go], color=C_NEUTRAL, marker="dot", size="3pt", alpha=0.7)],
-                       xlabel="", ylabel="Dec", title=f"hole {k+1} ({rr}) - observed",
+                       xlabel="", ylabel="Dec", title=f"{why} - observed",
                        xrange=xr, yrange=yr, invert_x=True)
         after = Panel([Series(g_ra[go], g_dec[go], color=C_NEUTRAL, marker="dot", size="3pt", alpha=0.7),
                        Series(i_ra[io], i_dec[io], color=C_NEW, marker="circle", size="3.5pt", alpha=0.7)],
-                      xlabel="", ylabel="", title=f"hole {k+1} - inpainted",
+                      xlabel="", ylabel="", title=f"{why} - inpainted",
                       xrange=xr, yrange=yr, invert_x=True)
         panels += [before, after]
     path = os.path.join(figs_dir, "inpaint_gallery.vsz")

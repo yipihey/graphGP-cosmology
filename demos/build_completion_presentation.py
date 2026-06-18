@@ -617,20 +617,23 @@ def render(D, figs, Dm, Dc):
              "to or larger than the correlation length are weakly constrained (the realizations span "
              "that uncertainty). This is an optional hole-free field product, separate from the "
              "unbiased masked clustering catalogs.</figcaption></figure>")
-    H.append(f"<p>To judge how well the transplant works, here are <b>{int(Dm['n_gallery'])} interior "
-             f"holes</b>, one per row, with three views each: <b>left</b>, the actual DESI Legacy "
-             f"Survey multicolour imaging of the spot (deeper imaging of the same SGC sky the SDSS "
-             f"targeting used) — often a saturated bright star or bad field is visible, the reason the "
-             f"region was masked; <b>middle</b>, the observed galaxies around the empty region (the gap "
-             f"is plainly visible); <b>right</b>, the same region after inpainting, with the "
-             f"transplanted galaxies in blue at 70% opacity so any overlap with real galaxies shows. "
-             f"The fill follows the surrounding density and carries real redshifts and colours.</p>")
+    H.append(f"<p>To show <i>why</i> the holes exist and how well the transplant works, here are "
+             f"<b>{int(Dm['n_gallery'])} interior holes</b> — {int(Dm['n_starmask'])} bright-star masks "
+             f"(identified by cross-matching hole centres against Gaia) and the rest bad-field/tiling "
+             f"gaps — one per row, with three views each: <b>left</b>, the actual <b>SDSS</b> "
+             f"<i>ugriz</i> imaging the photometric catalogue and BOSS spectroscopic targets were drawn "
+             f"from — a heavily saturated bright star (with bleed trails and halos) or a bad field is "
+             f"plainly the reason the region was masked; <b>middle</b>, the observed galaxies around the "
+             f"empty region (the gap is visible); <b>right</b>, after inpainting, with the transplanted "
+             f"galaxies in blue at 70% opacity so any overlap with real galaxies shows. The fill follows "
+             f"the surrounding density and carries real redshifts and colours.</p>")
     H.append(img("inpaint_gallery") + "<figcaption>For "
-             f"{int(Dm['n_gallery'])} interior mask holes (each row: Legacy imaging | observed | "
-             "inpainted). Inpainted galaxies are semi-transparent (alpha 0.7). Panels use the "
-             "astronomical RA convention (increasing leftwards), wrapped so the South cap is "
-             "contiguous; the imaging cutout is centred on the hole at the panel's field of view. The "
-             "static view (shown) carries the imaging; clicking opens the live, editable Veusz "
+             f"{int(Dm['n_gallery'])} interior mask holes (each row: SDSS imaging | observed | "
+             f"inpainted), labelled by cause (Gaia G magnitude of the masking star, or bad field). "
+             "Cutouts are the exact SDSS imaging (SkyServer), centred on the masking star / hole at the "
+             "panel's field of view. Inpainted galaxies are semi-transparent (alpha 0.7). Panels use the "
+             "astronomical RA convention (increasing leftwards), wrapped so the South cap is contiguous. "
+             "The static view (shown) carries the imaging; clicking opens the live, editable Veusz "
              "before/after.</figcaption></figure>")
 
     # --- selection coupling + validation (Wechsler v0 lessons, cosmology-free) ---
@@ -735,6 +738,31 @@ def render(D, figs, Dm, Dc):
 # ----------------------------------------------------------------------
 # Mask + inpainting (separate cache so it doesn't trigger the main recompute)
 # ----------------------------------------------------------------------
+def _gaia_bright_stars(dec_min, dec_max, gmax=8.0, cache="output/_cutouts/gaia_bright.npz"):
+    """Gaia DR3 stars brighter than ``gmax`` in a Dec band (cached). The bright
+    stars whose vetoes punch the bright-star-mask holes in the catalog."""
+    if cache and os.path.exists(cache):
+        d = np.load(cache); return {"ra": d["ra"], "dec": d["dec"], "mag": d["mag"]}
+    try:
+        from astroquery.gaia import Gaia
+        Gaia.ROW_LIMIT = 6000
+        # synchronous query (the async endpoint is currently flaky); brightest first,
+        # restricted to the CMASS-South RA range so TOP-N covers every bright star.
+        q = (f"SELECT TOP 6000 ra,dec,phot_g_mean_mag FROM gaiadr3.gaia_source "
+             f"WHERE phot_g_mean_mag<{gmax} AND dec BETWEEN {dec_min:.4f} AND {dec_max:.4f} "
+             f"AND (ra < 50 OR ra > 310) ORDER BY phot_g_mean_mag")
+        r = Gaia.launch_job(q).get_results()
+        out = {"ra": np.asarray(r["ra"], float), "dec": np.asarray(r["dec"], float),
+               "mag": np.asarray(r["phot_g_mean_mag"], float)}
+        if cache and len(out["ra"]):
+            os.makedirs(os.path.dirname(cache), exist_ok=True); np.savez(cache, **out)
+        print(f"  [gaia] {len(out['ra'])} bright stars (G<{gmax}) in dec [{dec_min:.1f},{dec_max:.1f}]")
+        return out
+    except Exception as e:
+        print(f"  [gaia] query failed ({e}); gallery falls back to largest holes")
+        return None
+
+
 def compute_mask():
     import healpy as hp
     from Corrfunc.mocks.DDtheta_mocks import DDtheta_mocks
@@ -780,28 +808,49 @@ def compute_mask():
     bx = lambda ra, dec: (np.abs(((ra-big.ra+180)%360)-180) < 1.0) & (np.abs(dec-big.dec) < 1.0)
     mb_o = bx(ra_d, dec_d); mb_i = bx(real["ra"], real["dec"])
 
-    # ---- inpaint GALLERY: many holes, before (observed) vs after (inpainted) ----
+    # ---- inpaint GALLERY: holes shown with their CAUSE (bright stars / bad fields) ----
     # work in wrapped RA so holes near RA=0/360 are contiguous; store per-hole.
+    from twopt_density.observed import _radec_to_nhat
+    from scipy.spatial import cKDTree
     wrap = lambda r: ((np.asarray(r, float) + 180.0) % 360.0) - 180.0
     hid_all = real["hole_id"].astype(int)
-    per_hole = np.bincount(hid_all, minlength=len(holes))
-    ra_d_w = wrap(ra_d); inp_ra_w = wrap(real["ra"])
-    # show the most-filled visible holes (clearest before/after); honest counts.
-    cand = [hi for hi, h in enumerate(holes)
-            if per_hole[hi] >= 1 and 0.05 <= h.radius_deg <= 0.7]
-    cand.sort(key=lambda hi: -per_hole[hi])
-    cand = cand[:12]
+    hra = np.array([h.ra for h in holes]) % 360.0
+    hdec = np.array([h.dec for h in holes]); hrad = np.array([h.radius_deg for h in holes])
+
+    # nearest Gaia bright star to each hole -> identify bright-star masks
+    stars = _gaia_bright_stars(float(hdec.min()) - 0.5, float(hdec.max()) + 0.5, gmax=8.0)
+    if stars is not None and len(stars["ra"]):
+        sd, sj = cKDTree(_radec_to_nhat(stars["ra"], stars["dec"])).query(_radec_to_nhat(hra, hdec))
+        sep = np.degrees(2 * np.arcsin(np.clip(sd / 2, 0, 1)))
+        smag = stars["mag"][sj]; sra = stars["ra"][sj] % 360.0; sdec = stars["dec"][sj]
+    else:
+        sep = np.full(len(holes), 99.0); smag = np.full(len(holes), 99.0)
+        sra = hra.copy(); sdec = hdec.copy()
+    # a bright-star mask is a SMALL hole with a bright star at its centre (a star
+    # inside a large hole is incidental, not the cause) — require both.
+    is_star = (hrad < 0.2) & (sep < np.maximum(hrad, 5.0 / 60.0))
+    star_holes = sorted(np.where(is_star)[0], key=lambda i: smag[i])[:8]   # brightest first
+    gap_holes = [i for i in np.argsort(-hrad)
+                 if (not is_star[i]) and 0.15 <= hrad[i] <= 0.6][:4]       # bad-field gaps
+    cand = list(star_holes) + list(gap_holes)
+
     g_ra, g_dec, g_hid, i_ra, i_dec, i_hid = [], [], [], [], [], []
-    c_ra, c_dec, c_rad, c_box = [], [], [], []
+    c_ra, c_dec, c_rad, c_box, c_mag, c_reason = [], [], [], [], [], []
+    ra_d_w = wrap(ra_d); inp_ra_w = wrap(real["ra"])
     for k, hi in enumerate(cand):
-        h = holes[hi]; cw = wrap(h.ra); cd = h.dec
-        R = max(2.5 * h.radius_deg, 0.22)
+        if hi in star_holes:                              # centre on the STAR; tight FOV
+            cw = wrap(sra[hi]); cd = float(sdec[hi]); R = min(max(4.0 * hrad[hi], 0.10), 0.2)
+            mag = float(smag[hi]); reason = f"G={mag:.1f} star"
+        else:                                             # bad-field / tiling gap
+            cw = wrap(hra[hi]); cd = float(hdec[hi]); R = min(max(2.5 * hrad[hi], 0.3), 1.0)
+            mag = float("nan"); reason = "bad field / gap"
         cosd = np.cos(np.radians(cd))
         mo = (np.abs((ra_d_w - cw) * cosd) < R) & (np.abs(dec_d - cd) < R)
         mi = (hid_all == hi)
         g_ra.append(ra_d_w[mo]); g_dec.append(dec_d[mo]); g_hid.append(np.full(int(mo.sum()), k))
         i_ra.append(inp_ra_w[mi]); i_dec.append(real["dec"][mi]); i_hid.append(np.full(int(mi.sum()), k))
-        c_ra.append(cw); c_dec.append(cd); c_rad.append(h.radius_deg); c_box.append(R)
+        c_ra.append(cw); c_dec.append(cd); c_rad.append(hrad[hi]); c_box.append(R)
+        c_mag.append(mag); c_reason.append(reason)
     cat_ = lambda L: (np.concatenate(L) if L else np.zeros(0))
     return {
         "sky_ra": ra_d[sub], "sky_dec": dec_d[sub],
@@ -809,6 +858,8 @@ def compute_mask():
         "inp_ra": cat_(i_ra), "inp_dec": cat_(i_dec), "inp_hid": cat_(i_hid),
         "gcen_ra": np.array(c_ra), "gcen_dec": np.array(c_dec),
         "grad": np.array(c_rad), "gbox": np.array(c_box), "n_gallery": len(cand),
+        "gstar_mag": np.array(c_mag), "greason": np.array(c_reason, dtype=object),
+        "n_starmask": len(star_holes),
         "hole_ra": np.array([h.ra for h in holes]), "hole_dec": np.array([h.dec for h in holes]),
         "hole_rad": np.array([h.radius_deg for h in holes]),
         "hole_area_tot": float(sum(h.area_deg2 for h in holes)), "n_holes": len(holes),
@@ -991,38 +1042,46 @@ def fig_trust(Dc):
     fig.tight_layout(); return fig_to_b64(fig)
 
 
-def fetch_gallery_cutouts(Dm, figs_dir, layer="ls-dr10", size=512):
-    """Fetch (and cache) a DESI Legacy Survey multicolor cutout per gallery hole.
+def fetch_gallery_cutouts(Dm, figs_dir, dr="dr17", size=512):
+    """Fetch (and cache) an **SDSS** multicolor cutout per gallery hole.
 
-    The interior mask holes are bright-star masks / bad fields / tiling gaps; the
-    cutout shows what is actually in the imaging there (e.g. the saturated star
-    that caused the mask). Centred on each hole at the panel's field of view.
-    Legacy (DECaLS/BASS/MzLS) imaging of the same SGC sky as the SDSS targeting,
-    but deeper. Returns a list of local JPEG paths (or None on failure). Cached:
-    refetched only if the file is missing."""
-    import urllib.request
+    This is the EXACT imaging the photometric catalog and BOSS spectroscopic
+    targets were drawn from (SDSS ugriz; SkyServer ``ImgCutout/getjpeg`` serves
+    that same imaging). Centred on each hole's cause (the bright star for a
+    bright-star mask, else the hole centroid) at the panel's field of view, so
+    the saturated star / bad field that punched the hole is visible. Returns a
+    list of local JPEG paths (None on failure). Cached: refetched only if
+    missing. A browser User-Agent is required (SkyServer 403s default agents)."""
+    import urllib.request, time
     os.makedirs(figs_dir, exist_ok=True)
+    UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/120 Safari/537.36")
     cra = np.asarray(Dm["gcen_ra"]) % 360.0; cdec = np.asarray(Dm["gcen_dec"])
     box = np.asarray(Dm["gbox"]); n = int(Dm["n_gallery"])
     paths = []
     for k in range(n):
         out = os.path.join(figs_dir, f"cutout_{k}.jpg")
         if not os.path.exists(out) or os.path.getsize(out) < 2000:
-            pixscale = max(0.262, 2 * box[k] * 3600.0 / size)        # arcsec/pix for the FOV
-            url = (f"https://www.legacysurvey.org/viewer/jpeg-cutout?ra={cra[k]:.5f}"
-                   f"&dec={cdec[k]:.5f}&layer={layer}&pixscale={pixscale:.3f}&size={size}")
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": "graphGP-cosmology/1.0"})
-                data = urllib.request.urlopen(req, timeout=60).read()
-                if len(data) > 2000:
-                    with open(out, "wb") as f:
-                        f.write(data)
-                else:
-                    out = None
-            except Exception as e:
-                print(f"  [cutout {k+1}] fetch failed: {e}"); out = None
+            scale = 2 * box[k] * 3600.0 / size                       # arcsec/pix for the FOV
+            url = (f"https://skyserver.sdss.org/{dr}/SkyServerWS/ImgCutout/getjpeg?"
+                   f"ra={cra[k]:.5f}&dec={cdec[k]:.5f}&scale={scale:.3f}&width={size}&height={size}")
+            ok = False
+            for attempt in range(4):                                 # SkyServer rate-limits (403)
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": UA})
+                    data = urllib.request.urlopen(req, timeout=60).read()
+                    if len(data) > 2000 and data[:2] == b"\xff\xd8":  # valid JPEG
+                        with open(out, "wb") as f:
+                            f.write(data)
+                        ok = True; break
+                except Exception as e:
+                    err = e
+                time.sleep(1.5 * (attempt + 1))                      # back off and retry
+            if not ok:
+                print(f"  [cutout {k+1}] SDSS fetch failed: {err}"); out = None
+            time.sleep(0.4)                                          # be gentle between requests
         paths.append(out if (out and os.path.exists(out)) else None)
-    print(f"[figures] gallery cutouts: {sum(p is not None for p in paths)}/{n} fetched/cached")
+    print(f"[figures] gallery cutouts (SDSS {dr}): {sum(p is not None for p in paths)}/{n} fetched/cached")
     return paths
 
 
@@ -1034,14 +1093,16 @@ def fig_inpaint_gallery(Dm, cutouts=None):
     g_ra, g_dec, g_hid = Dm["gal_ra"], Dm["gal_dec"], Dm["gal_hid"]
     i_ra, i_dec, i_hid = Dm["inp_ra"], Dm["inp_dec"], Dm["inp_hid"]
     cra, cdec, rad, box = Dm["gcen_ra"], Dm["gcen_dec"], Dm["grad"], Dm["gbox"]
+    reason = Dm["greason"] if "greason" in Dm else np.array(["hole"] * n, dtype=object)
     ncol = 3 if cutouts is not None else 2
     fig, axes = plt.subplots(n, ncol, figsize=(4.0 * ncol, 3.0 * max(n, 1)))
     axes = np.atleast_2d(axes)
-    titles = (["imaging (Legacy)", "observed", "inpainted"] if ncol == 3 else ["observed", "inpainted"])
+    labels = (["imaging (SDSS)", "observed", "inpainted"] if ncol == 3 else ["observed", "inpainted"])
     for k in range(n):
         go = g_hid == k; io = i_hid == k; cosd = np.cos(np.radians(cdec[k]))
         xlo, xhi = cra[k] + box[k] / cosd, cra[k] - box[k] / cosd      # RA increases left
         ylo, yhi = cdec[k] - box[k], cdec[k] + box[k]
+        why = str(reason[k])
         col = 0
         if ncol == 3:
             ax = axes[k][0]
@@ -1049,7 +1110,7 @@ def fig_inpaint_gallery(Dm, cutouts=None):
                 ax.imshow(mpimg.imread(cutouts[k]), extent=[xlo, xhi, ylo, yhi], aspect="auto")
             else:
                 ax.text(0.5, 0.5, "no imaging", ha="center", va="center", fontsize=7, transform=ax.transAxes)
-            ax.set_title(f"hole {k+1} ({rad[k]*60:.0f}') - {titles[0]}", fontsize=8)
+            ax.set_title(f"{why} - {labels[0]}", fontsize=8)
             ax.tick_params(labelsize=6); col = 1
         for j in range(2):
             ax = axes[k][col + j]
@@ -1057,7 +1118,7 @@ def fig_inpaint_gallery(Dm, cutouts=None):
             if j == 1:
                 ax.scatter(i_ra[io], i_dec[io], s=11, c=C_NEW, alpha=0.7, lw=0)
             ax.set_xlim(xlo, xhi); ax.set_ylim(ylo, yhi)
-            ax.set_title(f"hole {k+1} - {titles[col + j]}", fontsize=8)
+            ax.set_title(f"{labels[col + j]}", fontsize=8)
             ax.tick_params(labelsize=6)
     fig.tight_layout(); return fig_to_b64(fig)
 
