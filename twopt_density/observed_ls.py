@@ -293,6 +293,7 @@ def complete_catalog_photoz(
     dz_pool=None,
     count: str = "round",
     systot_mode: str = "analog",
+    z_mode: str = "field",
     verbose: bool = False,
 ):
     """Equal-weight completion using REAL imaging positions + photo-z redshifts.
@@ -331,28 +332,86 @@ def complete_catalog_photoz(
     wsys_o = np.asarray(catalog.w_sys_data if catalog.w_sys_data is not None
                         else np.ones(len(ra_o)))
 
-    # ---- redshift of each missing target: photo-z posterior × clustering prior ----
-    feat = photoz_features(targets.colors, targets.mags)
-    zk, wk = photoz.posterior(feat)                       # (M,k) neighbour z + weights
-    host = targets.host_index
+    # ---- redshift of each missing target ----
+    host = np.asarray(targets.host_index)
     z_host = np.where(host >= 0, z_o[np.clip(host, 0, len(z_o) - 1)], np.nan)
-    if clustering_prior == "data":
-        if dz_pool is None:
-            dz_pool = measure_close_pair_dz(catalog)
+    miss_kind = np.asarray(targets.miss_kind)
+    if dz_pool is None:
+        dz_pool = measure_close_pair_dz(catalog)
+    dz_pool = np.asarray(dz_pool, np.float64)
+    M = len(host)
+    z_miss = np.empty(M); zhost_fallback = np.zeros(M, bool)
+
+    if z_mode == "nn":
+        # SHARP, clustering-faithful assignment (BOSS w_cp/w_noz convention; Guo+ 2012):
+        # broad photo-z (sigma_z~0.03 ~ 90 Mpc/h) smears the line of sight and destroys
+        # 3-D redshift-space clustering, so for objects with a host we assign the
+        # nearest-neighbour redshift — collisions get host z + a measured close-pair Δz
+        # (true close pairs sit at ~the host z), redshift failures get the host z.
+        coll = (miss_kind == "collided") & (host >= 0)
+        zf = (miss_kind != "collided") & (host >= 0)
+        z_miss[coll] = z_host[coll] + rng.choice(dz_pool, int(coll.sum()))
+        z_miss[zf] = z_host[zf]
+        nohost = host < 0
+        if nohost.any():                                   # rare: no host -> photo-z / global
+            feat = photoz_features(np.asarray(targets.colors)[nohost],
+                                   None if targets.mags is None else np.asarray(targets.mags)[nohost])
+            zk, wk = photoz.posterior(feat)
+            for a, i in enumerate(np.where(nohost)[0]):
+                w = wk[a]; ok = np.isfinite(w) & (w > 0)
+                z_miss[i] = rng.choice(zk[a][ok], p=w[ok] / w[ok].sum()) if ok.any() else rng.choice(z_o)
+                zhost_fallback[i] = True
+    elif z_mode == "field":
+        # PRINCIPLED, GP/local-density-informed redshift. A missing galaxy at angular
+        # position n̂ is drawn from its LINE-OF-SIGHT density posterior
+        #   p(z | n̂, colours) ∝ (1+δ_g(n̂,z)) · n̄(z) · p_photoz(z|colours)
+        # where (1+δ_g)·n̄ is estimated nonparametrically as a KDE of the redshifts of
+        # the K nearest observed (spec-z) galaxies (the data-driven GP field along the
+        # sightline), p_photoz is the colour likelihood, and collisions add the
+        # close-pair prior about the host. This places each galaxy on a REAL, colour-
+        # consistent local structure (sharp where structure is) instead of a delta at
+        # one neighbour (NN) or a broad LOS-smearing photo-z — recovering 3-D clustering.
+        from scipy.spatial import cKDTree
+        feat = photoz_features(targets.colors, targets.mags)
+        zk, wk = photoz.posterior(feat)
+        K = min(150, len(z_o))
+        _, nn = cKDTree(_radec_to_nhat(ra_o, dec_o)).query(
+            _radec_to_nhat(np.asarray(targets.ra), np.asarray(targets.dec)), k=K, workers=-1)
+        zgrid = np.linspace(z_o.min(), z_o.max(), 256)
+        bw_f, bw_p = 0.004, 0.02                            # field / photo-z KDE bandwidths
         pcl = _clpair_density(dz_pool)
-        coll = (targets.miss_kind == "collided") & (host >= 0)
-        wk = wk.copy()
-        wk[coll] *= pcl(zk[coll] - z_host[coll, None])     # reweight collided only
-    # weighted sample one z per missing object; flag the host-z fallback explicitly
-    z_miss = np.empty(len(zk)); zhost_fallback = np.zeros(len(zk), bool)
-    for i in range(len(zk)):
-        w = wk[i]; ok = np.isfinite(w) & (w > 0)
-        if ok.any():
-            wp = w[ok] / w[ok].sum()
-            z_miss[i] = rng.choice(zk[i][ok], p=wp)
-        else:
-            z_miss[i] = z_host[i] if np.isfinite(z_host[i]) else rng.choice(z_o)
-            zhost_fallback[i] = True
+        coll_i = (miss_kind == "collided") & (host >= 0)
+        for i in range(M):
+            znb = z_o[nn[i]]
+            pf = np.exp(-0.5 * ((zgrid[:, None] - znb[None, :]) / bw_f) ** 2).sum(1)   # local field
+            w = wk[i]; ok = np.isfinite(w) & (w > 0)
+            pp = ((w[ok][None, :] * np.exp(-0.5 * ((zgrid[:, None] - zk[i][ok][None, :]) / bw_p) ** 2)).sum(1)
+                  if ok.any() else np.ones_like(zgrid))
+            p = pf * pp
+            if coll_i[i]:                                   # collisions: sharpen toward the host
+                p = p * pcl(zgrid - z_host[i])
+            s = p.sum()
+            if s > 0:
+                z_miss[i] = rng.choice(zgrid, p=p / s) + rng.normal(0, bw_f * 0.5)
+            else:
+                z_miss[i] = z_host[i] if np.isfinite(z_host[i]) else rng.choice(z_o)
+                zhost_fallback[i] = True
+    else:
+        # 'photoz': per-object redshift from p(z|colours) × close-pair prior (more
+        # realistic per-object z, but LOS-smeared — degrades 3-D redshift-space clustering).
+        feat = photoz_features(targets.colors, targets.mags)
+        zk, wk = photoz.posterior(feat)
+        if clustering_prior == "data":
+            pcl = _clpair_density(dz_pool)
+            coll = (miss_kind == "collided") & (host >= 0)
+            wk = wk.copy(); wk[coll] *= pcl(zk[coll] - z_host[coll, None])
+        for i in range(len(zk)):
+            w = wk[i]; ok = np.isfinite(w) & (w > 0)
+            if ok.any():
+                z_miss[i] = rng.choice(zk[i][ok], p=w[ok] / w[ok].sum())
+            else:
+                z_miss[i] = z_host[i] if np.isfinite(z_host[i]) else rng.choice(z_o)
+                zhost_fallback[i] = True
 
     # ---- base equal-weight set: observed (spec-z) + missing (photo-z) ----
     base_ra = np.concatenate([ra_o, np.asarray(targets.ra, np.float64)])
@@ -366,19 +425,22 @@ def complete_catalog_photoz(
     base_prov = np.concatenate([np.full(len(ra_o), PROV["observed"]), miss_prov])
 
     # ---- imaging-systematic completion ----
-    n = (rng.poisson(base_wsys) if count == "poisson"
-         else np.floor(base_wsys + rng.random(len(base_wsys))).astype(int))
-    if systot_mode == "duplicate":
+    if systot_mode == "duplicate":                         # legacy: exact duplicates (Δθ=0)
+        n = (rng.poisson(base_wsys) if count == "poisson"
+             else np.floor(base_wsys + rng.random(len(base_wsys))).astype(int))
         idx = np.repeat(np.arange(len(base_ra)), n)
         out_ra, out_dec, out_z, out_prov = base_ra[idx], base_dec[idx], base_z[idx], base_prov[idx]
-    else:                                                  # 'analog': keep 1, transplant excess
-        keep = n >= 1
-        src = np.repeat(np.arange(len(base_ra)), np.maximum(n - 1, 0))   # one src per extra
+    else:                                                  # 'analog': KEEP ALL real galaxies,
+        # add only the WEIGHT_SYSTOT EXCESS as local analogs. Never drop a real detection
+        # (so all correlation functions are preserved and no observed galaxy is discarded);
+        # E[n_i] = 1 + max(w_systot-1,0). The excess restores the imaging-systematic deficit.
+        n_extra = np.floor(np.maximum(base_wsys - 1.0, 0.0) + rng.random(len(base_wsys))).astype(int)
+        src = np.repeat(np.arange(len(base_ra)), n_extra)
         ex_ra, ex_dec, ex_z = _systot_restore_extras(base_ra, base_dec, base_z, src, rng)
-        out_ra = np.concatenate([base_ra[keep], ex_ra])
-        out_dec = np.concatenate([base_dec[keep], ex_dec])
-        out_z = np.concatenate([base_z[keep], ex_z])
-        out_prov = np.concatenate([base_prov[keep], np.full(len(ex_ra), PROV["systot"])])
+        out_ra = np.concatenate([base_ra, ex_ra])
+        out_dec = np.concatenate([base_dec, ex_dec])
+        out_z = np.concatenate([base_z, ex_z])
+        out_prov = np.concatenate([base_prov, np.full(len(ex_ra), PROV["systot"])])
     if verbose:
         print(f"[complete-photoz] N_obs={len(ra_o):,} + {targets.N:,} missing "
               f"-> N_eq={len(out_ra):,} (+{100*(len(out_ra)/len(ra_o)-1):.1f}%), "

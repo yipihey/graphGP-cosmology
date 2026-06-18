@@ -215,4 +215,5 @@ def apply_survey_systematics(
         mags=None if mags is None else mags[t_idx], miss_kind=t_kind, host_index=t_host)
 
     kept_mask = np.zeros(n, bool); kept_mask[obs] = True
-    return observed, targets, kept_mask
+    targets_true_z = z[t_idx]            # ORACLE: the true redshifts of the missing (for diagnostics)
+    return observed, targets, kept_mask, targets_true_z

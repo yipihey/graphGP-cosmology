@@ -78,7 +78,7 @@ def main():
         print(f"TRUTH = {len(ra):,} real CMASS-South galaxies")
 
     # ---- inject known systematics ----
-    obs, tg, kept = apply_survey_systematics(
+    obs, tg, kept, tg_true_z = apply_survey_systematics(
         ra, dec, z, colors, mags, wsys, coll_frac=args.coll_frac,
         zfail_frac=args.zfail_frac, zfail_faint_bias=1.5, seed=0)
     print(f"OBSERVED = {obs.N_data:,} ({100*obs.N_data/len(ra):.1f}% of truth); "
@@ -124,9 +124,22 @@ def main():
     Wp = np.array([wp_rp(np.asarray(c["ra"]), np.asarray(c["dec"]), np.asarray(c["z"]), rar, decr, zr,
                          rp_edges=rp_edges, pimax=40., nthreads=32, precomp_RR=RRwp) for c in cats])
     wp_cmp = Wp.mean(0)
-    print("\nwp(rp) recovery  (completed/truth, observed/truth):")
+    # ---- DECOMPOSITION: isolate the wp(rp) residual (redshift vs position vs systot) ----
+    host = np.asarray(tg.host_index); zhost = np.asarray(obs.z_data)[np.clip(host, 0, obs.N_data-1)]
+    znn = zhost.copy(); coll = np.asarray(tg.miss_kind) == "collided"
+    znn[coll] = zhost[coll] + np.random.default_rng(5).choice(dz, int(coll.sum()))   # NN/close-pair z
+    cra = lambda e: np.concatenate([np.asarray(obs.ra_data), np.asarray(tg.ra)[e] if e is not Ellipsis else np.asarray(tg.ra)])
+    # obs + missing(NN z), no systot extras
+    wp_nn = wp_rp(np.r_[obs.ra_data, tg.ra], np.r_[obs.dec_data, tg.dec], np.r_[obs.z_data, znn],
+                  rar, decr, zr, rp_edges=rp_edges, pimax=40., nthreads=32, precomp_RR=RRwp)
+    # ORACLE: obs + missing(TRUE z), no systot extras — isolates the redshift-assignment error
+    wp_or = wp_rp(np.r_[obs.ra_data, tg.ra], np.r_[obs.dec_data, tg.dec], np.r_[obs.z_data, tg_true_z],
+                  rar, decr, zr, rp_edges=rp_edges, pimax=40., nthreads=32, precomp_RR=RRwp)
+    print("\nwp(rp) recovery + decomposition (ratio to truth):")
+    print(f"{'rp':>8}{'obs':>8}{'+miss(NN)':>11}{'oracle(truez)':>14}{'completed':>11}")
     for i in range(len(rpc)):
-        print(f"  rp={rpc[i]:6.2f} Mpc/h: truth={wp_tru[i]:7.2f} cmp/tru={wp_cmp[i]/wp_tru[i]:.3f} obs/tru={wp_obs[i]/wp_tru[i]:.3f}")
+        print(f"{rpc[i]:8.2f}{wp_obs[i]/wp_tru[i]:8.3f}{wp_nn[i]/wp_tru[i]:11.3f}"
+              f"{wp_or[i]/wp_tru[i]:14.3f}{wp_cmp[i]/wp_tru[i]:11.3f}")
 
     # ---- n(z) recovery ----
     zb = np.linspace(0.43, 0.62, 30); zc = 0.5*(zb[1:]+zb[:-1])
