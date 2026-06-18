@@ -257,6 +257,33 @@ def _clpair_density(dz_pool, n_bins: int = 121, dz_max: float = 0.06):
                                h[cen >= 0], left=h[cen >= 0][0], right=0.0)
 
 
+# provenance codes for completed-catalog galaxies (per object)
+PROV = {"observed": 0, "collided": 1, "zfail": 2, "systot": 3, "zhost": 4, "inpaint": 5}
+PROV_NAME = {v: k for k, v in PROV.items()}
+
+
+def _systot_restore_extras(base_ra, base_dec, base_z, src, rng, jitter_arcsec=1.0):
+    """Restore ``len(src)`` WEIGHT_SYSTOT-implied galaxies at the survivor scale.
+
+    WEIGHT_SYSTOT is a *smooth* (degree-scale) imaging-systematic density boost,
+    so the restored galaxies must trace the field at the **survivor's position**
+    (``src[e]``), not be clustered onto an individual neighbour — placing them at
+    the local nearest-neighbour scale (~arcmin) injects spurious small-scale
+    power. We therefore restore each extra at its source position displaced by a
+    Gaussian of ``jitter_arcsec`` (~1″, far below the BOSS fiber scale and any
+    analysis scale), carrying the source redshift. This reproduces w(θ)/ξ at all
+    resolved scales (identically to exact duplication) while removing the
+    unphysical Δθ=0 delta-spike that corrupts kNN / coincident-point statistics.
+    Returns ``(ra, dec, z)`` of the extras."""
+    if len(src) == 0:
+        return (np.zeros(0), np.zeros(0), np.zeros(0))
+    sig = jitter_arcsec / 3600.0
+    cd = np.cos(np.radians(base_dec[src]))
+    ra = base_ra[src] + rng.normal(0, 1, len(src)) * sig / np.maximum(cd, 1e-3)
+    dec = base_dec[src] + rng.normal(0, 1, len(src)) * sig
+    return ra % 360.0, dec, base_z[src]
+
+
 @perf.timed("complete_catalog_photoz")
 def complete_catalog_photoz(
     catalog, targets, photoz,
@@ -265,6 +292,7 @@ def complete_catalog_photoz(
     clustering_prior: str = "data",
     dz_pool=None,
     count: str = "poisson",
+    systot_mode: str = "analog",
     verbose: bool = False,
 ):
     """Equal-weight completion using REAL imaging positions + photo-z redshifts.
@@ -275,12 +303,24 @@ def complete_catalog_photoz(
     KNOWN position with a redshift sampled from its photo-z posterior
     p(z|colours) — for collided objects reweighted by the close-pair clustering
     prior p(Δz) (a physical pair is near the host's z; a projection is not), and
-    (3) apply the imaging systematic w_systot as a per-object Poisson multiplicity
-    on the whole set. Thus E[count per host group] = w_systot·(w_cp+w_noz−1) =
-    w_c, reproducing the weighted clustering in the mean, while the missing
-    galaxies land at their true positions and the per-realization scatter comes
-    from the (calibrated) photo-z redshift uncertainty — exactly the systematic
-    to scan. Cosmology-free throughout. Returns ``dict(ra, dec, z, N)``.
+    (3) realize the imaging systematic w_systot.
+
+    ``systot_mode`` controls (3):
+
+    - ``'analog'`` (default): the integer **excess** ``n_i−1`` of each object is
+      restored at the survivor scale (:func:`_systot_restore_extras`) — a
+      sub-arcsec jitter of the source position carrying its redshift — which
+      reproduces w(θ)/ξ at all resolved scales while removing the unphysical
+      Δθ=0 delta-spike that exact duplication creates and that corrupts kNN /
+      coincident-point statistics. One un-jittered copy of each object with
+      ``n_i≥1`` is kept; ``n_i=0`` thins it.
+    - ``'duplicate'`` (legacy, for A/B tests): ``n_i`` exact copies via
+      ``np.repeat`` (creates Δθ=0 duplicates; biases small-scale/higher-order).
+
+    Either way E[count per host group] = w_systot·(w_cp+w_noz−1) = w_c, so the
+    weighted clustering is reproduced in the mean. Cosmology-free throughout.
+    Returns ``dict(ra, dec, z, N, prov)`` where ``prov`` is a per-object
+    provenance code (see :data:`PROV`).
     """
     from .photoz import photoz_features
 
@@ -303,8 +343,8 @@ def complete_catalog_photoz(
         coll = (targets.miss_kind == "collided") & (host >= 0)
         wk = wk.copy()
         wk[coll] *= pcl(zk[coll] - z_host[coll, None])     # reweight collided only
-    # weighted sample one z per missing object; fall back to host z if degenerate
-    z_miss = np.empty(len(zk))
+    # weighted sample one z per missing object; flag the host-z fallback explicitly
+    z_miss = np.empty(len(zk)); zhost_fallback = np.zeros(len(zk), bool)
     for i in range(len(zk)):
         w = wk[i]; ok = np.isfinite(w) & (w > 0)
         if ok.any():
@@ -312,22 +352,40 @@ def complete_catalog_photoz(
             z_miss[i] = rng.choice(zk[i][ok], p=wp)
         else:
             z_miss[i] = z_host[i] if np.isfinite(z_host[i]) else rng.choice(z_o)
+            zhost_fallback[i] = True
 
     # ---- base equal-weight set: observed (spec-z) + missing (photo-z) ----
     base_ra = np.concatenate([ra_o, np.asarray(targets.ra, np.float64)])
     base_dec = np.concatenate([dec_o, np.asarray(targets.dec, np.float64)])
     base_z = np.concatenate([z_o, z_miss])
     base_wsys = np.concatenate([wsys_o, wsys_o[np.clip(host, 0, len(z_o) - 1)]])
+    # base provenance: observed spec-z, then each missing target by kind (zhost if fell back)
+    miss_prov = np.where(zhost_fallback, PROV["zhost"],
+                         np.where(np.asarray(targets.miss_kind) == "collided",
+                                  PROV["collided"], PROV["zfail"]))
+    base_prov = np.concatenate([np.full(len(ra_o), PROV["observed"]), miss_prov])
 
-    # ---- imaging-systematic completion: Poisson(w_systot) multiplicity ----
+    # ---- imaging-systematic completion ----
     n = (rng.poisson(base_wsys) if count == "poisson"
          else np.floor(base_wsys + rng.random(len(base_wsys))).astype(int))
-    idx = np.repeat(np.arange(len(base_ra)), n)
+    if systot_mode == "duplicate":
+        idx = np.repeat(np.arange(len(base_ra)), n)
+        out_ra, out_dec, out_z, out_prov = base_ra[idx], base_dec[idx], base_z[idx], base_prov[idx]
+    else:                                                  # 'analog': keep 1, transplant excess
+        keep = n >= 1
+        src = np.repeat(np.arange(len(base_ra)), np.maximum(n - 1, 0))   # one src per extra
+        ex_ra, ex_dec, ex_z = _systot_restore_extras(base_ra, base_dec, base_z, src, rng)
+        out_ra = np.concatenate([base_ra[keep], ex_ra])
+        out_dec = np.concatenate([base_dec[keep], ex_dec])
+        out_z = np.concatenate([base_z[keep], ex_z])
+        out_prov = np.concatenate([base_prov[keep], np.full(len(ex_ra), PROV["systot"])])
     if verbose:
         print(f"[complete-photoz] N_obs={len(ra_o):,} + {targets.N:,} missing "
-              f"-> N_eq={len(idx):,} (+{100*(len(idx)/len(ra_o)-1):.1f}%)")
-    return {"ra": base_ra[idx].astype(np.float32), "dec": base_dec[idx].astype(np.float32),
-            "z": base_z[idx].astype(np.float32), "N": len(idx)}
+              f"-> N_eq={len(out_ra):,} (+{100*(len(out_ra)/len(ra_o)-1):.1f}%), "
+              f"mode={systot_mode}, zhost-fallback={int(zhost_fallback.sum())}")
+    return {"ra": out_ra.astype(np.float32), "dec": out_dec.astype(np.float32),
+            "z": out_z.astype(np.float32), "N": len(out_ra),
+            "prov": out_prov.astype(np.int8)}
 
 
 @perf.timed("generate_catalogs_from_kernel")
