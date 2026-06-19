@@ -17,12 +17,7 @@ import numpy as np
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from twopt_density.boss import load_boss
-from twopt_density.photoz import PhotoZKNN
-
-
-def features_of(colors, mags):
-    """Reliable photo-z features: g−r, r−i, i−z, i_mag (drop u)."""
-    return np.column_stack([colors[:, 1], colors[:, 2], colors[:, 3], mags[:, 3]])
+from twopt_density.photoz import PhotoZKNN, photoz_features as features_of
 
 
 def main():

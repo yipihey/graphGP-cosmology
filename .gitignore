@@ -21,3 +21,5 @@ paper/*.toc
 # Rust build artifacts
 morton_cascade/target/
 docs/data/__pycache__/
+/data
+/output

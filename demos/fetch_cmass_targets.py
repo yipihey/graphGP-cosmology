@@ -104,11 +104,16 @@ def main():
         header = header or h
         all_rows += rows
         print(f"  RA[{a:.0f},{b:.0f}]: {len(rows)} (total {len(all_rows)})")
-    arr = {h: np.array([r[j] for r in all_rows]) for j, h in enumerate(header)}
-    cols = [fits.Column(name=h, format="D" if h not in ("objID", "specObjID", "zwarning", "spec_class")
-                        else "K" if h != "spec_class" else "20A",
-                        array=np.array([_num(x) for x in arr[h]]) if h not in ("spec_class",) else arr[h])
-            for h in header]
+    arr = {h: [r[j] for r in all_rows] for j, h in enumerate(header)}
+    str_cols = {"objID", "specObjID", "spec_class"}   # keep IDs as strings (int64 IDs)
+    cols = []
+    for h in header:
+        if h in str_cols:
+            cols.append(fits.Column(name=h, format="24A",
+                                    array=np.array([str(x) for x in arr[h]], dtype="U24")))
+        else:
+            cols.append(fits.Column(name=h, format="D",
+                                    array=np.array([_num(x) for x in arr[h]])))
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     fits.BinTableHDU.from_columns(cols).writeto(args.out, overwrite=True)
     print(f"Saved {len(all_rows)} CMASS targets -> {args.out}")

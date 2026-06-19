@@ -1,11 +1,10 @@
-"""Validate the systematics completion: equal-weight completed catalog vs the
-w_c-weighted observed catalog.
+"""Validate the systematics completion against the w_c-weighted observed catalog.
 
-The requirement (cosmology-free, observed coordinates): the equal-weight
-completed catalog's clustering reproduces the completeness-weighted observed
-clustering at resolved separations, and many realizations span the posterior of
-where the missing ~8% of galaxies are. Compares ξ(Δθ, Δz=0) of the weighted
-observed vs the mean (and scatter) of the completed realizations.
+Three checks (cosmology-free, observed coordinates):
+  (1) global ξ(Δθ, Δz=0): equal-weight completed vs w_c-weighted observed, and
+      the data-driven vs host redshift assignment (the small-scale prior);
+  (2) the proper systematic/collision split (background vs clustered z);
+  (3) per-redshift-slice angular ξ(Δθ|z̄) closure — "identical at that redshift".
 
     PYTHONPATH=/home/tabel/Projects/graphgp:/home/tabel/Projects/graphGP-cosmology \
     OMP_NUM_THREADS=16 ~/.venv/k3d/bin/python3 demos/validate_completion.py
@@ -17,67 +16,102 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from twopt_density.boss import load_boss
 from twopt_density.quaia import make_random_from_selection_function
-from twopt_density.observed_ls import measure_K2d, complete_catalog
+from twopt_density.observed_ls import (measure_K2d, complete_catalog,
+                                       measure_close_pair_dz)
+
+COLL = 62.0 / 3600.0
+
+
+def xi0(ra_d, dec_d, z_d, w_d, ra_r, dec_r, z_r, te, ze, mask_d=None, mask_r=None):
+    if mask_d is not None:
+        ra_d, dec_d, z_d, w_d = ra_d[mask_d], dec_d[mask_d], z_d[mask_d], w_d[mask_d]
+        ra_r, dec_r, z_r = ra_r[mask_r], dec_r[mask_r], z_r[mask_r]
+    _, _, xi = measure_K2d(ra_d, dec_d, z_d, w_d, ra_r, dec_r, z_r, np.ones(len(ra_r)),
+                           theta_edges=te, z_edges=ze)
+    return xi[:, 0]
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n-real", type=int, default=6)
     p.add_argument("--n-rand-factor", type=int, default=2)
-    p.add_argument("--z-assign", default="host", choices=["host", "nz", "mix"])
-    p.add_argument("--out", default="output/completion_xi.png")
+    p.add_argument("--out", default="output/completion_validation.png")
     args = p.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     cat = load_boss(["data/boss/galaxy_DR12v5_CMASS_South.fits.gz"],
                     ["data/boss/random0_DR12v5_CMASS_South.fits.gz"], sample="CMASS", nside=256)
     w_c = np.asarray(cat.w_sys_data) * (np.asarray(cat.w_cp_data) + np.asarray(cat.w_noz_data) - 1.0)
+    ra_d = np.asarray(cat.ra_data); dec_d = np.asarray(cat.dec_data); z_d = np.asarray(cat.z_data)
     print(f"N_obs={cat.N_data:,}  <w_c>={w_c.mean():.4f}")
+
+    dz_pool = measure_close_pair_dz(cat, COLL)
+    print(f"close pairs ≤{COLL*3600:.0f}\": {len(dz_pool)//2:,}  "
+          f"frac |Δz|<0.003 = {np.mean(np.abs(dz_pool) < 0.003):.2f} (clustered core)")
 
     te = np.concatenate([[0.0], np.geomspace(0.01, 2.5, 18)]); ze = np.linspace(0.0, 0.03, 11)
     tcen = np.empty(len(te) - 1); tcen[0] = 0.5 * te[1]; tcen[1:] = np.sqrt(te[1:-1] * te[2:])
 
-    # shared randoms from the observed n(z) window
     rng = np.random.default_rng(0)
     nr = args.n_rand_factor * cat.N_data
     rar, decr, zr = make_random_from_selection_function(
-        sel_map=cat.sel_map, n_random=nr, z_data=np.asarray(cat.z_data), nside=cat.nside, rng=rng)
-    wr = np.ones(len(rar))
+        sel_map=cat.sel_map, n_random=nr, z_data=z_d, nside=cat.nside, rng=rng)
 
-    # weighted observed clustering (the target)
-    _, _, xi_w = measure_K2d(cat.ra_data, cat.dec_data, cat.z_data, w_c,
-                             rar, decr, zr, wr, theta_edges=te, z_edges=ze)
+    xw = xi0(ra_d, dec_d, z_d, w_c, rar, decr, zr, te, ze)
 
-    # equal-weight completed realizations
-    Xi = []
-    for s in range(args.n_real):
-        c = complete_catalog(cat, seed=s, z_assign=args.z_assign, verbose=(s == 0))
-        _, _, xi_e = measure_K2d(c["ra"], c["dec"], c["z"], np.ones(c["N"]),
-                                 rar, decr, zr, wr, theta_edges=te, z_edges=ze)
-        Xi.append(xi_e)
-    Xi = np.array(Xi)
-    xi_m = Xi.mean(0)[:, 0]; xi_s = Xi.std(0)[:, 0]; xw0 = xi_w[:, 0]
+    # (1)+(2) global closure for data vs host z-assignment
+    res = {}
+    for za in ("data", "host"):
+        X = []
+        for s in range(args.n_real):
+            c = complete_catalog(cat, seed=s, z_assign=za, dz_pool=dz_pool, verbose=(s == 0))
+            X.append(xi0(c["ra"], c["dec"], c["z"], np.ones(c["N"]), rar, decr, zr, te, ze))
+        res[za] = (np.mean(X, 0), np.std(X, 0))
 
-    coll = 62.0 / 3600.0
-    print(f"\ncollision scale = {coll:.4f}° (completion valid above this)")
-    print(f"{'theta':>8}{'xi_wgt':>10}{'xi_eq':>10}{'eq/wgt':>9}{'scatter%':>9}")
+    print(f"\n(1) global ξ(Δθ,0): equal-weight / w_c-weighted")
+    print(f"{'theta':>8}{'xi_wgt':>10}{'data':>8}{'host':>8}{'scat%':>7}")
     for i in range(len(tcen)):
-        flag = " " if tcen[i] > coll else " *"  # * = below collision scale
-        r = xi_m[i] / xw0[i] if xw0[i] else np.nan
-        sc = 100 * xi_s[i] / xi_m[i] if xi_m[i] else np.nan
-        print(f"{tcen[i]:8.4f}{xw0[i]:10.4f}{xi_m[i]:10.4f}{r:9.3f}{sc:9.1f}{flag}")
+        f = "*" if tcen[i] < COLL else " "
+        print(f"{tcen[i]:8.4f}{xw[i]:10.4f}{res['data'][0][i]/xw[i]:8.3f}"
+              f"{res['host'][0][i]/xw[i]:8.3f}{100*res['data'][1][i]/res['data'][0][i]:7.1f} {f}")
 
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5))
-    a1.errorbar(tcen, xi_m, yerr=xi_s, fmt="o-", color="#4a90d9", label="equal-weight completed (mean±scatter)")
-    a1.plot(tcen, xw0, "s--", color="#f5a623", label="w_c-weighted observed")
-    a1.axvline(coll, color="gray", ls=":", label="collision scale")
+    # (3) per-redshift-slice angular closure (z_assign='data')
+    zedges = np.quantile(z_d, [0.0, 0.25, 0.5, 0.75, 1.0])
+    print(f"\n(3) per-z-slice ξ(Δθ|z̄) eq/weighted (z_assign=data, resolved θ≳{COLL:.3f}°):")
+    cats = [complete_catalog(cat, seed=s, z_assign="data", dz_pool=dz_pool) for s in range(args.n_real)]
+    slice_rows = []
+    for a, b in zip(zedges[:-1], zedges[1:]):
+        md = (z_d >= a) & (z_d < b); mr = (zr >= a) & (zr < b)
+        xw_s = xi0(ra_d, dec_d, z_d, w_c, rar, decr, zr, te, ze, md, mr)
+        Xs = []
+        for c in cats:
+            zc = c["z"]; mc = (zc >= a) & (zc < b)
+            Xs.append(xi0(c["ra"], c["dec"], c["z"], np.ones(c["N"]), rar, decr, zr, te, ze, mc, mr))
+        xm = np.mean(Xs, 0)
+        ratio = xm / xw_s
+        resolved = tcen > COLL
+        med = np.nanmedian(ratio[resolved])
+        slice_rows.append((a, b, xw_s, xm))
+        print(f"  z∈[{a:.2f},{b:.2f}): median eq/wgt (resolved) = {med:.3f}  "
+              f"N_gal={md.sum():,}")
+
+    # plot
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5))
+    a1.plot(tcen, xw, "ks--", label="w_c-weighted observed", zorder=5)
+    a1.errorbar(tcen, res["data"][0], yerr=res["data"][1], fmt="o-", color="#4a90d9",
+                label="completed (z=data)")
+    a1.plot(tcen, res["host"][0], "^:", color="#d0021b", label="completed (z=host)")
+    a1.axvline(COLL, color="gray", ls=":")
     a1.set_xscale("log"); a1.set_yscale("log"); a1.set_xlabel(r"$\Delta\theta$ [deg]")
-    a1.set_ylabel(r"$\xi(\Delta\theta, \Delta z{=}0)$"); a1.legend(); a1.grid(True, which="both", alpha=0.2)
-    a1.set_title(f"completion closure (z_assign={args.z_assign})")
-    a2.semilogx(tcen, xi_m / xw0, "o-", color="#333"); a2.axhline(1, color="gray", ls="--")
-    a2.axvline(coll, color="gray", ls=":"); a2.fill_between(tcen, 0.98, 1.02, color="green", alpha=0.15, label="±2%")
-    a2.set_ylim(0.7, 1.3); a2.set_xlabel(r"$\Delta\theta$ [deg]"); a2.set_ylabel("eq / weighted")
-    a2.legend(); a2.grid(True, which="both", alpha=0.2)
+    a1.set_ylabel(r"$\xi(\Delta\theta,0)$"); a1.legend(); a1.grid(True, which="both", alpha=0.2)
+    a1.set_title("global closure + z-assignment prior")
+    for (a, b, xw_s, xm) in slice_rows:
+        l, = a2.plot(tcen, xm / xw_s, "o-", label=f"z∈[{a:.2f},{b:.2f})")
+    a2.axhline(1, color="gray", ls="--"); a2.axvline(COLL, color="gray", ls=":")
+    a2.fill_between(tcen, 0.97, 1.03, color="green", alpha=0.12)
+    a2.set_xscale("log"); a2.set_ylim(0.8, 1.2); a2.set_xlabel(r"$\Delta\theta$ [deg]")
+    a2.set_ylabel("eq / weighted"); a2.legend(fontsize=8); a2.grid(True, which="both", alpha=0.2)
+    a2.set_title("per-redshift-slice closure")
     plt.tight_layout(); plt.savefig(args.out, dpi=140, bbox_inches="tight")
     print(f"\nSaved: {args.out}")
 
