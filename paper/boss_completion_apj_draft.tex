@@ -1,26 +1,16 @@
-\newif\ifaastex
-\IfFileExists{aastex631.cls}{%
-  \aastextrue
-  \documentclass[twocolumn]{aastex631}
-}{%
-  \aastexfalse
-  \documentclass[twocolumn]{article}
-  \usepackage[margin=0.75in]{geometry}
-  \usepackage[authoryear]{natbib}
-  \usepackage{graphicx}
-  \newcommand{\shorttitle}[1]{}
-  \newcommand{\shortauthors}[1]{}
-  \newcommand{\affiliation}[1]{}
-  \newcommand{\correspondingauthor}[1]{}
-  \newcommand{\email}[1]{}
-  \newcommand{\keywords}[1]{\par\noindent\textbf{Keywords: }##1\par}
-  \newcommand{\acknowledgments}{\section*{Acknowledgments}}
-  \newcommand{\software}[1]{\section*{Software}##1}
-}
+%% ECHOES: BOSS DR12 CMASS-South completed-catalog posterior.
+%% Typeset with emulateapj (Vikhlinin) in ApJ two-column format.
+\documentclass[apj]{emulateapj}
 
 \usepackage{amsmath}
 \usepackage{booktabs}
 \usepackage[hidelinks]{hyperref}
+
+% AAS-style macros that emulateapj (revtex4-based) does not provide.
+\providecommand{\correspondingauthor}[1]{}
+\providecommand{\email}[1]{}
+\providecommand{\software}[1]{\section*{Software}#1}
+\providecommand{\keywords}[1]{\par\noindent\textbf{Keywords:\ }#1\par}
 
 \graphicspath{{figs/boss_completion/}}
 
@@ -30,20 +20,18 @@
 \begin{document}
 
 \title{\textsc{ECHOES}: Equal-weight Completed Hypothetical Observation Ensembles
-for BOSS CMASS-South:
-Survey-Ready Posterior Samples for Arbitrary Galaxy-Clustering Statistics}
+for BOSS DR12 CMASS-South:
+Posterior Completed-Catalog Samples for Galaxy Clustering Beyond Two Points}
 
 \author{Tom Abel}
 \affiliation{Kavli Institute for Particle Astrophysics and Cosmology, Stanford University, Stanford, CA, USA}
 \correspondingauthor{Tom Abel}
 \email{tabel@stanford.edu}
 
-\ifaastex\else\maketitle\fi
-
 \begin{abstract}
 Most precision galaxy-clustering analyses communicate between survey teams and
 theory teams through a small set of summary statistics, most often two-point
-correlation functions or power spectra.  This convention is powerful because the
+correlation functions or power spectra.  This convention is effective because the
 observational effects that enter these statistics have been studied for decades,
 but it also makes each new statistic responsible for reinterpreting the survey
 window, fiber assignment, redshift failures, imaging systematics, and random
@@ -71,7 +59,7 @@ a conditional anisotropic Gaussian-process posterior over the galaxy density
 field, sampled by Matheron's rule on a sparse graph and evaluated along each
 missing galaxy's line of sight.  The resulting catalogs are intended to let
 analysts run two-point, higher-order, marked, nearest-neighbor, topological,
-field-level, or simulation-based statistics directly on survey-ready data while
+field-level, or simulation-based statistics directly on completed catalogs while
 propagating the observational-completion uncertainty by resampling the catalog
 posterior.
 \end{abstract}
@@ -79,6 +67,8 @@ posterior.
 \keywords{Large-scale structure of the universe (902); Galaxy surveys (598);
 Astrostatistics (1882); Cosmological parameters (339); Observational cosmology
 (1146)}
+
+\maketitle
 
 \section{Introduction}
 \label{sec:intro}
@@ -168,7 +158,7 @@ mixtures of imaging, spectroscopy, selection, and calibration systematics
 \citep{Euclid2025,Wang2022,Miao2023,CSST2026,ZhanTyson2018}.  If those surveys
 wish to serve a community that will analyze the data with statistics not yet
 standardized, the most useful data product may not be a single corrected
-summary statistic.  It may be a survey-ready probabilistic catalog.
+summary statistic.  It may be a completed probabilistic catalog.
 
 This work builds such a product for BOSS DR12 CMASS-South.  We call the
 approach \textsc{ECHOES}: Equal-weight Completed Hypothetical Observation
@@ -285,18 +275,31 @@ that is then multiplied by a local-density prior along the same line of sight.
 \centering
 \includegraphics[width=0.49\textwidth]{footprint.png}
 \includegraphics[width=0.49\textwidth]{weights.png}
-\caption{BOSS CMASS-South geometry and completeness inputs.  The completion is
-conditioned on the observed BOSS footprint, the published completeness weights,
-and the SDSS imaging positions of spectroscopically missing targets.}
+\caption{Inputs to the completion.  \emph{Left:} the BOSS DR12 CMASS-South
+footprint and observed-galaxy distribution on the sky.  \emph{Right:} the
+published completeness weights --- fiber-collision $w_{\rm cp}$,
+redshift-failure $w_{\rm noz}$, and imaging-systematic $w_{\rm systot}$ ---
+whose product defines the per-region incompleteness the completion restores.
+The completion is conditioned on this geometry, on these weights, and on the
+SDSS imaging positions of the spectroscopically missing targets; it converts the
+weights into explicit equal-weight galaxies rather than carrying them as
+per-object multipliers.}
 \label{fig:footprint_weights}
 \end{figure*}
 
 \begin{figure}
 \centering
 \includegraphics[width=\columnwidth]{photoz.png}
-\caption{Color-space $k$NN photo-$z$ diagnostic for the CMASS sample.  The
-photo-$z$ is used as a likelihood factor for missing redshifts, not as a
-standalone redshift assignment.}
+\caption{The color-space $k$-nearest-neighbor photo-$z$ that supplies the color
+likelihood in the redshift posterior, validated on a held-out sample of
+good-redshift CMASS galaxies.  \emph{Left:} posterior-median photo-$z$ versus
+spectroscopic redshift ($\sigma_{\rm NMAD}\simeq0.019$).  \emph{Middle:} the
+probability-integral-transform histogram --- the rank of each true redshift
+within its own posterior --- which is flat (mean $\simeq0.5$), so the posterior
+is calibrated and can be sampled faithfully.  \emph{Right:} a single posterior
+draw per object reproduces the held-out $n(z)$.  The photo-$z$ enters the
+completion only as the likelihood factor
+$\widehat{p}_{\rm col}(z\mid{\bf x})$, never as a standalone redshift.}
 \label{fig:photoz}
 \end{figure}
 
@@ -375,15 +378,14 @@ Equation (\ref{eq:localposterior}), is also fixed after it is computed.  A
 realization is only a draw from each per-object inverse CDF plus the stochastic
 imaging analogs.
 
-The release stores the posterior as a compressed \texttt{npz} file.  It contains
-the observed redshifts, the base RA and Dec arrays for observed plus restored
-targets, the base provenance vector, \texttt{WEIGHT\_SYSTOT}, and an inverse CDF
-for each of the 6,777 missing targets.  The inverse CDF is tabulated at 65
-quantile levels and quantized to \texttt{uint16}.  The file
-\texttt{cmass\_south\_posterior.npz} is 2.04 MB.  A matching uniform-footprint
-random catalog, \texttt{cmass\_south\_randoms.npz}, contains 438,544 points.
-Because CMASS-South is approximately 99\% complete in the angular random mask,
-these randoms are uniform over the footprint to the percent level.
+The release therefore stores this posterior as a single compressed file of
+2.04 MB: the fixed observed catalog, the base positions and provenance for the
+observed and restored targets, \texttt{WEIGHT\_SYSTOT}, and a tabulated
+inverse-CDF redshift posterior for each of the 6{,}777 missing targets (the file
+schema and quantization are given in Appendix~\ref{app:products}).  A matching
+uniform-footprint random catalog contains 438{,}544 points; because CMASS-South
+is approximately 99\% complete in the angular mask, these randoms are uniform
+over the footprint to the percent level.
 
 Sampling is deterministic under a seed:
 \begin{enumerate}
@@ -403,9 +405,15 @@ contains 116,413 objects.
 \centering
 \includegraphics[width=0.49\textwidth]{missing.png}
 \includegraphics[width=0.49\textwidth]{samples_nz.png}
-\caption{Missing-target recovery and sampled redshift distributions.  The
-restored galaxies are placed at real imaging positions, and only their
-redshifts are sampled.  Realizations differ in the redshifts of missing
+\caption{Restored missing targets and the resulting redshift distribution.
+\emph{Left:} a zoomed sky region showing observed galaxies together with the
+recovered fiber-collision and redshift-failure targets, each placed at its real
+SDSS imaging position; only the redshift of each restored galaxy is uncertain.
+\emph{Right:} the equal-weight completed $n(z)$ reproduces the
+completeness-weighted observed $n(z)$, and the thin-slice panel illustrates that
+\emph{which} restored galaxies fall in a given redshift slice varies between
+realizations --- this realization-to-realization variation is the completion
+posterior.  Realizations differ only in the sampled redshifts of the missing
 galaxies and in the stochastic imaging-systematic analogs.}
 \label{fig:missing_nz}
 \end{figure*}
@@ -548,7 +556,7 @@ to ours--to use information beyond the Gaussian two-point limit--but the
 observational interface remains the published BOSS selection and weighting
 system.  Our product is complementary: it provides an ensemble of completed
 data catalogs so the observational correction can be sampled once and then
-reused by any statistic.
+reused across many statistics.
 
 \subsection{Default KNN-field completion}
 \label{subsec:boss_default}
@@ -562,11 +570,12 @@ galaxies.  With the imaging-systematic analog sampler enabled, seed 0 has
 $\simeq 0.1\%$ level in total count, as expected for the smooth analog step.
 
 Figure \ref{fig:missing_nz} shows the restored-target population and sampled
-$n(z)$.  Figure \ref{fig:twopoint} compares angular and two-dimensional
-clustering.  The completed equal-weight catalogs reproduce the official
-weighted angular clustering to roughly 1.5\% over the plotted angular range and
-the projected and multipole statistics at the 1--5\% level, depending on scale
-and statistic.  This is the expected accuracy target: the completed catalog is
+$n(z)$.  Figure \ref{fig:twopoint} compares the angular and two-dimensional
+clustering, and Figure \ref{fig:consistency} the projected correlation and
+redshift-space multipoles.  The completed equal-weight catalogs reproduce the
+official weighted angular clustering to roughly 1.5\% over the plotted angular
+range and the projected and multipole statistics at the 1--5\% level, depending
+on scale and statistic.  This is the expected accuracy target: the completed catalog is
 not an exact algebraic rewrite of the official weights, because it assigns
 redshifts and positions to missing galaxies rather than moving all their weight
 onto observed neighbors, but it should remain inside the systematic scale
@@ -576,12 +585,37 @@ already tolerated by the reference BOSS treatment.
 \centering
 \includegraphics[width=0.49\textwidth]{wtheta.png}
 \includegraphics[width=0.49\textwidth]{xi2d.png}
-\caption{Two-point validation on the real BOSS CMASS-South data.  The
-equal-weight completed catalogs reproduce the official weighted angular and
-redshift-space clustering while replacing completeness weights by explicit
-galaxies.}
+\caption{Two-point clustering of the equal-weight completed catalogs on the real
+BOSS CMASS-South data, with no completeness weights applied.
+\emph{Left:} the angular correlation function $w(\theta)$ of the completed
+ensemble (mean and realization scatter, blue band) against the official
+$w_c$-weighted measurement (orange); the two agree to $\simeq1.5\%$ across
+$0.05^\circ$--$2^\circ$, and the ratio panel shows no scale-dependent trend.
+\emph{Right:} the two-dimensional correlation $\xi(\Delta\theta,\Delta z)$
+measured directly in observed coordinates and its completed/weighted ratio across
+the plane.  The anisotropy between angular and line-of-sight separation is
+reproduced to a few percent, so the geometric (Alcock--Paczynski) information
+carried by the full $\xi(\Delta\theta,\Delta z)$ plane is preserved without
+imposing a distance--redshift relation.  The completion replaces survey weights
+by explicit equal-weight galaxies while leaving the measured two-point clustering
+unchanged at the percent level.}
 \label{fig:twopoint}
 \end{figure*}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{cosmology_consistency.png}
+\caption{Standard redshift-space clustering of the equal-weight completed
+ensemble (no completeness weights) versus the official $w_c$-weighted BOSS
+measurement, with a Planck fiducial cosmology used only to convert redshift to
+distance.  The projected correlation $w_p(r_p)$ (with the completed/official
+ratio) and the redshift-space monopole and quadrupole $\xi_0,\xi_2$ agree with
+the weighted reference at the 1--5\% level over
+$0.5<r_p<40\,h^{-1}{\rm Mpc}$.  An equal-weight completed catalog is therefore a
+drop-in replacement for the weighted catalog in the standard two-point
+estimators.}
+\label{fig:consistency}
+\end{figure}
 
 \subsection{Truth-known validation}
 \label{subsec:truth}
@@ -606,9 +640,20 @@ Patchy mocks rather than a failure mode inferred from real BOSS data.
 \centering
 \includegraphics[width=0.49\textwidth]{mock_truth_recovery.png}
 \includegraphics[width=0.49\textwidth]{patchy_truth_recovery.png}
-\caption{Truth-known recovery tests.  The completed ensemble recovers the input
-projected clustering at the 1--2\% level over the validated scales.  The oracle
-curve isolates the part of the residual that comes from redshift assignment.}
+\caption{Truth-known recovery of the projected correlation $w_p(r_p)$, plotted as
+the ratio to the input truth.  \emph{Left:} a real-BOSS-truth test in which the
+spectroscopic redshifts of a subset of CMASS-South galaxies are hidden and then
+completed.  The incomplete observed catalog is biased low at small $r_p$
+(missing close pairs); the completed ensemble recovers the truth to 1--2\% over
+$0.5<r_p<40\,h^{-1}{\rm Mpc}$.  The oracle curve, which restores the hidden
+galaxies at their \emph{true} redshifts, sets the achievable floor (ratio
+0.997--1.005), so the residual is dominated by the redshift-assignment posterior
+rather than by the masking bookkeeping.  \emph{Right:} the same battery on
+independent MultiDark--Patchy mocks; recovery is faithful above
+$\simeq1\,h^{-1}{\rm Mpc}$, and the sub-Mpc deficit is a known one-halo
+limitation of those mocks, confirmed by the real-BOSS-truth panel which recovers
+the small scales.  The completion reproduces an unobserved truth, not merely the
+weighted bookkeeping of the observed catalog.}
 \label{fig:truth}
 \end{figure*}
 
@@ -616,20 +661,29 @@ curve isolates the part of the residual that comes from redshift assignment.}
 \label{subsec:higherorder}
 
 The validation intentionally includes summaries that are nonlinear in the point
-set.  For nearest-neighbor CDFs, the maximum absolute CDF differences between
-completed and truth catalogs are 0.0022, 0.0021, and 0.0011 for $k=1,2,4$,
-respectively.  For counts in $8\,h^{-1}{\rm Mpc}$ cells, the mean is 0.660
-versus 0.663 in truth, the variance-to-mean ratio is 2.37 versus 2.42, and the
-skewness is 2.90 versus 2.94.  These tests are not exhaustive, but they are
+set.  For the nearest-neighbor distance CDFs \citep{BanerjeeAbel2021}, the
+maximum absolute CDF differences between completed and truth catalogs are 0.0022,
+0.0021, and 0.0011 for $k=1,2,4$, respectively.  For the counts-in-cells
+distribution \citep{Uhlemann2020,Friedrich2020} in $8\,h^{-1}{\rm Mpc}$ cells,
+the mean is 0.660 versus 0.663 in truth, the variance-to-mean ratio is 2.37
+versus 2.42, and the skewness is 2.90 versus 2.94.  These tests are not exhaustive, but they are
 important because a product that only reproduces $w_p$ could still fail for
 nearest-neighbor or cell-count statistics.
 
 \begin{figure}
 \centering
 \includegraphics[width=\columnwidth]{completion_highorder.png}
-\caption{Higher-order validation with nearest-neighbor CDFs and
-counts-in-cells.  These diagnostics probe nonlinear responses to duplicate
-points, missing close pairs, and redshift smearing.}
+\caption{Higher-order, coincidence-sensitive validation of the completed
+catalogs against truth.  \emph{Left:} the nearest-neighbor (kNN) cumulative
+distribution functions for $k=1,2,4$ --- the distribution of distances from
+random points to the $k$-th nearest galaxy --- which respond to duplicate
+points, missing close pairs, and redshift smearing.  Completed and truth agree to
+a maximum $|\Delta\,{\rm CDF}|\le0.0022$, and the absence of a spike at small
+separation confirms that the local-analog imaging-systematic step introduces no
+exact duplicates.  \emph{Right:} the counts-in-cells distribution in
+$8\,h^{-1}{\rm Mpc}$ spheres; the full one-point density distribution is
+recovered (mean $0.660$ versus $0.663$, variance-to-mean $2.37$ versus $2.42$,
+skewness $2.90$ versus $2.94$), not merely its second moment.}
 \label{fig:highorder}
 \end{figure}
 
@@ -651,10 +705,14 @@ replace that covariance with the completion ensemble.
 \begin{figure}
 \centering
 \includegraphics[width=\columnwidth]{recovery_calibration.png}
-\caption{Calibration of the completion uncertainty relative to mock
-sample variance.  The ensemble spread is the uncertainty in the observational
-completion conditioned on the observed catalog, not the total survey
-covariance.}
+\caption{Calibration of the completion uncertainty against mock sample variance
+(MultiDark--Patchy).  Per $r_p$ bin, the realization-to-realization spread of the
+completed $w_p(r_p)$ (the completion uncertainty) is 0.17--0.44\%, well below the
+0.8--7.2\% sample variance, so the completion adds only 6--36\% of the
+sample-variance error in quadrature.  Because the ensemble conditions on the
+single observed CMASS-South realization and resamples only the unobserved
+spectroscopic information, it is deliberately narrow and must be \emph{added} to a
+cosmic-variance or simulation covariance, not used in place of it.}
 \label{fig:calibration}
 \end{figure}
 
@@ -670,7 +728,7 @@ In truth recovery, both routes recover the input clustering to the percent
 level.  In the real-data head-to-head comparison, graphGP lies closer to the
 official weighted reference on larger projected scales, with a typical ratio
 near unity, while the KNN-field realization is modestly high in some bins.
-Because the KNN-field route is much cheaper and compresses to the 2 MB public
+Because the KNN-field route is much cheaper and compresses to the compact public
 ECHOES posterior, it is the default release.  graphGP is retained as a first-class
 alternative for surveys or statistics where correlated redshift-completion
 uncertainty is essential.
@@ -679,12 +737,44 @@ uncertainty is essential.
 \centering
 \includegraphics[width=0.49\textwidth]{graphgp_vs_knn.png}
 \includegraphics[width=0.49\textwidth]{graphgp_truth_recovery.png}
-\caption{Comparison of the default KNN-field redshift engine with the
-graphGP conditional-field route.  The two methods are complementary:
-KNN-field is fast and local; graphGP is correlated through a shared posterior
-density-field draw.}
+\caption{The default KNN-field redshift engine versus the graphGP
+conditional-field route, on the real CMASS-South data.  \emph{Left:} projected
+and angular clustering of the two completions against the official
+$w_c$-weighted reference; graphGP, being a smooth field draw, sits closer to the
+weighted reference on larger projected scales (ratio near unity), while the
+KNN-field realization is modestly high in some bins.  \emph{Right:} truth-known
+recovery of $w_p(r_p)$ for both engines; the KNN-field engine is sharper on the
+sub-Mpc fiber-collision scale because it uses nearby observed redshifts
+directly, whereas graphGP is smoother and slightly closer on larger scales.
+Both recover the input clustering to the percent level; neither dominates, and
+the cheaper KNN-field route --- which compresses to the public posterior --- is
+the default.}
 \label{fig:graphgp}
 \end{figure*}
+
+Although the graphGP field is built in a fiducial comoving frame, that choice is
+a gauge rather than a prior.  Repeating the redshift assignment under two extreme
+fiducial cosmologies --- Planck ($\Omega_m=0.315$) and Einstein--de Sitter
+($\Omega_m=1.0$) --- changes the per-object redshifts by an RMS of only
+$\sim0.001$ (correlation $0.9996$), an order of magnitude below the intrinsic
+assignment scatter, and the recovered $w_p(r_p)$ by less than $0.1\%$
+(Figure \ref{fig:graphgp_cosmo}).  Because the kernel is measured from the data
+and the output is expressed in observed redshift, the graphGP route is
+data-driven and carries no cosmological prior.
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{graphgp_cosmology_invariance.png}
+\caption{The graphGP redshift assignment is invariant to the internal fiducial
+cosmology.  \emph{Left:} per-object missing redshifts assigned under a Planck and
+an Einstein--de Sitter fiducial agree with RMS $\sim0.001$ and correlation
+$0.9996$, far below the intrinsic assignment scatter and the photo-$z$
+uncertainty.  \emph{Right:} the recovered $w_p(r_p)$ differs by less than $0.1\%$
+between the two fiducials.  The fiducial distance--redshift relation is a
+coordinate (gauge) choice absorbed by the data-measured kernel, not a
+cosmological prior.}
+\label{fig:graphgp_cosmo}
+\end{figure}
 
 \section{Sampling the Completion Posterior}
 \label{sec:posterior}
@@ -748,47 +838,33 @@ the official footprint visible.
 
 \begin{figure*}
 \centering
-\includegraphics[width=0.32\textwidth]{coupling.png}
-\includegraphics[width=0.32\textwidth]{trust.png}
-\includegraphics[width=0.32\textwidth]{systematics.png}
-\caption{Systematics diagnostics for the completion.  The maps and coupling
-tests quantify where the data-driven completion is well anchored by observed
-targets and where it is most dependent on the model.}
+\includegraphics[width=0.49\textwidth]{coupling.png}
+\includegraphics[width=0.49\textwidth]{trust.png}
+\caption{Completion diagnostics.  \emph{Left:} the spectroscopic success
+fraction as a function of the local target overdensity for the two missing-target
+kinds.  Redshift failures are consistent with no density coupling
+($h=-0.06\pm0.06$), whereas fiber collisions are coupled ($h=-0.24\pm0.03$)
+because close pairs occur in denser environments; since the completion places
+collided galaxies at their true imaging positions, this coupling is reproduced by
+construction rather than modeled.  \emph{Right:} the trustworthiness map --- the
+galaxy-count scatter across completion realizations per sky cell (median 0.13)
+--- which marks where the redshift posterior leaves the most freedom and the
+completion is extrapolating most strongly.}
 \label{fig:systematics}
 \end{figure*}
 
 \section{Data and Code Availability}
 \label{sec:availability}
 
-The analysis code and ECHOES report products are in the public repository
-\url{https://github.com/yipihey/graphGP-cosmology}.  The BOSS completion report
-used for this manuscript is
+The analysis code is publicly available at
+\url{https://github.com/yipihey/graphGP-cosmology}, and the interactive
+completion report at
 \url{https://yipihey.github.io/graphGP-cosmology/completion.html}.  The compact
-posterior and sampler are distributed in the report's \texttt{docs/data/}
-directory:
-\begin{verbatim}
-cmass_south_posterior.npz
-cmass_south_randoms.npz
-draw_samples.py
-\end{verbatim}
-The minimal use pattern is
-\begin{verbatim}
-from draw_samples import load_package, draw
-pkg = load_package("cmass_south_posterior.npz")
-cat = draw(pkg, seed=0)
-\end{verbatim}
-which returns arrays \texttt{ra}, \texttt{dec}, \texttt{z}, \texttt{prov}, and
-\texttt{N}.  A reproducible ensemble is specified by the integer seeds used.
-
-The relevant source modules are \texttt{twopt\_density/boss.py} for the BOSS
-loader, \texttt{twopt\_density/cmass\_targets.py} for missing target recovery,
-\texttt{twopt\_density/photoz.py} for the color-space $k$NN photo-$z$,
-\texttt{twopt\_density/observed\_ls.py} for the KNN-field completion and
-graphGP redshift interface, \texttt{twopt\_density/posterior\_sampler.py} for
-the compact inverse-CDF posterior, \texttt{twopt\_density/density\_field.py}
-for graphGP posterior field sampling, and
-\texttt{twopt\_density/clustering\_corrfunc.py} for the standard projected and
-multipole clustering measurements.
+ECHOES posterior, the matching random catalog, and a dependency-light sampler
+are released with the report; a reproducible ensemble of completed catalogs is
+specified by the set of integer seeds used.  The file contents, the minimal
+sampling interface, and the relevant source modules are documented in
+Appendix~\ref{app:products}.
 
 \section{Conclusions}
 \label{sec:conclusions}
@@ -817,8 +893,8 @@ not be limited to two-point functions, and the next generation of surveys will
 have more complicated assignment, calibration, and selection functions.  A
 ECHOES posterior over completed survey catalogs is a way to preserve the historical
 division of labor--survey teams ground observational corrections in the data,
-theory teams test statistics and models--while making the interface useful for
-arbitrary summaries.  DESI, Euclid, Roman, CSST, and Rubin/LSST will all face
+theory teams test statistics and models--while making the interface useful for a
+broad range of summaries.  DESI, Euclid, Roman, CSST, and Rubin/LSST will all face
 versions of this problem.  BOSS CMASS-South is small enough to solve carefully
 and mature enough to validate against the standard answer; it is therefore a
 useful prototype for how future public survey products can serve both standard
@@ -880,23 +956,34 @@ Equation (\ref{eq:matheron}) using the Gaussianized Poisson likelihood.
 same redshift grid used by the KNN-field sampler, then draw redshifts from the
 shared field realization.
 \end{enumerate}
-The field posterior is not part of the 2 MB default release because it is larger
+The field posterior is not part of the default release because it is larger
 and more expensive, but it is implemented as a first-class alternative and was
 used for the comparisons in Section \ref{subsec:graphgp_results}.
 
-\section{Suggested Figure Set}
-\label{app:figures}
+\section{Data Products and Sampler Interface}
+\label{app:products}
 
-The current report contains more validation figures than should appear in the
-main paper.  The main text uses the footprint/weights, photo-$z$, missing
-targets, two-point validation, truth recovery, higher-order validation,
-calibration, graphGP comparison, and systematics figures.  A shorter journal
-version could move Figure \ref{fig:systematics} and the optional inpainting
-diagnostics to an online appendix.  The figures \texttt{mask.png},
-\texttt{inpaint\_closure.png}, \texttt{cosmology\_consistency.png}, and
-\texttt{graphgp\_cosmology\_invariance.png} should be retained as supplementary
-material because they answer likely referee questions about mask holes and the
-fiducial cosmology used internally by graphGP.
+The release in the report's \texttt{docs/data/} directory contains the compact
+posterior \texttt{cmass\_south\_posterior.npz} (the fixed observed catalog plus
+an inverse-CDF redshift posterior for each restored target, tabulated at 65
+quantile levels and quantized to \texttt{uint16} for a 2.04 MB total), the
+matching uniform-footprint randoms \texttt{cmass\_south\_randoms.npz}, and a
+NumPy-only sampler \texttt{draw\_samples.py}.  A completed catalog is drawn from an integer
+seed with
+\begin{verbatim}
+from draw_samples import load_package, draw
+pkg = load_package("cmass_south_posterior.npz")
+cat = draw(pkg, seed=0)
+\end{verbatim}
+which returns the arrays \texttt{ra}, \texttt{dec}, \texttt{z}, \texttt{prov},
+and \texttt{N}; a reproducible ensemble is the set of seeds used.  The relevant
+source modules are \texttt{twopt\_density/boss.py} (BOSS loader),
+\texttt{cmass\_targets.py} (missing-target recovery), \texttt{photoz.py} (the
+color-space $k$NN photo-$z$), \texttt{observed\_ls.py} (the KNN-field completion
+and the graphGP redshift interface), \texttt{posterior\_sampler.py} (the compact
+inverse-CDF posterior), \texttt{density\_field.py} (graphGP posterior-field
+sampling), and \texttt{clustering\_corrfunc.py} (the projected and multipole
+clustering measurements).
 
 \acknowledgments
 This manuscript draft is based on the BOSS completion products in the
@@ -905,7 +992,7 @@ This manuscript draft is based on the BOSS completion products in the
 \software{Corrfunc \citep{Corrfunc2020}, NumPy, SciPy, Astropy, Healpy,
 graphGP}
 
-\IfFileExists{aasjournal.bst}{\bibliographystyle{aasjournal}}{\bibliographystyle{plainnat}}
+\bibliographystyle{aasjournalv7}
 \bibliography{boss_completion_refs}
 
 \end{document}

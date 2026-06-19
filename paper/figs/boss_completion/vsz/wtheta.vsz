@@ -1,0 +1,115 @@
+# Veusz saved document (version 4.2)
+SetCompatLevel(0)
+Set('width', '20cm')
+Set('height', '14cm')
+Set('StyleSheet/Font/font', 'Helvetica')
+Set('StyleSheet/Font/size', '11pt')
+Set('StyleSheet/axis/Line/width', '0.8pt')
+ImportString('d1x(numeric)','''
+6.080209e-02
+8.991155e-02
+1.329574e-01
+1.966118e-01
+2.907412e-01
+4.299357e-01
+6.357707e-01
+9.401508e-01
+1.390255e+00
+2.055850e+00
+''')
+ImportString('d1y(numeric)','''
+3.156116e-01
+2.336696e-01
+1.896856e-01
+1.282375e-01
+9.220076e-02
+6.476742e-02
+4.186873e-02
+2.557670e-02
+1.328796e-02
+6.516441e-03
+''')
+ImportString('d2x(numeric)','''
+6.080209e-02
+8.991155e-02
+1.329574e-01
+1.966118e-01
+2.907412e-01
+4.299357e-01
+6.357707e-01
+9.401508e-01
+1.390255e+00
+2.055850e+00
+''')
+ImportString('d2y(numeric),+-','''
+3.305218e-01 1.229707e-02
+2.373932e-01 9.228031e-03
+1.925334e-01 4.099514e-03
+1.280145e-01 3.967409e-03
+9.186333e-02 2.726573e-03
+6.450466e-02 2.812068e-03
+4.160614e-02 1.204328e-03
+2.498173e-02 1.233099e-03
+1.339714e-02 7.679801e-04
+6.427965e-03 7.559190e-04
+''')
+Add('page', name='page1', autoadd=False)
+To('page1')
+Add('graph', name='graph1', autoadd=False)
+To('graph1')
+Add('axis', name='x', autoadd=False)
+To('x')
+Set('label', 'theta [deg]')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', True)
+To('..')
+Add('axis', name='y', autoadd=False)
+To('y')
+Set('label', 'w(theta)')
+Set('min', 'Auto')
+Set('max', 'Auto')
+Set('log', True)
+Set('direction', 'vertical')
+To('..')
+Add('label', name='title', autoadd=False)
+To('title')
+Set('label', 'angular two-point function')
+Set('xPos', [0.5])
+Set('yPos', [1.04])
+Set('alignHorz', 'centre')
+Set('Text/size', '11pt')
+To('..')
+Add('xy', name='xy1', autoadd=False)
+To('xy1')
+Set('xData', 'd1x')
+Set('yData', 'd1y')
+Set('marker', 'none')
+Set('markerSize', '3pt')
+Set('key', 'weighted observed')
+Set('PlotLine/hide', False)
+Set('PlotLine/color', '#000000')
+Set('PlotLine/style', 'solid')
+Set('PlotLine/width', '1.5pt')
+Set('MarkerFill/color', '#000000')
+Set('MarkerLine/color', '#000000')
+Set('MarkerLine/transparency', 0)
+Set('MarkerFill/transparency', 0)
+To('..')
+Add('xy', name='xy2', autoadd=False)
+To('xy2')
+Set('xData', 'd2x')
+Set('yData', 'd2y')
+Set('marker', 'circle')
+Set('markerSize', '3pt')
+Set('key', 'equal-weight completed (mean +/- realization sigma)')
+Set('PlotLine/hide', True)
+Set('MarkerFill/color', '#3a6ea8')
+Set('MarkerLine/color', '#3a6ea8')
+Set('MarkerLine/transparency', 15)
+Set('MarkerFill/transparency', 15)
+Set('errorStyle', 'barends')
+Set('ErrorBarLine/color', '#3a6ea8')
+To('..')
+To('..')
+To('..')
