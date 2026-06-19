@@ -23,6 +23,8 @@ import argparse, os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
 import healpy as hp
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from twopt_density.boss import load_boss
 from twopt_density.photoz import PhotoZKNN, photoz_features
 from twopt_density.cmass_targets import load_cmass_targets
@@ -121,6 +123,30 @@ def main():
           f"graphGP median {np.median((x0_g.mean(0)/xi0_off)[ok]):.3f}")
     print("\n(KNN-KDE sharp/cosmology-free; graphGP correlated/principled but grid+S/N limited. "
           "Bigger spread = more honest posterior IF recovery stays ~1%.)")
+
+    # ---- figure for the report's graphGP tab ----
+    CK, CG, CO = "#3a6ea8", "#c0392b", "#222"
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4.4))
+    a = ax[0]
+    a.loglog(rpc, wp_off, "s-", color=CO, label="official (w_c-weighted)")
+    a.loglog(rpc, wp_k.mean(0), "o-", color=CK, label="KNN-KDE completion")
+    a.loglog(rpc, wp_g.mean(0), "^-", color=CG, label="graphGP completion")
+    a.set_xlabel("rp [Mpc/h]"); a.set_ylabel("wp(rp)"); a.legend(fontsize=8); a.set_title("projected wp(rp)")
+    a = ax[1]
+    a.axhline(1, color="gray", ls=":"); a.fill_between(rpc, 0.97, 1.03, color="green", alpha=0.1)
+    a.semilogx(rpc, wp_k.mean(0)/wp_off, "o-", color=CK, label="KNN / official")
+    a.semilogx(rpc, wp_g.mean(0)/wp_off, "^-", color=CG, label="graphGP / official")
+    a.set_ylim(0.9, 1.12); a.set_xlabel("rp [Mpc/h]"); a.set_ylabel("completed / official")
+    a.legend(fontsize=8); a.set_title("wp ratio (graphGP matches the weighted more closely)")
+    a = ax[2]
+    a.step(zc2, nz_w, where="mid", color=CO, lw=2, label="weighted observed")
+    a.step(zc2, nz_k, where="mid", color=CK, lw=1.6, ls="--", label="KNN-KDE")
+    a.step(zc2, nz_g, where="mid", color=CG, lw=1.6, ls=":", label="graphGP")
+    a.set_xlabel("redshift z"); a.set_ylabel("n(z)"); a.legend(fontsize=8); a.set_title("n(z)")
+    fig.suptitle("Redshift engine head-to-head on real CMASS-South (observed+missing, vs official weighted)", y=1.01)
+    fig.tight_layout(); os.makedirs("output", exist_ok=True)
+    fig.savefig("output/graphgp_vs_knn.png", dpi=130, bbox_inches="tight")
+    print("Saved: output/graphgp_vs_knn.png")
 
 
 if __name__ == "__main__":

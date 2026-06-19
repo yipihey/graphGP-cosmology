@@ -13,6 +13,8 @@ closely than KNN; this says which one matches TRUTH.
 import argparse, dataclasses, os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from twopt_density.boss import load_boss
 from twopt_density.photoz import PhotoZKNN, photoz_features
 from twopt_density.observed_ls import complete_catalog_photoz, measure_close_pair_dz, PROV
@@ -105,6 +107,21 @@ def main():
         print(f"  {rpc[i]:6.2f}  {wp_t[i]:7.2f}  {wp_o[i]/wp_t[i]:6.3f}  {wp_or[i]/wp_t[i]:7.3f}  "
               f"{wp_k[i]/wp_t[i]:6.3f}  {wp_g[i]/wp_t[i]:6.3f}")
     print("\n(closest-to-1 across rp = more faithful to truth; oracle is the floor set by z-assignment.)")
+
+    # ---- figure for the report's graphGP tab ----
+    fig, a = plt.subplots(figsize=(7.6, 5.0))
+    a.axhline(1, color="k", lw=1)
+    a.fill_between(rpc, 0.98, 1.02, color="green", alpha=0.08, label="±2%")
+    a.semilogx(rpc, wp_o/wp_t, "v-", color="#888", label="observed (incomplete)")
+    a.semilogx(rpc, wp_or/wp_t, "d-", color="#2e8b57", label="oracle (true z) — floor")
+    a.semilogx(rpc, wp_k/wp_t, "o-", color="#3a6ea8", lw=2, label="KNN-KDE completion")
+    a.semilogx(rpc, wp_g/wp_t, "^-", color="#c0392b", lw=2, label="graphGP completion")
+    a.set_ylim(0.9, 1.08); a.set_xlabel("rp [Mpc/h]"); a.set_ylabel("wp(rp) recovered / TRUTH")
+    a.legend(fontsize=9); a.set_title("Inject-and-recover on real-BOSS-truth\n"
+                                      "KNN sharper at the sub-Mpc collision scale; graphGP smoother at large rp")
+    fig.tight_layout(); os.makedirs("output", exist_ok=True)
+    fig.savefig("output/graphgp_truth_recovery.png", dpi=130, bbox_inches="tight")
+    print("Saved: output/graphgp_truth_recovery.png")
 
 
 if __name__ == "__main__":

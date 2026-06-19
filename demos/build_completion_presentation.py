@@ -453,6 +453,10 @@ code{background:#eef;padding:1px 6px;border-radius:3px;font-size:13px;}
 pre{background:#f5f5f5;padding:10px 14px;border-radius:6px;overflow-x:auto;font-size:12.5px;}
 table{border-collapse:collapse;margin:12px 0;font-size:14px;}
 th,td{padding:5px 14px;text-align:left;border-bottom:1px solid #e6e6e6;} th{background:#f4f4f4;}
+.tabbar{display:flex;gap:6px;margin:16px 0 4px;border-bottom:2px solid #3a6ea8;}
+.tabbar button{font-size:15px;font-weight:600;padding:9px 22px;border:1px solid #ddd;border-bottom:none;
+ background:#f4f4f4;color:#555;cursor:pointer;border-radius:6px 6px 0 0;}
+.tabbar button.active{background:#3a6ea8;color:#fff;border-color:#3a6ea8;}
 """
 
 
@@ -475,6 +479,11 @@ def render(D, figs, Dm, Dc):
     H.append("<h1>Imaging-informed completion of the BOSS CMASS catalog</h1>")
     H.append(f"<div class='sub'>Cosmology-free correction of spectroscopic incompleteness "
              f"&middot; BOSS DR12 CMASS-South &middot; {date}</div>")
+    H.append("<div class='tabbar'>"
+             "<button id='btn-completion' class='active' onclick=\"showTab('completion')\">"
+             "Completion (default · KNN)</button>"
+             "<button id='btn-graphgp' onclick=\"showTab('graphgp')\">graphGP route</button></div>")
+    H.append("<div id='tab-completion'>")
     H.append("<nav>" + " ".join(
         f"<a href='#{i}'>{t}</a>" for i, t in [
             ("scope", "Scope"), ("problem", "Problem"), ("opportunity", "Opportunity"),
@@ -974,6 +983,93 @@ def render(D, figs, Dm, Dc):
              "OMP_NUM_THREADS=16 ~/.venv/k3d/bin/python3 demos/build_completion_presentation.py\n\n"
              "# core code: twopt_density/{boss,photoz,cmass_targets,observed_ls}.py\n"
              "# target fetch: demos/fetch_cmass_targets.py (SDSS DR12 SkyServer)</pre>")
+    H.append("</div>")  # end tab-completion
+
+    # ================= graphGP route (second tab) =================
+    H.append("<div id='tab-graphgp' style='display:none'>")
+    H.append("<h2>The graphGP route: a conditional Gaussian-process redshift field</h2>")
+    H.append("<p class='lead'>The default completion (other tab) assigns each missing galaxy's "
+             "redshift from a fast <b>local-density (KNN)</b> estimate along its sightline. This "
+             "project is named for a more powerful, more flexible engine — <b>graphGP</b>, a "
+             "scalable nearest-neighbour (Vecchia) Gaussian process — and it is available as a "
+             "first-class drop-in. This tab explains it and shows the head-to-head.</p>")
+    H.append("<div class='callout'>Switch engines with one argument:"
+             "<pre>from twopt_density.observed_ls import complete_catalog_photoz, build_gp_field\n"
+             "field = build_gp_field(cat, n_samples=20)          # conditional GP posterior, built once\n"
+             "cat_s = complete_catalog_photoz(cat, tg, pz, z_mode='graphgp', gp_field=field, seed=s)</pre>"
+             "The default stays <code>z_mode='field'</code> (KNN); <code>'graphgp'</code> is the "
+             "opt-in flexible engine that other surveys will want.</div>")
+
+    H.append("<h3>What it does</h3>")
+    H.append("<p>Instead of a per-object KNN kernel density, graphGP draws a full <b>conditional "
+             "posterior of the galaxy density field</b> δ(n̂,z) given the observed galaxies, via "
+             "Matheron's pathwise-conditioning rule on a Vecchia graph "
+             "(<code>twopt_density/density_field.py</code>). Each missing galaxy's redshift is then "
+             "drawn from <b>p(z | n̂, colours) ∝ (1+δ(n̂,z)) · n̄(z) · p<sub>photoz</sub></b> with "
+             "the GP field evaluated along its sightline — so neighbouring missing galaxies are "
+             "<i>correlated</i> through the shared field draw (the KNN proxy treats them "
+             "independently). The kernel ξ(r) is <b>measured from the data</b> (no ΛCDM / BAO / "
+             "growth assumed), and the output is in observed redshift.</p>")
+
+    H.append("<h3>It is fully data-driven — no cosmology prior</h3>")
+    H.append("<p>The field engine converts z→comoving distance with a fiducial cosmology to build "
+             "the neighbour graph and measure ξ(r). We tested whether that injects a cosmological "
+             "prior by repeating the whole assignment under two radically different fiducials — "
+             "<b>Planck (Ω<sub>m</sub>=0.315)</b> and <b>Einstein–de Sitter (Ω<sub>m</sub>=1.0)</b>.</p>")
+    H.append(pimg("output/graphgp_cosmology_invariance.png") +
+             "<figcaption><b>The fiducial cosmology is a gauge/unit choice, not a prior.</b> "
+             "Between Planck and Einstein–de Sitter the per-object redshift changes by RMS≈0.001 "
+             "(left; correlation 0.9996) — an order of magnitude below the intrinsic assignment "
+             "scatter (~0.012) and ~30× below the photo-z σ<sub>z</sub>≈0.03 — and the recovered "
+             "wp(rp) is invariant to &lt;0.1% (right). The measured kernel absorbs the metric and "
+             "the output is in observed z, so the graphGP route is data-driven with no cosmology "
+             "prior.</figcaption></figure>")
+
+    H.append("<h3>Head-to-head with the KNN default (real CMASS-South)</h3>")
+    H.append(pimg("output/graphgp_vs_knn.png") +
+             "<figcaption>Completing the same missing galaxies (observed+missing, systot off) with "
+             "each engine and comparing to the official w<sub>c</sub>-weighted clustering. Both "
+             "recover n(z) and wp(rp); <b>graphGP matches the weighted reference more closely</b> "
+             "(ratio ≈1.00 vs the KNN ≈1.03), because the GP field is smoother. ξ<sub>0</sub> "
+             "behaves the same way.</figcaption></figure>")
+
+    H.append("<h3>But which is more faithful to <i>truth</i>? (inject-and-recover)</h3>")
+    H.append(pimg("output/graphgp_truth_recovery.png") +
+             "<figcaption>The decisive test: take the full real CMASS as TRUTH, inject extra "
+             "collisions/failures/imaging-thinning, complete, and compare the recovered wp(rp) to "
+             "truth (the oracle uses the missing galaxies' <i>true</i> redshifts — the achievable "
+             "floor). Both engines recover truth to ~1–2%, but they trade places by scale: "
+             "<b>KNN is sharper at the sub-Mpc fiber-collision scale</b> (0.99–1.00, where the "
+             "collision correction matters most), while <b>graphGP is smoother and closer at large "
+             "rp</b>. Neither dominates.</figcaption></figure>")
+
+    H.append("<h3>When to use which</h3>")
+    H.append("<table>"
+             "<tr><th></th><th>z_mode='field' (default, KNN)</th><th>z_mode='graphgp'</th></tr>"
+             "<tr><td>method</td><td>local-density KNN-KDE</td><td>conditional anisotropic GP "
+             "(Matheron)</td></tr>"
+             "<tr><td>best at</td><td>sub-Mpc fiber-collision scale</td><td>large scales; correlated "
+             "field-level posterior</td></tr>"
+             "<tr><td>cosmology</td><td>none</td><td>fiducial is a validated gauge (&lt;0.1%) → still "
+             "data-driven</td></tr>"
+             "<tr><td>cost</td><td>~seconds; 2 MB inverse-CDF package</td><td>~minutes/ensemble; "
+             "correlated draws (build + sample)</td></tr>"
+             "<tr><td>truth recovery</td><td>~1–2% (sharp small-scale)</td><td>~1–2% (smooth "
+             "large-scale)</td></tr>"
+             "</table>")
+    H.append("<p>The KNN engine is the default and what backs the 2&nbsp;MB shareable package "
+             "(its per-object independence is what compresses). graphGP is the principled, "
+             "correlated, more flexible alternative — recommended for field-level inference and "
+             "for other surveys where the KNN proxy is not enough. Reproduce: "
+             "<code>demos/graphgp_vs_knn_zfield.py</code>, <code>graphgp_truth_recovery.py</code>, "
+             "<code>graphgp_cosmology_invariance.py</code>.</p>")
+    H.append("</div>")  # end tab-graphgp
+
+    H.append("<script>function showTab(t){"
+             "for(const x of ['completion','graphgp']){"
+             "document.getElementById('tab-'+x).style.display=(x===t)?'block':'none';"
+             "document.getElementById('btn-'+x).classList.toggle('active',x===t);}"
+             "window.scrollTo(0,0);}</script>")
     H.append("</body></html>")
     return "".join(H)
 
